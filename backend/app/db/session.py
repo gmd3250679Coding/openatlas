@@ -99,6 +99,17 @@ def init_db() -> None:
             conn.exec_driver_sql("ALTER TABLE sessions ADD COLUMN task_summary TEXT DEFAULT ''")
         if "summary_updated_at" not in scols:
             conn.exec_driver_sql("ALTER TABLE sessions ADD COLUMN summary_updated_at DATETIME")
+        acols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(task_artifacts)").fetchall()}
+        if "source_path" not in acols:
+            conn.exec_driver_sql("ALTER TABLE task_artifacts ADD COLUMN source_path VARCHAR(512) DEFAULT ''")
+        if "run_id" not in acols:
+            conn.exec_driver_sql("ALTER TABLE task_artifacts ADD COLUMN run_id VARCHAR(36)")
+        if "employee_id" not in acols:
+            conn.exec_driver_sql("ALTER TABLE task_artifacts ADD COLUMN employee_id VARCHAR(36)")
+        if "version" not in acols:
+            conn.exec_driver_sql("ALTER TABLE task_artifacts ADD COLUMN version INTEGER DEFAULT 1")
+        if "provenance_payload" not in acols:
+            conn.exec_driver_sql("ALTER TABLE task_artifacts ADD COLUMN provenance_payload TEXT DEFAULT '{}'")
         mcols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(messages)").fetchall()}
         if "speaker_employee_id" not in mcols:
             conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN speaker_employee_id VARCHAR(36)")

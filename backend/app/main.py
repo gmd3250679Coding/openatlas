@@ -46,6 +46,7 @@ from app.db.models import (
     RuntimeType,
     Scope,
     SessionRecord,
+    SessionRun,
     SkillBinding,
     SkillPackage,
     SkillRun,
@@ -54,6 +55,8 @@ from app.db.models import (
     TaskArtifact,
     User,
     UserRole,
+    WorkflowNodeRun,
+    WorkflowRun,
 )
 from app.db.session import SessionLocal, get_db, init_db
 from app.services import hermes_client
@@ -1787,6 +1790,14 @@ def _session_health_snapshot(db: Session, rec: SessionRecord) -> dict:
     if pending_runs:
         issues.append({"code": "pending_hermes_run", "severity": "info", "message": f"仍有 {len(pending_runs)} 个 Hermes Run 处于可追踪状态。"})
     latest_event = canvas_events[0] if canvas_events else None
+    latest_run = db.query(SessionRun).filter(
+        SessionRun.session_id == rec.id,
+        SessionRun.tenant_id == rec.tenant_id,
+    ).order_by(SessionRun.created_at.desc()).first()
+    latest_workflow = db.query(WorkflowRun).filter(
+        WorkflowRun.session_id == rec.id,
+        WorkflowRun.tenant_id == rec.tenant_id,
+    ).order_by(WorkflowRun.created_at.desc()).first()
     score = 100
     severity_penalty = {"critical": 28, "warning": 14, "info": 4}
     for issue in issues:
@@ -1820,6 +1831,8 @@ def _session_health_snapshot(db: Session, rec: SessionRecord) -> dict:
             "canvas_events": db.query(CanvasEvent).filter(CanvasEvent.session_id == rec.id, CanvasEvent.tenant_id == rec.tenant_id).count(),
         },
         "latest_runtime_event": _canvas_event_to_dict(latest_event) if latest_event else None,
+        "latest_run": _session_run_to_dict(latest_run) if latest_run else None,
+        "latest_workflow": _workflow_run_to_dict(latest_workflow) if latest_workflow else None,
     }
 
 
@@ -1847,6 +1860,10 @@ def _context_to_dict(row: ContextInjection) -> dict:
 
 def _artifact_provenance(db: Session, row: TaskArtifact) -> dict:
     msg = db.get(MessageRecord, row.message_id) if row.message_id else None
+    run = db.get(SessionRun, row.run_id) if getattr(row, "run_id", None) else None
+    extra = _json_loads_obj(getattr(row, "provenance_payload", "") or "{}", {})
+    if not isinstance(extra, dict):
+        extra = {}
     context_q = db.query(ContextInjection).filter(
         ContextInjection.session_id == row.session_id,
         ContextInjection.tenant_id == row.tenant_id,
@@ -1866,13 +1883,17 @@ def _artifact_provenance(db: Session, row: TaskArtifact) -> dict:
     user_msg = user_q.order_by(MessageRecord.created_at.desc()).first()
     return {
         "source": row.source,
-        "employee_id": msg.speaker_employee_id if msg else None,
+        "source_path": getattr(row, "source_path", "") or "",
+        "run_id": getattr(row, "run_id", None),
+        "hermes_run_id": run.hermes_run_id if run else "",
+        "employee_id": getattr(row, "employee_id", None) or (msg.speaker_employee_id if msg else None),
         "employee_name": msg.speaker_name if msg else "",
         "message_id": row.message_id,
         "turn_index": msg.turn_index if msg else None,
         "query_excerpt": (user_msg.content or "")[:180] if user_msg else "",
         "context_counts": context_counts,
         "context_items": [_context_to_dict(c) for c in context_rows[:12]],
+        **extra,
     }
 
 
@@ -1886,6 +1907,10 @@ def _artifact_to_dict(row: TaskArtifact, db: Session | None = None) -> dict:
         "mime_type": row.mime_type,
         "content": row.content,
         "source": row.source,
+        "source_path": getattr(row, "source_path", "") or "",
+        "run_id": getattr(row, "run_id", None),
+        "employee_id": getattr(row, "employee_id", None),
+        "version": int(getattr(row, "version", 1) or 1),
         "status": row.status,
         "archived": row.archived,
         "created_at": row.created_at.isoformat() if row.created_at else None,
@@ -2180,6 +2205,288 @@ def _canvas_event_to_dict(ev: CanvasEvent) -> dict:
     }
 
 
+def _json_loads_obj(value: str | None, default: Any = None) -> Any:
+    if default is None:
+        default = {}
+    try:
+        return json.loads(value or "")
+    except Exception:
+        return default
+
+
+def _session_run_to_dict(row: SessionRun) -> dict:
+    return {
+        "id": row.id,
+        "session_id": row.session_id,
+        "employee_id": row.employee_id,
+        "hermes_run_id": row.hermes_run_id,
+        "status": row.status,
+        "stage": row.stage,
+        "reason": row.reason,
+        "last_event_type": row.last_event_type,
+        "event_count": row.event_count,
+        "payload": _json_loads_obj(row.payload, {}),
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _workflow_node_to_dict(row: WorkflowNodeRun) -> dict:
+    return {
+        "id": row.id,
+        "workflow_run_id": row.workflow_run_id,
+        "session_id": row.session_id,
+        "employee_id": row.employee_id,
+        "node_id": row.node_id,
+        "label": row.label,
+        "status": row.status,
+        "run_id": row.run_id,
+        "hermes_run_id": row.hermes_run_id,
+        "event_count": row.event_count,
+        "input_summary": row.input_summary,
+        "output_summary": row.output_summary,
+        "artifact_ids": _json_loads_obj(row.artifact_ids, []),
+        "error": row.error,
+        "payload": _json_loads_obj(row.payload, {}),
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _workflow_run_to_dict(row: WorkflowRun, nodes: list[WorkflowNodeRun] | None = None) -> dict:
+    return {
+        "id": row.id,
+        "session_id": row.session_id,
+        "template_id": row.template_id,
+        "status": row.status,
+        "strategy": row.strategy,
+        "summary": row.summary,
+        "payload": _json_loads_obj(row.payload, {}),
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "nodes": [_workflow_node_to_dict(n) for n in (nodes or [])],
+    }
+
+
+def _create_session_run(
+    db: Session,
+    *,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    employee_id: str | None,
+    status: str = "queued",
+    stage: str = "",
+    reason: str = "",
+    payload: dict[str, Any] | None = None,
+) -> SessionRun:
+    now = datetime.now(timezone.utc)
+    row = SessionRun(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+        employee_id=employee_id,
+        status=status,
+        stage=stage,
+        reason=reason,
+        payload=json.dumps(payload or {}, ensure_ascii=False),
+        started_at=now if status in {"running", "waiting_approval", "waiting_input"} else None,
+        updated_at=now,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _update_session_run(
+    db: Session,
+    run_id: str | None,
+    *,
+    status: str | None = None,
+    stage: str | None = None,
+    reason: str | None = None,
+    event_type: str | None = None,
+    hermes_run_id: str | None = None,
+    payload_patch: dict[str, Any] | None = None,
+) -> SessionRun | None:
+    if not run_id:
+        return None
+    row = db.get(SessionRun, run_id)
+    if not row:
+        return None
+    now = datetime.now(timezone.utc)
+    if status:
+        row.status = status
+        if status in {"running", "waiting_approval", "waiting_input"} and not row.started_at:
+            row.started_at = now
+        if status in {"completed", "failed", "cancelled"}:
+            row.completed_at = now
+    if stage is not None:
+        row.stage = stage[:64]
+    if reason is not None:
+        row.reason = reason[:2000]
+    if event_type:
+        row.last_event_type = event_type[:64]
+        row.event_count = int(row.event_count or 0) + 1
+    if hermes_run_id:
+        row.hermes_run_id = hermes_run_id[:128]
+    if payload_patch:
+        payload = _json_loads_obj(row.payload, {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.update(payload_patch)
+        row.payload = json.dumps(payload, ensure_ascii=False)
+    row.updated_at = now
+    return row
+
+
+def _node_id_for_employee(employee_id: str | None) -> str:
+    return f"employee-{employee_id}" if employee_id else "user"
+
+
+def _ensure_workflow_run(
+    db: Session,
+    *,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    template_id: str | None = None,
+    strategy: str = "relay",
+    payload: dict[str, Any] | None = None,
+) -> WorkflowRun:
+    row = db.query(WorkflowRun).filter(
+        WorkflowRun.tenant_id == tenant_id,
+        WorkflowRun.session_id == session_id,
+    ).order_by(WorkflowRun.created_at.desc()).first()
+    if row and row.status in {"running", "waiting_approval", "waiting_input"}:
+        return row
+    now = datetime.now(timezone.utc)
+    row = WorkflowRun(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+        template_id=template_id,
+        status="running",
+        strategy=strategy,
+        payload=json.dumps(payload or {}, ensure_ascii=False),
+        started_at=now,
+        updated_at=now,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _ensure_workflow_node_run(
+    db: Session,
+    *,
+    workflow_run: WorkflowRun,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    employee_id: str | None,
+    node_id: str | None = None,
+    label: str = "",
+) -> WorkflowNodeRun:
+    resolved_node_id = node_id or _node_id_for_employee(employee_id)
+    row = db.query(WorkflowNodeRun).filter(
+        WorkflowNodeRun.workflow_run_id == workflow_run.id,
+        WorkflowNodeRun.node_id == resolved_node_id,
+    ).first()
+    if row:
+        return row
+    row = WorkflowNodeRun(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        workflow_run_id=workflow_run.id,
+        session_id=session_id,
+        employee_id=employee_id,
+        node_id=resolved_node_id,
+        label=label or resolved_node_id,
+        status="idle",
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _update_workflow_node_run(
+    db: Session,
+    *,
+    workflow_run: WorkflowRun | None,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    employee_id: str | None,
+    node_id: str | None = None,
+    label: str = "",
+    status: str | None = None,
+    event_type: str | None = None,
+    session_run_id: str | None = None,
+    hermes_run_id: str | None = None,
+    input_summary: str | None = None,
+    output_summary: str | None = None,
+    artifact_ids: list[str] | None = None,
+    error: str | None = None,
+    payload_patch: dict[str, Any] | None = None,
+) -> WorkflowNodeRun | None:
+    wf = workflow_run or _ensure_workflow_run(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    row = _ensure_workflow_node_run(
+        db,
+        workflow_run=wf,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+        employee_id=employee_id,
+        node_id=node_id,
+        label=label,
+    )
+    now = datetime.now(timezone.utc)
+    if status:
+        row.status = status
+        if status in {"running", "waiting_approval", "waiting_input"} and not row.started_at:
+            row.started_at = now
+        if status in {"done", "completed", "failed", "cancelled"}:
+            row.completed_at = now
+    if event_type:
+        row.event_count = int(row.event_count or 0) + 1
+    if session_run_id:
+        row.run_id = session_run_id
+    if hermes_run_id:
+        row.hermes_run_id = hermes_run_id[:128]
+    if input_summary is not None:
+        row.input_summary = input_summary[:4000]
+    if output_summary is not None:
+        row.output_summary = output_summary[:4000]
+    if artifact_ids:
+        existing = _json_loads_obj(row.artifact_ids, [])
+        if not isinstance(existing, list):
+            existing = []
+        row.artifact_ids = json.dumps(list(dict.fromkeys([*existing, *artifact_ids])), ensure_ascii=False)
+    if error is not None:
+        row.error = error[:4000]
+    if payload_patch:
+        payload = _json_loads_obj(row.payload, {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.update(payload_patch)
+        row.payload = json.dumps(payload, ensure_ascii=False)
+    row.updated_at = now
+    wf.updated_at = now
+    return row
+
+
 def _record_canvas_runtime_event(
     *,
     tenant_id: str,
@@ -2272,6 +2579,7 @@ def _artifact_from_path(path: str | Path, *, source: str = "hermes_tool") -> dic
             "mime_type": "text/html;charset=utf-8",
             "content": _wrap_html_artifact(file_text),
             "source": source,
+            "source_path": str(resolved),
         }
     if ext in {".md", ".markdown"}:
         return {
@@ -2280,6 +2588,7 @@ def _artifact_from_path(path: str | Path, *, source: str = "hermes_tool") -> dic
             "mime_type": "text/markdown;charset=utf-8",
             "content": file_text,
             "source": source,
+            "source_path": str(resolved),
         }
     if ext == ".csv":
         return {
@@ -2288,6 +2597,7 @@ def _artifact_from_path(path: str | Path, *, source: str = "hermes_tool") -> dic
             "mime_type": "text/csv;charset=utf-8",
             "content": file_text[:200000],
             "source": source,
+            "source_path": str(resolved),
         }
     if ext == ".json":
         return {
@@ -2296,6 +2606,7 @@ def _artifact_from_path(path: str | Path, *, source: str = "hermes_tool") -> dic
             "mime_type": "application/json;charset=utf-8",
             "content": file_text[:200000],
             "source": source,
+            "source_path": str(resolved),
         }
     if is_tmp_helper or ext in {".py", ".js", ".ts", ".tsx", ".jsx", ".sh", ".pyc"}:
         return None
@@ -2307,6 +2618,7 @@ def _artifact_from_path(path: str | Path, *, source: str = "hermes_tool") -> dic
         "mime_type": mimetypes.guess_type(str(p))[0] or "text/plain;charset=utf-8",
         "content": file_text[:200000],
         "source": source,
+        "source_path": str(resolved),
     }
 
 
@@ -2362,6 +2674,17 @@ def _tool_artifacts_from_payload(payload: Any, *, source: str = "hermes_tool") -
     return artifacts[:12]
 
 
+def _next_artifact_version(db: Session, *, session_id: str, name: str) -> int:
+    versions = [
+        int(getattr(row, "version", 1) or 1)
+        for row in db.query(TaskArtifact).filter(
+            TaskArtifact.session_id == session_id,
+            TaskArtifact.name == name,
+        ).all()
+    ]
+    return (max(versions) + 1) if versions else 1
+
+
 def _tool_artifacts_from_hermes_item(item: dict[str, Any], *, prefix: str = "Hermes 产物") -> list[dict]:
     role, content = _hermes_message_role_content(item)
     tool_name = str(item.get("tool_name") or item.get("name") or "").strip()
@@ -2380,6 +2703,9 @@ def _persist_tool_event_artifacts(
     user_id: str,
     session_id: str,
     payload: Any,
+    run_id: str | None = None,
+    employee_id: str | None = None,
+    hermes_run_id: str | None = None,
 ) -> list[dict]:
     artifacts = _tool_artifacts_from_payload(payload, source="hermes_tool_live")
     if not artifacts:
@@ -2387,12 +2713,9 @@ def _persist_tool_event_artifacts(
     db = SessionLocal()
     persisted: list[dict] = []
     try:
-        seen = {
-            (a.name, a.source)
-            for a in db.query(TaskArtifact).filter_by(session_id=session_id).all()
-        }
+        seen = {(a.name, a.source, a.source_path) for a in db.query(TaskArtifact).filter_by(session_id=session_id).all()}
         for art in artifacts:
-            key = (art["name"], art.get("source") or "hermes_tool_live")
+            key = (art["name"], art.get("source") or "hermes_tool_live", art.get("source_path") or "")
             if key in seen:
                 continue
             row = TaskArtifact(
@@ -2405,6 +2728,14 @@ def _persist_tool_event_artifacts(
                 mime_type=art["mime_type"],
                 content=art["content"],
                 source=art.get("source") or "hermes_tool_live",
+                source_path=art.get("source_path") or "",
+                run_id=run_id,
+                employee_id=employee_id,
+                version=_next_artifact_version(db, session_id=session_id, name=art["name"]),
+                provenance_payload=json.dumps({
+                    "origin": "tool_event",
+                    "hermes_run_id": hermes_run_id or "",
+                }, ensure_ascii=False),
             )
             db.add(row)
             db.flush()
@@ -2447,13 +2778,13 @@ async def _reconcile_hermes_session_transcript(
     ]
     imported = 0
     artifact_seen = {
-        (a.name, a.source)
+        (a.name, a.source, getattr(a, "source_path", "") or "")
         for a in db.query(TaskArtifact).filter_by(session_id=rec.id).all()
     }
     for item in items:
         role, content = _hermes_message_role_content(item)
         for art in _tool_artifacts_from_hermes_item(item, prefix="Hermes 产物"):
-            key = (art["name"], art.get("source") or "hermes_tool")
+            key = (art["name"], art.get("source") or "hermes_tool", art.get("source_path") or "")
             if key in artifact_seen:
                 continue
             db.add(TaskArtifact(
@@ -2466,6 +2797,10 @@ async def _reconcile_hermes_session_transcript(
                 mime_type=art["mime_type"],
                 content=art["content"],
                 source=art.get("source") or "hermes_tool",
+                source_path=art.get("source_path") or "",
+                employee_id=employee_id or rec.employee_id,
+                version=_next_artifact_version(db, session_id=rec.id, name=art["name"]),
+                provenance_payload=json.dumps({"origin": "reconcile_tool"}, ensure_ascii=False),
             ))
             artifact_seen.add(key)
             imported += 1
@@ -2495,7 +2830,7 @@ async def _reconcile_hermes_session_transcript(
         db.add(msg_row)
         db.flush()
         for art in _extract_task_artifacts(content, prefix=f"{speaker_name or 'Hermes'}-补同步"):
-            key = (art["name"], "assistant_reconcile")
+            key = (art["name"], "assistant_reconcile", "")
             if key in artifact_seen:
                 continue
             db.add(TaskArtifact(
@@ -2508,6 +2843,9 @@ async def _reconcile_hermes_session_transcript(
                 mime_type=art["mime_type"],
                 content=art["content"],
                 source="assistant_reconcile",
+                employee_id=employee_id or rec.employee_id,
+                version=_next_artifact_version(db, session_id=rec.id, name=art["name"]),
+                provenance_payload=json.dumps({"origin": "reconcile_message"}, ensure_ascii=False),
             ))
             artifact_seen.add(key)
         existing.add(("assistant", content))
@@ -3103,6 +3441,27 @@ async def maintain_stale_sessions(
                     "任务超过 30 分钟没有新事件。OpenAtlas 已停止运行等待，"
                     "请打开会话补充信息、重新进行或检查 Hermes Runtime。"
                 )
+                latest_run = db.query(SessionRun).filter(
+                    SessionRun.session_id == rec.id,
+                    SessionRun.tenant_id == p.tenant.id,
+                ).order_by(SessionRun.created_at.desc()).first()
+                if latest_run:
+                    _update_session_run(
+                        db,
+                        latest_run.id,
+                        status="waiting_input",
+                        stage="stale",
+                        reason=rec.task_summary,
+                        event_type="maintenance.stale",
+                    )
+                latest_wf = db.query(WorkflowRun).filter(
+                    WorkflowRun.session_id == rec.id,
+                    WorkflowRun.tenant_id == p.tenant.id,
+                ).order_by(WorkflowRun.created_at.desc()).first()
+                if latest_wf:
+                    latest_wf.status = "waiting_input"
+                    latest_wf.summary = rec.task_summary
+                    latest_wf.updated_at = datetime.now(timezone.utc)
                 if (rec.title or "").strip() in {"", "新会话"} and (rec.last_message or "").strip():
                     rec.title = (rec.last_message or "").strip().replace("\n", " ")[:64]
                 rec.updated_at = datetime.now(timezone.utc)
@@ -3405,6 +3764,67 @@ async def session_health(
             speaker_name=emp.display_name if emp else "",
         )
     return {"id": rec.id, "imported": imported, "health": _session_health_snapshot(db, rec)}
+
+
+@app.get("/api/sessions/{sid}/runs")
+def list_session_runs(
+    sid: str,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    rec = db.get(SessionRecord, sid)
+    if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
+        raise HTTPException(404, "session not found")
+    rows = db.query(SessionRun).filter(
+        SessionRun.session_id == sid,
+        SessionRun.tenant_id == p.tenant.id,
+    ).order_by(SessionRun.created_at.desc()).limit(50).all()
+    return {"items": [_session_run_to_dict(r) for r in rows], "total": len(rows)}
+
+
+@app.get("/api/sessions/{sid}/replay")
+def get_session_replay(
+    sid: str,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    rec = db.get(SessionRecord, sid)
+    if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
+        raise HTTPException(404, "session not found")
+    wf = db.query(WorkflowRun).filter(
+        WorkflowRun.session_id == sid,
+        WorkflowRun.tenant_id == p.tenant.id,
+    ).order_by(WorkflowRun.created_at.desc()).first()
+    nodes: list[WorkflowNodeRun] = []
+    if wf:
+        nodes = db.query(WorkflowNodeRun).filter(
+            WorkflowNodeRun.workflow_run_id == wf.id,
+        ).order_by(WorkflowNodeRun.created_at.asc()).all()
+    events = db.query(CanvasEvent).filter(
+        CanvasEvent.session_id == sid,
+        CanvasEvent.tenant_id == p.tenant.id,
+    ).order_by(CanvasEvent.created_at.asc()).limit(300).all()
+    runs = db.query(SessionRun).filter(
+        SessionRun.session_id == sid,
+        SessionRun.tenant_id == p.tenant.id,
+    ).order_by(SessionRun.created_at.asc()).limit(80).all()
+    artifacts = db.query(TaskArtifact).filter(
+        TaskArtifact.session_id == sid,
+        TaskArtifact.tenant_id == p.tenant.id,
+    ).order_by(TaskArtifact.created_at.asc()).limit(80).all()
+    return {
+        "session": {
+            "id": rec.id,
+            "title": rec.title or "新会话",
+            "task_status": rec.task_status,
+            "task_summary": rec.task_summary,
+        },
+        "workflow_run": _workflow_run_to_dict(wf, nodes) if wf else None,
+        "runs": [_session_run_to_dict(r) for r in runs],
+        "events": [_canvas_event_to_dict(e) for e in events],
+        "artifacts": [_artifact_to_dict(a, db) for a in artifacts],
+        "total": len(events) + len(runs) + len(nodes),
+    }
 
 
 @app.post("/api/sessions/{sid}/recover")
@@ -4021,6 +4441,34 @@ async def session_chat_stream(
     target = await hermes_client.resolve_target(db, p.tenant.id)
     use_run_events = await hermes_client.supports_run_events(target)
     msg = body.message
+    workflow_row = _ensure_workflow_run(
+        db,
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=rec.id,
+        template_id=rec.reusable_template_id,
+        strategy="relay" if len(turn_employees) > 1 else "single",
+        payload={
+            "message_id": user_msg.id,
+            "employee_ids": [e.id for e in turn_employees],
+            "query_excerpt": body.message[:240],
+        },
+    )
+    _update_workflow_node_run(
+        db,
+        workflow_run=workflow_row,
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=rec.id,
+        employee_id=None,
+        node_id="user",
+        label="用户",
+        status="done",
+        event_type="user.message",
+        input_summary=body.message[:1000],
+    )
+    workflow_run_id = workflow_row.id
+    db.commit()
 
     async def event_gen():
         # P3.12 (2026-06-07) Bug 3.4.3: 每个 SSE event 附 openatlas_session_id
@@ -4064,11 +4512,104 @@ async def session_chat_stream(
         try:
             relay_outputs: list[str] = []
             for turn_index, emp in enumerate(turn_employees):
+                session_run_id = ""
+                current_hermes_run_id = ""
+                db_run = SessionLocal()
+                try:
+                    wf = db_run.get(WorkflowRun, workflow_run_id)
+                    run_row = _create_session_run(
+                        db_run,
+                        tenant_id=p.tenant.id,
+                        user_id=p.user.id,
+                        session_id=rec.id,
+                        employee_id=emp.id,
+                        status="running",
+                        stage="agent",
+                        reason=f"{emp.display_name} 开始处理",
+                        payload={"turn_index": turn_index, "query_excerpt": msg[:240]},
+                    )
+                    session_run_id = run_row.id
+                    _update_workflow_node_run(
+                        db_run,
+                        workflow_run=wf,
+                        tenant_id=p.tenant.id,
+                        user_id=p.user.id,
+                        session_id=rec.id,
+                        employee_id=emp.id,
+                        label=emp.display_name,
+                        status="running",
+                        event_type="agent.join",
+                        session_run_id=session_run_id,
+                        input_summary=msg[:1000],
+                        payload_patch={"turn_index": turn_index},
+                    )
+                    session_row = db_run.get(SessionRecord, rec.id)
+                    if session_row:
+                        session_row.task_status = "running"
+                        session_row.updated_at = datetime.now(timezone.utc)
+                    db_run.commit()
+                finally:
+                    db_run.close()
+
+                def mark_run_progress(
+                    *,
+                    status: str | None = None,
+                    node_status: str | None = None,
+                    stage: str | None = None,
+                    reason: str | None = None,
+                    event_type: str | None = None,
+                    hermes_run_id: str | None = None,
+                    artifact_ids: list[str] | None = None,
+                    output_summary: str | None = None,
+                    error: str | None = None,
+                    payload_patch: dict[str, Any] | None = None,
+                ) -> None:
+                    db_progress = SessionLocal()
+                    try:
+                        wf = db_progress.get(WorkflowRun, workflow_run_id)
+                        _update_session_run(
+                            db_progress,
+                            session_run_id,
+                            status=status,
+                            stage=stage,
+                            reason=reason,
+                            event_type=event_type,
+                            hermes_run_id=hermes_run_id,
+                            payload_patch=payload_patch,
+                        )
+                        _update_workflow_node_run(
+                            db_progress,
+                            workflow_run=wf,
+                            tenant_id=p.tenant.id,
+                            user_id=p.user.id,
+                            session_id=rec.id,
+                            employee_id=emp.id,
+                            label=emp.display_name,
+                            status=node_status or status,
+                            event_type=event_type,
+                            session_run_id=session_run_id,
+                            hermes_run_id=hermes_run_id,
+                            output_summary=output_summary,
+                            artifact_ids=artifact_ids,
+                            error=error,
+                            payload_patch=payload_patch,
+                        )
+                        if wf and status in {"completed", "failed", "cancelled"}:
+                            wf.status = "failed" if status == "failed" else "running"
+                            wf.updated_at = datetime.now(timezone.utc)
+                        db_progress.commit()
+                    except Exception:
+                        db_progress.rollback()
+                    finally:
+                        db_progress.close()
+
                 speaker = {
                     "openatlas_session_id": sess_marker,
                     "speaker_employee_id": emp.id,
                     "speaker_name": emp.display_name,
                     "turn_index": turn_index,
+                    "session_run_id": session_run_id,
+                    "workflow_run_id": workflow_run_id,
                 }
                 yield trace_event(
                     "agent",
@@ -4166,6 +4707,7 @@ async def session_chat_stream(
                 assistant_text_parts: list[str] = []
                 reasoning_parts: list[str] = []
                 tool_call_records: list[dict[str, Any]] = []
+                persisted_artifact_ids: list[str] = []
                 final_task_status = "running"
                 final_task_reason = ""
                 assistant_persisted = False
@@ -4185,7 +4727,7 @@ async def session_chat_stream(
                     )
 
                 def persist_assistant_once() -> None:
-                    nonlocal assistant_persisted, final_task_status, final_task_reason
+                    nonlocal assistant_persisted, final_task_status, final_task_reason, persisted_artifact_ids
                     if assistant_persisted:
                         return
                     assistant_persisted = True
@@ -4226,7 +4768,7 @@ async def session_chat_stream(
                             prefix=f"{emp.display_name}-回复-{turn_index + 1}",
                         )
                         for art in artifacts:
-                            db2.add(TaskArtifact(
+                            artifact_row = TaskArtifact(
                                 tenant_id=p.tenant.id,
                                 user_id=p.user.id,
                                 session_id=sid,
@@ -4236,7 +4778,18 @@ async def session_chat_stream(
                                 mime_type=art["mime_type"],
                                 content=art["content"],
                                 source="assistant",
-                            ))
+                                run_id=session_run_id,
+                                employee_id=emp.id,
+                                version=_next_artifact_version(db2, session_id=sid, name=art["name"]),
+                                provenance_payload=json.dumps({
+                                    "origin": "assistant_message",
+                                    "hermes_run_id": current_hermes_run_id,
+                                    "turn_index": turn_index,
+                                }, ensure_ascii=False),
+                            )
+                            db2.add(artifact_row)
+                            db2.flush()
+                            persisted_artifact_ids.append(artifact_row.id)
                         session_row = db2.get(SessionRecord, sid)
                         if session_row:
                             session_row.task_status = final_task_status
@@ -4254,6 +4807,7 @@ async def session_chat_stream(
                 )
 
                 async def runtime_stream():
+                    nonlocal current_hermes_run_id
                     if use_run_events:
                         run = await hermes_client.create_run(
                             target,
@@ -4263,6 +4817,15 @@ async def session_chat_stream(
                             reasoning_effort=body.reasoning_effort,
                         )
                         run_id = str(run.get("run_id") or "")
+                        current_hermes_run_id = run_id
+                        mark_run_progress(
+                            status="running",
+                            node_status="running",
+                            stage="runtime",
+                            reason="Hermes run started",
+                            event_type="run.started",
+                            hermes_run_id=run_id,
+                        )
                         _remember_hermes_run(
                             run_id,
                             tenant_id=p.tenant.id,
@@ -4340,6 +4903,14 @@ async def session_chat_stream(
                             if _is_approval_event(ev_name, ev_data):
                                 pending_dangerous_tool = None
                                 synthetic_approval_sent = False
+                                mark_run_progress(
+                                    status="waiting_approval",
+                                    node_status="waiting_approval",
+                                    stage="approval",
+                                    reason="等待用户确认授权",
+                                    event_type=ev_name,
+                                    hermes_run_id=run_id,
+                                )
                                 yield {
                                     "event": "openatlas.approval_required",
                                     "data": _normalize_approval_payload(ev_name, ev_data, run_id, source="hermes"),
@@ -4373,6 +4944,14 @@ async def session_chat_stream(
                                     if approval_key not in synthetic_approval_keys:
                                         synthetic_approval_keys.add(approval_key)
                                         synthetic_approval_sent = True
+                                        mark_run_progress(
+                                            status="waiting_approval",
+                                            node_status="waiting_approval",
+                                            stage="approval",
+                                            reason="等待用户确认工具调用",
+                                            event_type="openatlas.approval_required",
+                                            hermes_run_id=run_id,
+                                        )
                                         yield {
                                             "event": "openatlas.approval_required",
                                             "data": _normalize_approval_payload(
@@ -4412,12 +4991,21 @@ async def session_chat_stream(
                     name = ev.get("event") or "message"
                     data = ev.get("data")
                     completed_fallback = ""
-                    if name == "openatlas.run_detached":
+                    if name in {"openatlas.run_detached", "openatlas.run_idle"}:
                         runtime_detached = True
                         detached_run_id = ""
                         if isinstance(data, dict):
                             detached_run_id = str(data.get("hermes_run_id") or data.get("run_id") or "")
-                        _schedule_detached_run_reconcile(detached_run_id or run_id)
+                        if name == "openatlas.run_detached":
+                            _schedule_detached_run_reconcile(detached_run_id or current_hermes_run_id)
+                        mark_run_progress(
+                            status="stale",
+                            node_status="running",
+                            stage="runtime",
+                            reason="Hermes 长时间未推送新事件，等待后台补同步",
+                            event_type=name,
+                            hermes_run_id=detached_run_id or current_hermes_run_id,
+                        )
                     if name == "run.completed" and isinstance(data, dict):
                         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
                         assistant_usage["input_tokens"] = int(usage.get("input_tokens") or 0)
@@ -4527,8 +5115,20 @@ async def session_chat_stream(
                                 user_id=p.user.id,
                                 session_id=rec.id,
                                 payload=tool_payload,
+                                run_id=session_run_id,
+                                employee_id=emp.id,
+                                hermes_run_id=current_hermes_run_id or tool_payload.get("hermes_run_id"),
                             )
                             if live_artifacts:
+                                mark_run_progress(
+                                    status="running",
+                                    node_status="running",
+                                    stage="artifact",
+                                    reason=f"登记 {len(live_artifacts)} 个工具交付物",
+                                    event_type="artifact.created",
+                                    hermes_run_id=current_hermes_run_id or tool_payload.get("hermes_run_id"),
+                                    artifact_ids=[str(a.get("id")) for a in live_artifacts if a.get("id")],
+                                )
                                 yield trace_event(
                                     "artifact",
                                     "工具产物入库",
@@ -4568,8 +5168,30 @@ async def session_chat_stream(
                             speaker,
                             runtime_event=name,
                         )
+                        mark_run_progress(
+                            status="failed" if name == "tool.failed" else "running",
+                            node_status="failed" if name == "tool.failed" else "running",
+                            stage="tool",
+                            reason=str(tool_payload.get("error") or tool_payload.get("label") or tool_payload.get("tool_name") or tool_payload.get("name") or ""),
+                            event_type=name,
+                            hermes_run_id=current_hermes_run_id or tool_payload.get("hermes_run_id"),
+                            error=str(tool_payload.get("error") or "") if name == "tool.failed" else None,
+                        )
                     if name in ("run.completed", "done"):
                         persist_assistant_once()
+                        done_status = "completed" if final_task_status == "completed" else (
+                            "waiting_input" if final_task_status == "needs_input" else final_task_status
+                        )
+                        mark_run_progress(
+                            status=done_status,
+                            node_status="done" if done_status == "completed" else done_status,
+                            stage="assistant",
+                            reason=final_task_reason,
+                            event_type=name,
+                            hermes_run_id=current_hermes_run_id,
+                            artifact_ids=persisted_artifact_ids,
+                            output_summary="".join(assistant_text_parts)[:1000],
+                        )
                     if isinstance(data, dict):
                         data = {**data, **speaker}
                     if isinstance(data, (dict, list)):
@@ -4628,6 +5250,22 @@ async def session_chat_stream(
                     },
                 )
                 yield f"event: agent_leave\ndata: {json.dumps({**speaker, 'content_length': len(full)}, ensure_ascii=False)}\n\n"
+            db_wf_done = SessionLocal()
+            try:
+                wf = db_wf_done.get(WorkflowRun, workflow_run_id)
+                if wf:
+                    node_rows = db_wf_done.query(WorkflowNodeRun).filter(
+                        WorkflowNodeRun.workflow_run_id == wf.id,
+                    ).all()
+                    has_failed = any(n.status == "failed" for n in node_rows)
+                    has_waiting = any(n.status in {"waiting_approval", "waiting_input"} for n in node_rows)
+                    wf.status = "failed" if has_failed else "waiting_input" if has_waiting else "completed"
+                    wf.completed_at = datetime.now(timezone.utc) if wf.status in {"completed", "failed"} else None
+                    wf.summary = f"协作运行结束: {len(node_rows)} 个节点，状态 {wf.status}"
+                    wf.updated_at = datetime.now(timezone.utc)
+                    db_wf_done.commit()
+            finally:
+                db_wf_done.close()
             yield trace_event("done", "任务流结束", "本轮会话执行完成")
             yield f"event: done\ndata: {json.dumps({'openatlas_session_id': sess_marker}, ensure_ascii=False)}\n\n"
         except Exception as e:
@@ -4637,6 +5275,12 @@ async def session_chat_stream(
                 if session_row:
                     session_row.task_status = "failed"
                     session_row.updated_at = datetime.now(timezone.utc)
+                wf = db_err.get(WorkflowRun, workflow_run_id)
+                if wf:
+                    wf.status = "failed"
+                    wf.summary = str(e)[:1000]
+                    wf.completed_at = datetime.now(timezone.utc)
+                    wf.updated_at = datetime.now(timezone.utc)
                 db_err.commit()
             finally:
                 db_err.close()

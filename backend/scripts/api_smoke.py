@@ -317,6 +317,12 @@ def run() -> dict:
         recovered = request("POST", f"/sessions/{sid}/recover", {}, token=token)
         if not recovered.get("health") or "score" not in recovered["health"]:
             raise SmokeError(f"session recover missing health payload: {recovered}")
+        runs = request("GET", f"/sessions/{sid}/runs", token=token)
+        if not runs.get("items"):
+            raise SmokeError(f"session runs missing after chat stream: {runs}")
+        replay = request("GET", f"/sessions/{sid}/replay", token=token)
+        if not replay.get("workflow_run") or not replay.get("runs"):
+            raise SmokeError(f"session replay missing workflow/run evidence: {replay}")
         messages = request("GET", f"/sessions/{sid}/messages", token=token)
         listed = request("GET", f"/files?session_id={sid}", token=token)
         file_detail = request("GET", f"/files/{uploaded['id']}", token=token)
@@ -340,6 +346,12 @@ def run() -> dict:
             "stream": stream_result,
             "message_count": len(messages["items"]),
             "health_score": recovered["health"].get("score"),
+            "runs": {"count": len(runs.get("items", [])), "latest": runs.get("items", [None])[0]},
+            "replay": {
+                "workflow_status": (replay.get("workflow_run") or {}).get("status"),
+                "node_count": len((replay.get("workflow_run") or {}).get("nodes") or []),
+                "event_count": len(replay.get("events") or []),
+            },
             "summary": detail.get("summary", {}),
             "file": {"listed": len(listed.get("items", [])), "summary": file_detail.get("summary"), "snippets": file_detail.get("snippets", [])[:1]},
             "pptx": {"extracted_chars": pptx_uploaded.get("extracted_chars"), "summary": pptx_detail.get("summary")},

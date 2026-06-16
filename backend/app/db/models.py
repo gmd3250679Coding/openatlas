@@ -204,6 +204,27 @@ class SessionRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 
+class SessionRun(Base):
+    """Durable execution lifecycle for one user-visible task turn."""
+    __tablename__ = "session_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
+    employee_id: Mapped[str | None] = mapped_column(ForeignKey("digital_employees.id"), nullable=True, index=True)
+    hermes_run_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued")
+    stage: Mapped[str] = mapped_column(String(64), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    last_event_type: Mapped[str] = mapped_column(String(64), default="")
+    event_count: Mapped[int] = mapped_column(Integer, default=0)
+    payload: Mapped[str] = mapped_column(Text, default="{}")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
 class CollaborationTemplate(Base):
     """Reusable group/session orchestration template.
 
@@ -398,6 +419,11 @@ class TaskArtifact(Base):
     mime_type: Mapped[str] = mapped_column(String(128), default="text/plain;charset=utf-8")
     content: Mapped[str] = mapped_column(Text, default="")
     source: Mapped[str] = mapped_column(String(32), default="assistant")
+    source_path: Mapped[str] = mapped_column(String(512), default="")
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("session_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    employee_id: Mapped[str | None] = mapped_column(ForeignKey("digital_employees.id"), nullable=True, index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    provenance_payload: Mapped[str] = mapped_column(Text, default="{}")
     status: Mapped[str] = mapped_column(String(24), default="active")  # active/archived
     archived: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
@@ -453,3 +479,47 @@ class CanvasEvent(Base):
     edge_id: Mapped[str] = mapped_column(String(128), default="")
     payload: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class WorkflowRun(Base):
+    """One executable instance of a collaboration canvas/session plan."""
+    __tablename__ = "workflow_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
+    template_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    strategy: Mapped[str] = mapped_column(String(32), default="relay")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    payload: Mapped[str] = mapped_column(Text, default="{}")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class WorkflowNodeRun(Base):
+    """Per-node execution evidence for canvas replay."""
+    __tablename__ = "workflow_node_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    workflow_run_id: Mapped[str] = mapped_column(ForeignKey("workflow_runs.id", ondelete="CASCADE"), index=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
+    employee_id: Mapped[str | None] = mapped_column(ForeignKey("digital_employees.id"), nullable=True, index=True)
+    node_id: Mapped[str] = mapped_column(String(128), default="")
+    label: Mapped[str] = mapped_column(String(128), default="")
+    status: Mapped[str] = mapped_column(String(32), default="idle")
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("session_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    hermes_run_id: Mapped[str] = mapped_column(String(128), default="")
+    event_count: Mapped[int] = mapped_column(Integer, default=0)
+    input_summary: Mapped[str] = mapped_column(Text, default="")
+    output_summary: Mapped[str] = mapped_column(Text, default="")
+    artifact_ids: Mapped[str] = mapped_column(Text, default="[]")
+    error: Mapped[str] = mapped_column(Text, default="")
+    payload: Mapped[str] = mapped_column(Text, default="{}")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)

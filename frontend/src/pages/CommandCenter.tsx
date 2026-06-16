@@ -26,7 +26,7 @@ import {
   refreshSessionSummary, patchSessionTaskStatus, archiveArtifact,
   fetchCollaborationTemplates, createSessionFromTemplate,
   fetchRunQueue, resumeSessionTask, recoverSessionTask,
-  replayEmployeeEvents, type CanvasReplay,  // M5
+  replayEmployeeEvents, replaySessionEvents, type CanvasReplay,  // M5
   type Conversation, type Attachment, type Employee,
 } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
@@ -942,19 +942,21 @@ export default function CommandCenter() {
   }, [activeSessionId, rememberSessionMeta]);
 
   const handleReplayEvents = useCallback(async () => {
-    if (activeEmployee?.id) {
-      setReplayOpen(true);
-      try {
-        const replay = await replayEmployeeEvents(activeEmployee.id);
-        setReplayData(replay);
-      } catch (e) {
-        console.warn('[M5] replay failed:', e);
-        setReplayData(null);
-      }
-    } else {
-      message.warning('请先选员工');
+    if (!activeSessionId && !activeEmployee?.id) {
+      message.warning('请先进入一个会话');
+      return;
     }
-  }, [activeEmployee?.id]);
+    setReplayOpen(true);
+    try {
+      const replay = activeSessionId
+        ? await replaySessionEvents(activeSessionId)
+        : await replayEmployeeEvents(activeEmployee!.id);
+      setReplayData(replay);
+    } catch (e) {
+      console.warn('[M5] replay failed:', e);
+      setReplayData(null);
+    }
+  }, [activeEmployee, activeSessionId]);
 
   const handleCanvasHubPointerDown = useCallback((e: ReactPointerEvent<HTMLButtonElement>) => {
     if (e.button !== 0) return;
@@ -3312,20 +3314,97 @@ export default function CommandCenter() {
 
       {/* M5 (Event Log): Replay Modal — 时间轴 + 跳回原 conv */}
       <Modal
-        title={`事件流 Replay — ${replayData?.employee_name ?? '加载中…'}`}
+        title={`协作执行回放 — ${replayData?.session_title || replayData?.employee_name || '加载中…'}`}
         open={replayOpen}
         onCancel={() => setReplayOpen(false)}
         footer={null}
         width={760}
         styles={{ body: { maxHeight: '70vh', overflowY: 'auto', padding: '16px 24px' } }}
       >
-        {replayData && replayData.events.length === 0 && (
+        {replayData?.workflow_run?.nodes?.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', marginBottom: 8 }}>
+              节点执行
+            </div>
+            <div style={{ display: 'grid', gap: 8 }}>
+              {replayData.workflow_run.nodes.map((node: any) => (
+                <div key={node.id} style={{
+                  padding: '10px 12px',
+                  borderRadius: 10,
+                  border: '1px solid var(--border-subtle)',
+                  background: 'var(--bg-secondary)',
+                  display: 'grid',
+                  gap: 4,
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                    <strong style={{ fontSize: 13, color: 'var(--text-primary)' }}>
+                      {node.label || node.node_id}
+                    </strong>
+                    <span style={{ fontSize: 12, color: node.status === 'failed' ? '#ef4444' : node.status === 'done' || node.status === 'completed' ? '#10b981' : 'var(--accent)' }}>
+                      {node.status} · {node.event_count || 0} events
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
+                    {node.output_summary || node.input_summary || node.error || '暂无节点摘要'}
+                  </div>
+                  {Array.isArray(node.artifact_ids) && node.artifact_ids.length > 0 && (
+                    <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+                      交付物 {node.artifact_ids.length} 个
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {replayData?.runs && replayData.runs.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', marginBottom: 8 }}>
+              任务运行状态
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {replayData.runs.map((run: any) => (
+                <span key={run.id} style={{
+                  padding: '6px 10px',
+                  borderRadius: 999,
+                  background: 'var(--bg-secondary)',
+                  border: '1px solid var(--border-subtle)',
+                  fontSize: 12,
+                  color: 'var(--text-secondary)',
+                }}>
+                  {run.stage || 'run'} · {run.status} · {run.event_count || 0}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {replayData?.artifacts && replayData.artifacts.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', marginBottom: 8 }}>
+              本次交付物
+            </div>
+            <div style={{ display: 'grid', gap: 6 }}>
+              {replayData.artifacts.slice(0, 8).map((artifact: any) => (
+                <div key={artifact.id} style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                  {artifact.kind?.toUpperCase?.() || 'FILE'} · v{artifact.version || 1} · {artifact.name}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {replayData && replayData.events.length === 0 && !replayData.workflow_run && (
           <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-tertiary)' }}>
-            暂无事件。打开画布 → click 节点 → 关闭画布后再来。
+            暂无回放数据。先执行一次会话或协作方案后再来。
           </div>
         )}
         {replayData && replayData.events.length > 0 && (
           <div data-m5-replay-timeline>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', marginBottom: 8 }}>
+              原始事件流
+            </div>
             {replayData.events.map((evt, idx) => (
               <div
                 key={evt.id}
@@ -3340,6 +3419,7 @@ export default function CommandCenter() {
                   transition: 'background 0.2s',
                 }}
                 onClick={() => {
+                  if (!evt.conversation_id) return;
                   // 跳回原 conv
                   message.info(`跳回 conv #${evt.conversation_id} — ${evt.conversation_title}`);
                   setReplayOpen(false);
@@ -3375,7 +3455,7 @@ export default function CommandCenter() {
                   {evt.node_id ? `节点: ${evt.node_id}` : evt.edge_id ? `边: ${evt.edge_id}` : '(无 target)'}
                 </span>
                 <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
-                  conv: {evt.conversation_title ?? `#${evt.conversation_id}`}
+                  {evt.conversation_id ? `conv: ${evt.conversation_title ?? `#${evt.conversation_id}`}` : evt.session_id ? `session: ${String(evt.session_id).slice(0, 8)}` : ''}
                 </span>
               </div>
             ))}

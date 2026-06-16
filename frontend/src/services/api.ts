@@ -1229,7 +1229,15 @@ export type Attachment = {
   is_expired?: boolean;
 };
 export type CanvasStatePayload = any;
-export type CanvasReplay = { employee_name?: string; total?: number; events: any[] };
+export type CanvasReplay = {
+  employee_name?: string;
+  session_title?: string;
+  total?: number;
+  events: any[];
+  runs?: any[];
+  artifacts?: any[];
+  workflow_run?: any;
+};
 
 /* ════════════════════════════════════════════════════════════════════════
  * Function shims — legacy components import these names.
@@ -1534,4 +1542,18 @@ export async function replayEmployeeEvents(id: number | string): Promise<CanvasR
   const q = new URLSearchParams({ employee_id: employeeId || String(id), limit: '100' });
   const r = await apiFetch<{ items?: any[]; total?: number }>(`/canvas-events?${q.toString()}`);
   return { employee_name: '员工', total: r.total ?? (r.items || []).length, events: r.items || [] };
+}
+
+export async function replaySessionEvents(sessionId: number | string): Promise<CanvasReplay> {
+  const realId = await resolveRealSessionId(sessionId);
+  const r = await apiFetch<any>(`/sessions/${realId}/replay`);
+  return {
+    employee_name: r?.session?.title || '当前会话',
+    session_title: r?.session?.title || '当前会话',
+    total: r?.total ?? 0,
+    events: Array.isArray(r?.events) ? r.events : [],
+    runs: Array.isArray(r?.runs) ? r.runs : [],
+    artifacts: Array.isArray(r?.artifacts) ? r.artifacts : [],
+    workflow_run: r?.workflow_run || null,
+  };
 }
