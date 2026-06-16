@@ -14,6 +14,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
+from io import BytesIO
 
 
 BASE = os.environ.get("OPENATLAS_API_BASE", "http://127.0.0.1:58003/api").rstrip("/")
@@ -124,14 +126,23 @@ def chat_stream(token: str, sid: str, message: str, *, attachment_ids: list[str]
 
 
 def upload_text(token: str, name: str, text: str, *, session_id: str | None = None, content_type: str = "text/markdown") -> dict:
+    return upload_bytes(
+        token,
+        name,
+        text.encode("utf-8"),
+        session_id=session_id,
+        content_type=content_type + "; charset=utf-8",
+    )
+
+
+def upload_bytes(token: str, name: str, data: bytes, *, session_id: str | None = None, content_type: str = "application/octet-stream") -> dict:
     boundary = "----OpenAtlasApiSmoke" + uuid.uuid4().hex
-    payload = (
+    head = (
         f"--{boundary}\r\n"
         f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'
-        f"Content-Type: {content_type}; charset=utf-8\r\n\r\n"
-        f"{text}\r\n"
-        f"--{boundary}--\r\n"
+        f"Content-Type: {content_type}\r\n\r\n"
     ).encode("utf-8")
+    payload = head + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
     suffix = f"?session_id={urllib.parse.quote(session_id)}" if session_id else ""
     req = urllib.request.Request(
         BASE + "/files/upload" + suffix,
@@ -145,6 +156,41 @@ def upload_text(token: str, name: str, text: str, *, session_id: str | None = No
     )
     with urllib.request.urlopen(req, timeout=25) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def build_minimal_pptx(text: str) -> bytes:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+</Types>""")
+        zf.writestr("_rels/.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>""")
+        zf.writestr("ppt/presentation.xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>
+</p:presentation>""")
+        zf.writestr("ppt/_rels/presentation.xml.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+</Relationships>""")
+        safe_text = (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+        zf.writestr("ppt/slides/slide1.xml", f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld><p:spTree><p:sp><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{safe_text}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld>
+</p:sld>""")
+    return buf.getvalue()
 
 
 def ensure_employee(token: str) -> dict:
@@ -222,6 +268,30 @@ def run() -> dict:
     emp = emp_result["data"]
     emp_id = emp["id"]
 
+    def employee_toolset_boundary():
+        current = request("GET", f"/employees/{emp_id}", token=token)
+        original = current.get("toolsets") or []
+        toolsets = request("GET", "/toolsets/governance", token=token).get("toolsets") or []
+        valid = [item.get("name") for item in toolsets if item.get("name")]
+        if not valid:
+            raise SmokeError("no Hermes toolsets available for boundary check")
+        invalid = expect_http_error(
+            "PATCH",
+            f"/employees/{emp_id}/toolsets",
+            400,
+            token=token,
+            body={"toolsets": ["openatlas-smoke-nonexistent-toolset"]},
+        )
+        if not invalid["ok"]:
+            raise SmokeError(f"unknown toolset was not rejected: {invalid}")
+        patched = request("PATCH", f"/employees/{emp_id}/toolsets", {"toolsets": [valid[0]]}, token=token)
+        if patched.get("toolsets") != [valid[0]]:
+            raise SmokeError(f"valid toolset was not persisted: {patched}")
+        request("PATCH", f"/employees/{emp_id}/toolsets", {"toolsets": original}, token=token)
+        return {"valid_toolset": valid[0], "restored": original}
+
+    report.append(expect("employee toolset boundary", employee_toolset_boundary))
+
     def session_and_stream():
         sid = request("POST", "/sessions", {
             "employee_id": emp_id,
@@ -243,6 +313,19 @@ def run() -> dict:
         listed = request("GET", f"/files?session_id={sid}", token=token)
         file_detail = request("GET", f"/files/{uploaded['id']}", token=token)
         request("DELETE", f"/files/{uploaded['id']}", token=token)
+        pptx_uploaded = upload_bytes(
+            token,
+            "openatlas-api-smoke.pptx",
+            build_minimal_pptx("OPENATLAS_PPTX_SMOKE"),
+            session_id=sid,
+            content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+        if pptx_uploaded.get("extracted_chars", 0) <= 0:
+            raise SmokeError(f"uploaded pptx was not extracted: {pptx_uploaded}")
+        pptx_detail = request("GET", f"/files/{pptx_uploaded['id']}", token=token)
+        if "OPENATLAS_PPTX_SMOKE" not in str(pptx_detail.get("content_preview") or pptx_detail.get("summary") or pptx_detail):
+            raise SmokeError(f"pptx detail missing extracted marker: {pptx_detail}")
+        request("DELETE", f"/files/{pptx_uploaded['id']}", token=token)
         request("DELETE", f"/sessions/{sid}", token=token)
         return {
             "session_id": sid,
@@ -250,6 +333,7 @@ def run() -> dict:
             "message_count": len(messages["items"]),
             "summary": detail.get("summary", {}),
             "file": {"listed": len(listed.get("items", [])), "summary": file_detail.get("summary"), "snippets": file_detail.get("snippets", [])[:1]},
+            "pptx": {"extracted_chars": pptx_uploaded.get("extracted_chars"), "summary": pptx_detail.get("summary")},
         }
 
     report.append(expect("session + chat stream", session_and_stream))
@@ -308,6 +392,28 @@ def run() -> dict:
         return {"skill_id": skill["id"], "binding_id": binding["id"], "disabled": disabled.get("status"), "dashboard_keys": sorted(tenant_dashboard.keys())}
 
     report.append(expect("skill binding + dashboard + audit", skill_bind_dashboard_audit))
+
+    def job_scheduler_metadata():
+        job = request("POST", "/jobs", {
+            "name": "API Smoke Scheduled Job " + uuid.uuid4().hex[:6],
+            "description": "Created by api_smoke.py",
+            "schedule_kind": "interval",
+            "schedule_expr": "30m",
+            "employee_id": emp_id,
+            "prompt": "请用一句话回复 OPENATLAS_JOB_SMOKE",
+        }, token=token)
+        if not job.get("next_run_at"):
+            raise SmokeError(f"created job missing next_run_at: {job}")
+        paused = request("POST", f"/jobs/{job['id']}/pause", {}, token=token)
+        if paused.get("status") != "paused":
+            raise SmokeError(f"pause failed: {paused}")
+        resumed = request("POST", f"/jobs/{job['id']}/resume", {}, token=token)
+        if resumed.get("status") != "active" or not resumed.get("next_run_at"):
+            raise SmokeError(f"resume failed to restore schedule: {resumed}")
+        request("DELETE", f"/jobs/{job['id']}", token=token)
+        return {"job_id": job["id"], "next_run_at": resumed.get("next_run_at")}
+
+    report.append(expect("job scheduler metadata", job_scheduler_metadata))
 
     def template_create_use():
         sid = request("POST", "/sessions", {

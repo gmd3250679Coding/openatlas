@@ -97,7 +97,7 @@ test.describe('OpenAtlas main chain', () => {
     const prompt = `OPENATLAS_E2E_WORKBENCH_${Date.now()}`;
     await workbenchComposer.fill(`请阅读附件并回复 ${prompt}`);
     await workbenchComposer.press('Enter');
-    await expect(page.getByText(prompt)).toBeVisible();
+    await expect(page.getByText(prompt).first()).toBeVisible();
     await expect(page.getByText(/已注入|extracted|uploaded|已上传/).first()).toBeVisible();
     if (STRICT_MODEL) {
       await expect(page.locator('.message-bubble').filter({ hasNotText: prompt }).last()).toBeVisible({ timeout: 60_000 });
@@ -105,7 +105,16 @@ test.describe('OpenAtlas main chain', () => {
     const activeComposer = page.locator('textarea').last();
     await expect(activeComposer).toBeVisible({ timeout: 30_000 });
     await expect(activeComposer).toBeDisabled({ timeout: 10_000 }).catch(() => undefined);
-    await expect(activeComposer).toBeEnabled({ timeout: 120_000 });
+    const approvalDeadline = Date.now() + 120_000;
+    while (Date.now() < approvalDeadline && !(await activeComposer.isEnabled().catch(() => false))) {
+      const oneShotApproval = page.getByRole('button', { name: /仅本次允许/ }).first();
+      if (await oneShotApproval.isVisible({ timeout: 1_000 }).catch(() => false)) {
+        await oneShotApproval.click({ force: true });
+      } else {
+        await page.waitForTimeout(1_000);
+      }
+    }
+    await expect(activeComposer).toBeEnabled({ timeout: 5_000 });
 
     const session = await api<any>(request, 'POST', '/sessions', token, {
       employee_id: primary.id,

@@ -184,6 +184,7 @@ export interface StreamChunk {
   memories?: MemoryEntry[];
   files?: UploadedFile[];
   skills?: any[];
+  artifacts?: any[];
   aborted?: boolean;
   openatlas_session_id?: string;
   items?: any[];
@@ -574,11 +575,12 @@ export async function browseHermesSkillsHub(params: {
 }
 
 export async function searchHermesSkillsHub(params: {
-  q: string; source?: string; limit?: number;
+  q: string; source?: string; limit?: number; only_installable?: boolean;
 }): Promise<any> {
   const q = new URLSearchParams({ q: params.q });
   if (params.source) q.set('source', params.source);
   if (params.limit) q.set('limit', String(params.limit));
+  q.set('only_installable', String(params.only_installable ?? true));
   return apiFetch(`/hermes-skills/hub/search?${q.toString()}`);
 }
 
@@ -1376,6 +1378,19 @@ export async function* chatWithEmployeeStream(
         skills: payload.skills || [],
         memories: payload.memories || [],
         files: payload.files || [],
+        speaker_employee_id: payload.speaker_employee_id ?? ev.speaker_employee_id,
+        speaker_name: payload.speaker_name ?? ev.speaker_name,
+        turn_index: payload.turn_index ?? ev.turn_index,
+        openatlas_session_id: payload.openatlas_session_id ?? ev.openatlas_session_id,
+      };
+      continue;
+    }
+    if (evName === 'openatlas.artifacts') {
+      yield {
+        event_type: evName,
+        event: evName,
+        artifacts: payload.items || payload.artifacts || ev.items || [],
+        items: payload.items || payload.artifacts || ev.items || [],
         speaker_employee_id: payload.speaker_employee_id ?? ev.speaker_employee_id,
         speaker_name: payload.speaker_name ?? ev.speaker_name,
         turn_index: payload.turn_index ?? ev.turn_index,

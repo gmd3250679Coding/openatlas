@@ -72,6 +72,9 @@ app.add_middleware(
 
 
 _PENDING_HERMES_RUNS: dict[str, dict[str, Any]] = {}
+_RUN_RECONCILE_TASKS: dict[str, asyncio.Task] = {}
+_JOB_SCHEDULER_TASK: asyncio.Task | None = None
+_RUNNING_JOB_IDS: set[str] = set()
 
 
 def _remember_hermes_run(
@@ -100,6 +103,61 @@ def _remember_hermes_run(
     }
 
 
+def _schedule_detached_run_reconcile(run_id: str) -> None:
+    """Start a lightweight watcher that imports late Hermes output/artifacts.
+
+    The UI stream may detach for long-running tasks, but Hermes can still finish
+    and write files. This watcher keeps the OpenAtlas session/artifact tables in
+    sync without requiring the user to reopen history manually.
+    """
+    if not run_id or run_id in _RUN_RECONCILE_TASKS:
+        return
+    try:
+        task = asyncio.create_task(_watch_detached_run(run_id))
+    except RuntimeError:
+        return
+    _RUN_RECONCILE_TASKS[run_id] = task
+    task.add_done_callback(lambda _t: _RUN_RECONCILE_TASKS.pop(run_id, None))
+
+
+async def _watch_detached_run(run_id: str) -> None:
+    meta = _PENDING_HERMES_RUNS.get(run_id)
+    if not meta:
+        return
+    # Keep this bounded. A front-end detach is not a license to poll forever.
+    attempts = int(os.environ.get("OPENATLAS_RUN_RECONCILE_ATTEMPTS", "60"))
+    interval = float(os.environ.get("OPENATLAS_RUN_RECONCILE_INTERVAL_SECONDS", "10"))
+    for _ in range(max(1, attempts)):
+        await asyncio.sleep(max(2.0, interval))
+        with SessionLocal() as db:
+            rec = db.get(SessionRecord, meta.get("session_id"))
+            if not rec or rec.tenant_id != meta.get("tenant_id") or rec.archived:
+                return
+            target = await hermes_client.resolve_target(db, rec.tenant_id)
+            emp = db.get(DigitalEmployee, meta.get("employee_id")) if meta.get("employee_id") else None
+            imported = await _reconcile_hermes_session_transcript(
+                db,
+                target=target,
+                rec=rec,
+                tenant_id=rec.tenant_id,
+                user_id=rec.user_id,
+                employee_id=meta.get("employee_id") or rec.employee_id,
+                speaker_name=emp.display_name if emp else "",
+            )
+            if imported:
+                db.add(CanvasEvent(
+                    tenant_id=rec.tenant_id,
+                    user_id=rec.user_id,
+                    session_id=rec.id,
+                    employee_id=meta.get("employee_id") or rec.employee_id,
+                    event_type="runtime.reconciled",
+                    node_id=f"employee-{meta.get('employee_id') or rec.employee_id or ''}",
+                    payload=json.dumps({"hermes_run_id": run_id, "imported": imported}, ensure_ascii=False),
+                ))
+                db.commit()
+                return
+
+
 def _get_authorized_hermes_run(run_id: str, p: Principal) -> dict[str, Any]:
     meta = _PENDING_HERMES_RUNS.get(run_id)
     if not meta:
@@ -125,6 +183,11 @@ def _startup() -> None:
             )
     # Phase 3.3 — start the gateway supervisor background task
     start_supervisor()
+
+
+@app.on_event("startup")
+async def _startup_job_scheduler() -> None:
+    _start_job_scheduler()
 
 
 # ── Auth dependency ─────────────────────────────────────────────────────────
@@ -636,6 +699,74 @@ def _extract_text_from_file(path: str, mime: str) -> str:
             except Exception:
                 return ""
         lower = path.lower()
+        if (
+            mime in (
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "application/vnd.ms-powerpoint",
+            )
+            or lower.endswith((".pptx", ".pptm", ".ppt"))
+        ):
+            if lower.endswith((".pptx", ".pptm")):
+                try:
+                    from pptx import Presentation  # type: ignore
+                    prs = Presentation(path)
+                    lines: list[str] = []
+                    for slide_idx, slide in enumerate(prs.slides, start=1):
+                        slide_lines: list[str] = []
+                        for shape in slide.shapes:
+                            if getattr(shape, "has_text_frame", False):
+                                text = "\n".join(
+                                    p.text.strip()
+                                    for p in shape.text_frame.paragraphs
+                                    if p.text and p.text.strip()
+                                )
+                                if text:
+                                    slide_lines.append(text)
+                            if getattr(shape, "has_table", False):
+                                for row in shape.table.rows:
+                                    slide_lines.append(" | ".join(cell.text.strip() for cell in row.cells))
+                        if getattr(slide, "has_notes_slide", False):
+                            notes = slide.notes_slide.notes_text_frame.text.strip()
+                            if notes:
+                                slide_lines.append(f"Notes: {notes}")
+                        if slide_lines:
+                            lines.append(f"# Slide {slide_idx}\n" + "\n".join(slide_lines))
+                    if lines:
+                        return "\n\n".join(lines)
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
+                try:
+                    import zipfile as _zipfile
+                    import xml.etree.ElementTree as ET
+                    lines: list[str] = []
+                    with _zipfile.ZipFile(path) as zf:
+                        slide_names = sorted(
+                            n for n in zf.namelist()
+                            if n.startswith("ppt/slides/slide") and n.endswith(".xml")
+                        )
+                        for slide_idx, name in enumerate(slide_names, start=1):
+                            root = ET.fromstring(zf.read(name))
+                            texts = [t.text.strip() for t in root.iter() if t.tag.endswith("}t") and t.text and t.text.strip()]
+                            if texts:
+                                lines.append(f"# Slide {slide_idx}\n" + "\n".join(texts))
+                    return "\n\n".join(lines)
+                except Exception:
+                    return ""
+            try:
+                proc = subprocess.run(
+                    ["textutil", "-convert", "txt", "-stdout", path],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    return proc.stdout
+            except Exception:
+                return ""
+            return ""
         if mime == "text/csv" or lower.endswith(".csv"):
             try:
                 import csv
@@ -1881,6 +2012,36 @@ def _canvas_event_to_dict(ev: CanvasEvent) -> dict:
     }
 
 
+def _record_canvas_runtime_event(
+    *,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    employee_id: str | None,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+    node_id: str | None = None,
+    edge_id: str | None = None,
+) -> None:
+    db = SessionLocal()
+    try:
+        db.add(CanvasEvent(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            employee_id=employee_id or None,
+            event_type=event_type,
+            node_id=node_id or (f"employee-{employee_id}" if employee_id else ""),
+            edge_id=edge_id or "",
+            payload=json.dumps(payload or {}, ensure_ascii=False),
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 def _sanitize_hermes_text(s: str) -> str:
     """P3.12 (2026-06-07) Bug 5b: 历史消息清洗 — 剥 <system_prompt> <context> <file_context> 三种注入块.
 
@@ -1911,21 +2072,10 @@ def _hermes_message_role_content(item: dict[str, Any]) -> tuple[str, str]:
     return role, _sanitize_hermes_text(content)
 
 
-def _tool_artifacts_from_hermes_item(item: dict[str, Any], *, prefix: str = "Hermes 产物") -> list[dict]:
-    role, content = _hermes_message_role_content(item)
-    tool_name = str(item.get("tool_name") or item.get("name") or "").strip()
-    if role != "tool" or tool_name not in {"write_file", "write"} or not content:
-        return []
-    try:
-        payload = json.loads(content)
-    except Exception:
-        return []
-    path = str(payload.get("resolved_path") or payload.get("path") or payload.get("file") or "")
-    if not path:
-        return []
+def _artifact_from_path(path: str | Path, *, source: str = "hermes_tool") -> dict | None:
     p = Path(path).expanduser()
     if not p.exists() or not p.is_file():
-        return []
+        return None
     try:
         resolved = p.resolve()
         home = Path.home().resolve()
@@ -1938,37 +2088,155 @@ def _tool_artifacts_from_hermes_item(item: dict[str, Any], *, prefix: str = "Her
     try:
         file_text = p.read_text(encoding="utf-8", errors="replace")
     except Exception:
-        return []
+        return None
     ext = p.suffix.lower()
     if ext in {".html", ".htm"}:
         if is_tmp_helper:
-            return []
-        return [{
+            return None
+        return {
             "kind": "html",
             "name": p.name,
             "mime_type": "text/html;charset=utf-8",
             "content": _wrap_html_artifact(file_text),
-            "source": "hermes_tool",
-        }]
+            "source": source,
+        }
     if ext in {".md", ".markdown"}:
-        return [{
+        return {
             "kind": "markdown",
             "name": p.name,
             "mime_type": "text/markdown;charset=utf-8",
             "content": file_text,
-            "source": "hermes_tool",
-        }]
-    if is_tmp_helper or ext in {".py", ".js", ".ts", ".tsx", ".jsx", ".sh"}:
-        return []
+            "source": source,
+        }
+    if ext == ".csv":
+        return {
+            "kind": "table",
+            "name": p.name,
+            "mime_type": "text/csv;charset=utf-8",
+            "content": file_text[:200000],
+            "source": source,
+        }
+    if ext == ".json":
+        return {
+            "kind": "json",
+            "name": p.name,
+            "mime_type": "application/json;charset=utf-8",
+            "content": file_text[:200000],
+            "source": source,
+        }
+    if is_tmp_helper or ext in {".py", ".js", ".ts", ".tsx", ".jsx", ".sh", ".pyc"}:
+        return None
     if not is_user_visible:
-        return []
-    return [{
+        return None
+    return {
         "kind": "report",
         "name": p.name,
         "mime_type": mimetypes.guess_type(str(p))[0] or "text/plain;charset=utf-8",
         "content": file_text[:200000],
-        "source": "hermes_tool",
-    }]
+        "source": source,
+    }
+
+
+def _candidate_paths_from_payload(payload: Any) -> list[str]:
+    paths: list[str] = []
+
+    def add_from_string(value: str) -> None:
+        if not value:
+            return
+        # JSON strings often carry path fields as plain values.
+        if value.startswith("~") or value.startswith("/"):
+            paths.append(value.strip().strip("'\"`，,;"))
+        for m in re.finditer(r"(?P<path>(?:~|/Users/|/tmp/|/private/tmp/)[^\s'\"`<>|]+)", value):
+            paths.append(m.group("path").strip().strip("'\"`，,;"))
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for k, v in value.items():
+                lk = str(k).lower()
+                if lk in {"path", "file", "filename", "filepath", "file_path", "resolved_path", "output_path"}:
+                    if isinstance(v, str):
+                        add_from_string(v)
+                    else:
+                        walk(v)
+                else:
+                    walk(v)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, str):
+            add_from_string(value)
+
+    if isinstance(payload, str):
+        try:
+            walk(json.loads(payload))
+        except Exception:
+            walk(payload)
+    else:
+        walk(payload)
+    return list(dict.fromkeys(paths))[:20]
+
+
+def _tool_artifacts_from_payload(payload: Any, *, source: str = "hermes_tool") -> list[dict]:
+    artifacts: list[dict] = []
+    for path in _candidate_paths_from_payload(payload):
+        art = _artifact_from_path(path, source=source)
+        if art:
+            artifacts.append(art)
+    return artifacts[:12]
+
+
+def _tool_artifacts_from_hermes_item(item: dict[str, Any], *, prefix: str = "Hermes 产物") -> list[dict]:
+    role, content = _hermes_message_role_content(item)
+    tool_name = str(item.get("tool_name") or item.get("name") or "").strip()
+    if role != "tool" or tool_name not in {"write_file", "write", "terminal", "execute_code"} or not content:
+        return []
+    try:
+        payload = json.loads(content)
+    except Exception:
+        payload = content
+    return _tool_artifacts_from_payload(payload, source="hermes_tool")
+
+
+def _persist_tool_event_artifacts(
+    *,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    payload: Any,
+) -> list[dict]:
+    artifacts = _tool_artifacts_from_payload(payload, source="hermes_tool_live")
+    if not artifacts:
+        return []
+    db = SessionLocal()
+    persisted: list[dict] = []
+    try:
+        seen = {
+            (a.name, a.source)
+            for a in db.query(TaskArtifact).filter_by(session_id=session_id).all()
+        }
+        for art in artifacts:
+            key = (art["name"], art.get("source") or "hermes_tool_live")
+            if key in seen:
+                continue
+            row = TaskArtifact(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                message_id=None,
+                kind=art["kind"],
+                name=art["name"],
+                mime_type=art["mime_type"],
+                content=art["content"],
+                source=art.get("source") or "hermes_tool_live",
+            )
+            db.add(row)
+            db.flush()
+            persisted.append(_artifact_to_dict(row))
+            seen.add(key)
+        db.commit()
+        return persisted
+    finally:
+        db.close()
 
 
 async def _reconcile_hermes_session_transcript(
@@ -3475,6 +3743,14 @@ async def session_chat_stream(
                     speaker,
                     employee_id=emp.id,
                 )
+                _record_canvas_runtime_event(
+                    tenant_id=p.tenant.id,
+                    user_id=p.user.id,
+                    session_id=rec.id,
+                    employee_id=emp.id,
+                    event_type="agent.join",
+                    payload={"speaker_name": emp.display_name, "turn_index": turn_index},
+                )
                 yield f"event: agent_join\ndata: {json.dumps(speaker, ensure_ascii=False)}\n\n"
 
                 relay_context = "\n\n".join(relay_outputs)
@@ -3804,6 +4080,10 @@ async def session_chat_stream(
                     completed_fallback = ""
                     if name == "openatlas.run_detached":
                         runtime_detached = True
+                        detached_run_id = ""
+                        if isinstance(data, dict):
+                            detached_run_id = str(data.get("hermes_run_id") or data.get("run_id") or "")
+                        _schedule_detached_run_reconcile(detached_run_id or run_id)
                     if name == "run.completed" and isinstance(data, dict):
                         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
                         assistant_usage["input_tokens"] = int(usage.get("input_tokens") or 0)
@@ -3907,6 +4187,46 @@ async def session_chat_stream(
                                 next_record.pop("label", None)
                             merged = {**tool_call_records[existing_idx], **{k: v for k, v in next_record.items() if v not in (None, "")}}
                             tool_call_records[existing_idx] = merged
+                        if name == "tool.completed":
+                            live_artifacts = _persist_tool_event_artifacts(
+                                tenant_id=p.tenant.id,
+                                user_id=p.user.id,
+                                session_id=rec.id,
+                                payload=tool_payload,
+                            )
+                            if live_artifacts:
+                                yield trace_event(
+                                    "artifact",
+                                    "工具产物入库",
+                                    f"从工具事件登记 {len(live_artifacts)} 个交付物",
+                                    speaker,
+                                    artifact_count=len(live_artifacts),
+                                )
+                                yield (
+                                    "event: openatlas.artifacts\n"
+                                    f"data: {json.dumps({**speaker, 'items': live_artifacts}, ensure_ascii=False)}\n\n"
+                                )
+                                _record_canvas_runtime_event(
+                                    tenant_id=p.tenant.id,
+                                    user_id=p.user.id,
+                                    session_id=rec.id,
+                                    employee_id=emp.id,
+                                    event_type="artifact.created",
+                                    payload={"count": len(live_artifacts), "items": live_artifacts, "turn_index": turn_index},
+                                )
+                        _record_canvas_runtime_event(
+                            tenant_id=p.tenant.id,
+                            user_id=p.user.id,
+                            session_id=rec.id,
+                            employee_id=emp.id,
+                            event_type=name,
+                            payload={
+                                "tool_name": tool_payload.get("tool_name") or tool_payload.get("name") or tool_payload.get("tool"),
+                                "label": tool_payload.get("label") or tool_payload.get("preview") or tool_payload.get("command"),
+                                "status": status,
+                                "turn_index": turn_index,
+                            },
+                        )
                         yield trace_event(
                             "tool",
                             "工具调用事件",
@@ -3960,6 +4280,19 @@ async def session_chat_stream(
                     task_status=final_task_status,
                 )
                 yield task_state_event(final_task_status, final_task_reason, speaker)
+                _record_canvas_runtime_event(
+                    tenant_id=p.tenant.id,
+                    user_id=p.user.id,
+                    session_id=rec.id,
+                    employee_id=emp.id,
+                    event_type="agent.leave",
+                    payload={
+                        "speaker_name": emp.display_name,
+                        "turn_index": turn_index,
+                        "content_length": len(full),
+                        "task_status": final_task_status,
+                    },
+                )
                 yield f"event: agent_leave\ndata: {json.dumps({**speaker, 'content_length': len(full)}, ensure_ascii=False)}\n\n"
             yield trace_event("done", "任务流结束", "本轮会话执行完成")
             yield f"event: done\ndata: {json.dumps({'openatlas_session_id': sess_marker}, ensure_ascii=False)}\n\n"
@@ -4252,6 +4585,151 @@ def tenant_isolation_status(p: Principal = Depends(get_principal), db: Session =
 
 
 # ── Jobs (Phase 3.5 — own schedule + state; Hermes is read-only) ──────────
+def _parse_interval_seconds(expr: str) -> int:
+    raw = (expr or "").strip().lower()
+    if not raw:
+        return 3600
+    m = re.match(r"^(\d+)\s*([smhd]?)$", raw)
+    if not m:
+        raise HTTPException(400, "interval schedule_expr must be like 30s, 15m, 2h, or seconds")
+    value = int(m.group(1))
+    unit = m.group(2) or "s"
+    factor = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return max(30, value * factor)
+
+
+def _compute_next_job_run_at(kind: str, expr: str, *, after: datetime | None = None) -> datetime | None:
+    base = after or datetime.utcnow()
+    kind = (kind or "cron").strip().lower()
+    expr = (expr or "").strip()
+    if kind == "once":
+        if not expr or expr.lower() in {"now", "once"}:
+            return base
+        try:
+            dt = datetime.fromisoformat(expr.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt if dt > base else base
+        except Exception as exc:
+            raise HTTPException(400, "once schedule_expr must be ISO datetime or now") from exc
+    if kind == "interval":
+        return base + timedelta(seconds=_parse_interval_seconds(expr))
+    if kind != "cron":
+        raise HTTPException(400, "schedule_kind must be cron, interval, or once")
+    parts = expr.split()
+    if len(parts) != 5:
+        raise HTTPException(400, "cron schedule_expr must have five fields")
+    minute_raw, hour_raw = parts[0], parts[1]
+    minute = int(minute_raw) if minute_raw.isdigit() else base.minute
+    hour = int(hour_raw) if hour_raw.isdigit() else None
+    if not (0 <= minute <= 59):
+        raise HTTPException(400, "cron minute must be 0-59")
+    if hour is not None and not (0 <= hour <= 23):
+        raise HTTPException(400, "cron hour must be 0-23")
+    if hour is None:
+        candidate = base.replace(minute=minute, second=0, microsecond=0)
+        if candidate <= base:
+            candidate += timedelta(hours=1)
+        return candidate
+    candidate = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= base:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _refresh_job_next_run(j: Job, *, after: datetime | None = None) -> None:
+    j.next_run_at = _compute_next_job_run_at(j.schedule_kind, j.schedule_expr, after=after)
+
+
+async def _execute_job_once(db: Session, j: Job, *, request: Request | None = None, principal: Principal | None = None) -> None:
+    target = await hermes_client.resolve_target(db, j.tenant_id)
+    sess = await hermes_client.create_session(target, title=f"job:{j.name}")
+    hermes_sid = sess.get("id") or sess.get("session_id")
+    if not hermes_sid:
+        raise HTTPException(502, "hermes did not return a session id")
+    now = datetime.utcnow()
+    j.last_run_at = now
+    try:
+        last_text: list[str] = []
+        async for ev in hermes_client.stream_chat(
+            target,
+            hermes_sid,
+            message=j.prompt or "(no prompt)",
+        ):
+            if ev.get("event") == "assistant.delta":
+                d = ev.get("data") or {}
+                t = d.get("delta") or d.get("content") or ""
+                if isinstance(t, str):
+                    last_text.append(t)
+        j.last_status = "ok"
+        j.last_error = ""
+        db.add(SessionRecord(
+            tenant_id=j.tenant_id,
+            user_id=j.created_by,
+            employee_id=j.employee_id,
+            hermes_session_id=hermes_sid,
+            title=f"[job] {j.name}",
+            last_message=("".join(last_text))[:500],
+            message_count=1,
+            task_status="completed",
+        ))
+    except Exception as ex:
+        j.last_status = "error"
+        j.last_error = str(ex)[:1000]
+    if request is None:
+        if (j.schedule_kind or "").lower() == "once":
+            j.status = JobStatus.disabled
+            j.next_run_at = None
+        else:
+            _refresh_job_next_run(j, after=now)
+    audit(db, principal=principal, action="job.run", resource_type="job",
+          resource_id=j.id, request=request, extra={"status": j.last_status, "scheduled": request is None})
+
+
+async def _job_scheduler_loop() -> None:
+    interval = float(os.environ.get("OPENATLAS_JOB_SCHEDULER_INTERVAL_SECONDS", "30"))
+    while True:
+        await asyncio.sleep(max(5.0, interval))
+        if os.environ.get("OPENATLAS_DISABLE_JOB_SCHEDULER") == "1":
+            continue
+        now = datetime.utcnow()
+        with SessionLocal() as db:
+            due = db.query(Job).filter(
+                Job.status == JobStatus.active,
+                Job.next_run_at != None,  # noqa: E711
+                Job.next_run_at <= now,
+            ).order_by(Job.next_run_at.asc()).limit(5).all()
+            for j in due:
+                if j.id in _RUNNING_JOB_IDS:
+                    continue
+                _RUNNING_JOB_IDS.add(j.id)
+                try:
+                    await _execute_job_once(db, j)
+                    db.commit()
+                except Exception as exc:  # noqa: BLE001
+                    j.last_status = "error"
+                    j.last_error = str(exc)[:1000]
+                    try:
+                        _refresh_job_next_run(j, after=now)
+                    except Exception:
+                        j.status = JobStatus.paused
+                    db.commit()
+                finally:
+                    _RUNNING_JOB_IDS.discard(j.id)
+
+
+def _start_job_scheduler() -> None:
+    global _JOB_SCHEDULER_TASK
+    if os.environ.get("OPENATLAS_DISABLE_JOB_SCHEDULER") == "1":
+        return
+    if _JOB_SCHEDULER_TASK and not _JOB_SCHEDULER_TASK.done():
+        return
+    try:
+        _JOB_SCHEDULER_TASK = asyncio.create_task(_job_scheduler_loop())
+    except RuntimeError:
+        return
+
+
 def _job_to_dict(j: Job) -> dict:
     return {
         "id": j.id,
@@ -4327,6 +4805,7 @@ def create_job(
         deliver=body.deliver, prompt=body.prompt,
         status=JobStatus.active, created_by=p.user.id,
     )
+    _refresh_job_next_run(j)
     db.add(j)
     db.flush()
     audit(db, principal=p, action="job.create", resource_type="job",
@@ -4368,6 +4847,8 @@ def patch_job(
         j.toolsets = ",".join(body.toolsets); changes["toolsets"] = body.toolsets
     if not changes:
         raise HTTPException(400, "no fields to update")
+    if any(k in changes for k in ("schedule_kind", "schedule_expr")):
+        _refresh_job_next_run(j)
     audit(db, principal=p, action="job.update", resource_type="job",
           resource_id=j.id, request=request, extra=changes)
     db.commit()
@@ -4413,6 +4894,8 @@ def resume_job(
     if not j or j.tenant_id != p.tenant.id:
         raise HTTPException(404, "job not found")
     j.status = JobStatus.active
+    if not j.next_run_at or j.next_run_at <= datetime.utcnow():
+        _refresh_job_next_run(j)
     audit(db, principal=p, action="job.resume", resource_type="job",
           resource_id=j.id, request=request)
     db.commit()
@@ -4431,38 +4914,7 @@ async def run_job(
     j = db.get(Job, job_id)
     if not j or j.tenant_id != p.tenant.id:
         raise HTTPException(404, "job not found")
-    target = await hermes_client.resolve_target(db, p.tenant.id)
-    sess = await hermes_client.create_session(target, title=f"job:{j.name}")
-    hermes_sid = sess.get("id") or sess.get("session_id")
-    if not hermes_sid:
-        raise HTTPException(502, "hermes did not return a session id")
-    j.last_run_at = datetime.utcnow()
-    try:
-        last_text = []
-        async for ev in hermes_client.stream_chat(
-            target, hermes_sid, message=j.prompt or "(no prompt)",
-        ):
-            if ev.get("event") == "assistant.delta":
-                d = ev.get("data") or {}
-                t = d.get("delta") or ""
-                if isinstance(t, str):
-                    last_text.append(t)
-        j.last_status = "ok"
-        j.last_error = ""
-        # also persist a SessionRecord so the result is visible in /history
-        db.add(SessionRecord(
-            tenant_id=p.tenant.id, user_id=p.user.id, employee_id=j.employee_id,
-            hermes_session_id=hermes_sid,
-            title=f"[job] {j.name}",
-            last_message=("".join(last_text))[:500],
-            message_count=1,
-        ))
-    except Exception as ex:
-        j.last_status = "error"
-        j.last_error = str(ex)[:1000]
-    audit(db, principal=p, action="job.run", resource_type="job",
-          resource_id=j.id, request=request,
-          extra={"status": j.last_status})
+    await _execute_job_once(db, j, request=request, principal=p)
     db.commit()
     return _job_to_dict(j)
 
@@ -4491,6 +4943,7 @@ def search_hermes_skills_hub(
     q: str = Query(min_length=1, max_length=200),
     source: str = Query(default="all"),
     limit: int = Query(default=20, ge=1, le=100),
+    only_installable: bool = Query(default=True),
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
     if source not in {"all", "official", "skills-sh", "well-known", "github", "clawhub", "lobehub", "browse-sh"}:
@@ -4499,21 +4952,45 @@ def search_hermes_skills_hub(
     code = r"""
 import json, sys
 from tools.skills_hub import GitHubAuth, create_source_router, unified_search
-query, source, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    from hermes_cli.skills_hub import inspect_skill
+except Exception:
+    inspect_skill = None
+query, source, limit, only_installable = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "1"
 sources = create_source_router(GitHubAuth())
-results = unified_search(query, sources, source_filter=source, limit=limit)
-print(json.dumps({"items": [
-    {
+raw_results = unified_search(query, sources, source_filter=source, limit=max(limit * (3 if only_installable else 1), limit))
+items = []
+for r in raw_results:
+    item = {
         "name": r.name,
         "identifier": r.identifier,
         "source": r.source,
         "trust": r.trust_level,
         "description": r.description,
     }
-    for r in results
-]}, ensure_ascii=False))
+    if only_installable:
+        ok = False
+        inspect_error = ""
+        if inspect_skill is not None:
+            try:
+                detail = inspect_skill(r.identifier)
+                ok = bool(detail)
+                if ok and isinstance(detail, dict):
+                    item["installable"] = True
+                    item["resolved_name"] = detail.get("name") or detail.get("id") or detail.get("identifier")
+                    item["version"] = detail.get("version")
+            except Exception as exc:
+                inspect_error = str(exc)
+        if not ok:
+            continue
+        if inspect_error:
+            item["inspect_error"] = inspect_error[:300]
+    items.append(item)
+    if len(items) >= limit:
+        break
+print(json.dumps({"items": items, "only_installable": only_installable}, ensure_ascii=False))
 """
-    return _run_hermes_python_json(hermes_home, code, [q, source, str(limit)], timeout=60)
+    return _run_hermes_python_json(hermes_home, code, [q, source, str(limit), "1" if only_installable else "0"], timeout=90)
 
 
 @app.get("/api/hermes-skills/hub/inspect")

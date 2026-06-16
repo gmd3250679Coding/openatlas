@@ -473,6 +473,30 @@ export default function CommandCenter() {
     });
   }, []);
 
+  const mergeLiveArtifacts = useCallback((sid: string | null | undefined, artifacts: any[]) => {
+    if (!sid || !Array.isArray(artifacts) || artifacts.length === 0) return;
+    setSessionMetaById((prev) => {
+      const current = prev[sid] || {};
+      const existing = Array.isArray(current.artifacts) ? current.artifacts : [];
+      const seen = new Set(existing.map((a: any) => String(a.id || `${a.name || ''}:${a.source || ''}`)));
+      const nextItems = artifacts.filter((a: any) => {
+        const key = String(a?.id || `${a?.name || ''}:${a?.source || ''}`);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      if (nextItems.length === 0) return prev;
+      return {
+        ...prev,
+        [sid]: {
+          ...current,
+          id: sid,
+          artifacts: [...nextItems, ...existing].slice(0, 80),
+        },
+      };
+    });
+  }, []);
+
   const loadRunQueue = useCallback(async () => {
     try {
       setRunQueue(await fetchRunQueue());
@@ -1785,6 +1809,10 @@ export default function CommandCenter() {
           }, targetSessionId);
           continue;
         }
+        if (chunk.event_type === 'openatlas.artifacts' || chunk.artifacts?.length) {
+          mergeLiveArtifacts(targetSessionId, chunk.artifacts || chunk.items || []);
+          continue;
+        }
         if (chunk.event_type === 'openatlas.context' || chunk.skills || chunk.memories) {
           mergeLiveContext(targetSessionId, chunk);
           if (chunk.files) {
@@ -1921,7 +1949,7 @@ export default function CommandCenter() {
     activeHermesRunIdsRef.current.clear();
     setOrbState('idle');
     setIsProcessing(false);
-  }, [activeEmployee, pendingAttachments, loadConversations, user, activeSessionId, allEmployees, markInjectedFiles, mergeLiveContext, mergeTaskState, rememberSessionMeta, reasoningEffort, requestApprovalChoiceInline]);
+  }, [activeEmployee, pendingAttachments, loadConversations, user, activeSessionId, allEmployees, markInjectedFiles, mergeLiveArtifacts, mergeLiveContext, mergeTaskState, rememberSessionMeta, reasoningEffort, requestApprovalChoiceInline]);
 
   // ─────────────────────────────────────────────────────────────────────
   // M4.2 (Group Chat): 群聊 dispatch — 用 conversationChatStream 替代 chatWithEmployeeStream
@@ -2051,6 +2079,10 @@ export default function CommandCenter() {
         if (chunk.conversation_id) {
           setActiveSessionIdSafe(chunk.conversation_id);
           setDispatchCid(chunk.conversation_id);
+        }
+        if (chunk.event_type === 'openatlas.artifacts' || chunk.artifacts?.length) {
+          mergeLiveArtifacts(convId, chunk.artifacts || chunk.items || []);
+          continue;
         }
         if (chunk.event_type === 'openatlas.context' || chunk.skills || chunk.memories) {
           mergeLiveContext(convId, chunk);
@@ -2287,7 +2319,7 @@ export default function CommandCenter() {
       setRelayChips([]);
       setIsProcessing(false);
     }
-  }, [pendingAttachments, loadConversations, user, employeeForSpeaker, activeSessionId, markInjectedFiles, mergeLiveContext, mergeTaskState, rememberSessionMeta, reasoningEffort, requestApprovalChoiceInline]);
+  }, [pendingAttachments, loadConversations, user, employeeForSpeaker, activeSessionId, markInjectedFiles, mergeLiveArtifacts, mergeLiveContext, mergeTaskState, rememberSessionMeta, reasoningEffort, requestApprovalChoiceInline]);
 
   const handleSend = useCallback(() => {
     const text = input.trim();
