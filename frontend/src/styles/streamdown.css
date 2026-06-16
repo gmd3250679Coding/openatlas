@@ -1,0 +1,825 @@
+/**
+ * streamdown.css — Streamdown 渲染样式覆写 (M3.1 + M3.2, 2026-06-04)
+ *
+ * Streamdown 2.5.0 内嵌 Shiki(无需外部 shiki dep) + Mermaid,但默认输出
+ * Tailwind utility class(如 `bg-[var(--sdm-bg)]`、`text-[var(--sdm-c,inherit)]`),
+ * Atlas 项目未引入 Tailwind,因此下面用纯 CSS + Atlas design token 覆写
+ * 基础排版、代码块高亮、表格、引用、列表,保证肉眼质感与 Phase A 9 套 token
+ * 保持一致。
+ *
+ * Streamdown 高亮变量约定(从源码 grep):
+ *   --sdm-bg:  代码块亮色背景  --shiki-dark-bg: 暗色背景
+ *   --sdm-fg:  代码块亮色前景  --shiki-dark:    暗色前景
+ *   --sdm-c:   Shiki 关键字亮色  --shiki-dark:    关键字暗色
+ * Streamdown 给每个 token span 加 `style={{color: '#abc123'}}`(hex 写入),
+ * 所以高亮颜色由 shiki 主题本身决定,我们只需要保证 code 块背景/前景/CSS 变量
+ * 都有兜底,主题切换时不破。
+ *
+ * 消费 token:--sdm-bg / --sdm-fg / --sdm-border / --sdm-code-bg / --sdm-muted
+ * 全部 fall back 到 var(--bg-secondary) / var(--text-primary) / ... 等
+ * Phase A 9 套 token,主题切换自动跟随。
+ */
+.streamdown-host {
+  --sdm-bg: var(--bg-secondary, #ffffff);
+  --sdm-fg: var(--text-primary, #1d1d1f);
+  --sdm-border: var(--border-subtle, #ececef);
+  --sdm-code-bg: var(--bg-tertiary, #f5f5f7);
+  --sdm-muted: var(--text-tertiary, #6b7280);
+  --sdm-accent: var(--accent, #4f46e5);
+  --sdm-accent-soft: var(--accent-soft, rgba(79, 70, 229, 0.08));
+  color: var(--sdm-fg);
+  font-family: var(--font-prose, Georgia, "Source Serif 4", "Noto Serif SC", "Songti SC", serif);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+/* 段落 */
+.streamdown-host p {
+  margin: 0 0 12px 0;
+  color: var(--sdm-fg);
+}
+
+/* 标题 */
+.streamdown-host h1,
+.streamdown-host h2,
+.streamdown-host h3,
+.streamdown-host h4,
+.streamdown-host h5,
+.streamdown-host h6 {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-weight: 600;
+  color: var(--sdm-fg);
+  margin: 18px 0 10px 0;
+  line-height: 1.3;
+}
+.streamdown-host h1 { font-size: 22px; }
+.streamdown-host h2 { font-size: 19px; }
+.streamdown-host h3 { font-size: 16px; }
+.streamdown-host h4 { font-size: 15px; }
+.streamdown-host h5 { font-size: 14px; }
+.streamdown-host h6 { font-size: 13px; }
+
+/* 列表 */
+.streamdown-host ul,
+.streamdown-host ol {
+  margin: 8px 0 14px 0;
+  padding-left: 24px;
+  color: var(--sdm-fg);
+}
+.streamdown-host li { margin: 4px 0; }
+.streamdown-host li::marker { color: var(--sdm-muted); }
+
+/* 引用 */
+.streamdown-host blockquote {
+  margin: 10px 0;
+  padding: 8px 14px;
+  border-left: 3px solid var(--sdm-accent);
+  background: var(--sdm-accent-soft);
+  color: var(--sdm-fg);
+  border-radius: 0 6px 6px 0;
+}
+
+/* 行内代码 */
+.streamdown-host :not(pre) > code {
+  font-family: var(--font-mono, "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.88em;
+  background: var(--sdm-code-bg);
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--sdm-border);
+  color: var(--sdm-fg);
+}
+
+/* 代码块 (M3.2 增强:shiki 主题 hex 颜色已写入每个 token span 的 style,
+   只需要保证 pre 容器有合适背景/前景让颜色可读;同时收紧 padding 容纳行号) */
+.streamdown-host pre {
+  margin: 10px 0;
+  padding: 14px 16px;
+  background: var(--sdm-code-bg);
+  border: 1px solid var(--sdm-border);
+  border-radius: 8px;
+  overflow-x: auto;
+  font-family: var(--font-mono, "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--sdm-fg);
+  /* M3.2:shiki 主题切换通过 --shiki-dark-bg / --shiki-dark 控制,
+     暗色主题下 Shiki 输出深色背景 + 浅色前景,我们让 pre 容器透明,
+     跟随代码块自身的 [data-theme] 切换 */
+}
+.streamdown-host pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+  color: inherit;
+  counter-reset: line;
+  display: block;
+}
+
+/* M3.2:代码块包装层(CodeHighlighter 组件) + 标题栏 + 复制按钮 */
+.streamdown-host .code-block,
+.streamdown-host [data-streamdown="code-block"] {
+  margin: 10px 0;
+  border: 1px solid var(--sdm-border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--sdm-code-bg);
+}
+.streamdown-host .code-block-header,
+.streamdown-host [data-streamdown="code-block-header"] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: var(--sdm-bg);
+  border-bottom: 1px solid var(--sdm-border);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--sdm-muted);
+  text-transform: lowercase;
+  letter-spacing: 0.5px;
+}
+.streamdown-host .code-block-lang {
+  font-weight: 500;
+}
+.streamdown-host .code-block-copy,
+.streamdown-host [data-streamdown="code-block-copy-button"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 56px;
+  height: 22px;
+  padding: 0 8px;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  color: var(--sdm-muted);
+  cursor: pointer;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  transition: background 0.15s, color 0.15s;
+}
+.streamdown-host .code-block-copy:hover,
+.streamdown-host [data-streamdown="code-block-copy-button"]:hover {
+  background: var(--sdm-accent-soft);
+  color: var(--sdm-accent);
+}
+.streamdown-host .code-block-copy:disabled,
+.streamdown-host [data-streamdown="code-block-copy-button"]:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* M3.2:shiki 输出容器 */
+.streamdown-host .code-block-body {
+  overflow-x: auto;
+  font-family: var(--font-mono, "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.streamdown-host .code-block-body pre {
+  margin: 0;
+  padding: 14px 16px;
+  background: transparent !important;
+  border: 0;
+  border-radius: 0;
+}
+.streamdown-host .code-block-body code {
+  display: block;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+  color: inherit;
+}
+/* shiki 默认输出已带 .shiki class,inline style 写 hex 颜色,
+   我们只要保证 <span class="line"> 是 block 即可 */
+/* M3.2:行号 (CSS counter on .line spans inside .line-numbers) */
+.streamdown-host .line-numbers .line {
+  display: block;
+  counter-increment: code-line;
+  position: relative;
+  padding-left: 3.5em;
+}
+.streamdown-host .line-numbers .line::before {
+  content: counter(code-line);
+  position: absolute;
+  left: 0;
+  width: 2.5em;
+  text-align: right;
+  color: var(--sdm-muted);
+  opacity: 0.5;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+/* shiki 暗色主题:跟随 <html data-theme="dark"> 切换,只覆盖 shiki 内部 span 的内联 color/background */
+[data-theme="dark"] .shiki,
+[data-theme="dark"] .shiki span,
+.streamdown-host [data-theme="dark"] .shiki,
+.streamdown-host [data-theme="dark"] .shiki span {
+  color: var(--shiki-dark) !important;
+  background-color: var(--shiki-dark-bg) !important;
+  font-style: var(--shiki-dark-font-style) !important;
+  font-weight: var(--shiki-dark-font-weight) !important;
+  text-decoration: var(--shiki-dark-text-decoration) !important;
+}
+.streamdown-host .code-block-skeleton {
+  margin: 0;
+  padding: 14px 16px;
+  background: var(--sdm-code-bg);
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+  color: var(--sdm-fg);
+}
+
+/* 表格 */
+.streamdown-host table {
+  border-collapse: collapse;
+  margin: 10px 0;
+  width: 100%;
+  font-size: 13px;
+  border: 1px solid var(--sdm-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.streamdown-host th,
+.streamdown-host td {
+  border: 1px solid var(--sdm-border);
+  padding: 6px 10px;
+  text-align: left;
+}
+.streamdown-host th {
+  background: var(--sdm-code-bg);
+  font-weight: 600;
+  color: var(--sdm-fg);
+}
+.streamdown-host td {
+  color: var(--sdm-fg);
+}
+
+/* 链接 */
+.streamdown-host a {
+  color: var(--sdm-accent);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+}
+.streamdown-host a:hover {
+  border-bottom-color: var(--sdm-accent);
+}
+
+/* 分隔线 */
+.streamdown-host hr {
+  border: 0;
+  border-top: 1px solid var(--sdm-border);
+  margin: 16px 0;
+}
+
+/* 粗体 / 斜体 */
+.streamdown-host strong { color: var(--sdm-fg); font-weight: 600; }
+
+/* ===== M3.3: Mermaid 图表面板 ===== */
+.streamdown-host .mermaid-block {
+  border: 1px solid var(--sdm-border);
+  border-radius: 8px;
+  background: var(--sdm-code-bg);
+  padding: 16px;
+  margin: 12px 0;
+  overflow-x: auto;
+  text-align: center;
+}
+.streamdown-host .mermaid-block svg {
+  max-width: 100%;
+  height: auto;
+  display: inline-block;
+}
+.streamdown-host .mermaid-skeleton {
+  color: var(--sdm-muted);
+  font-size: 12px;
+  text-align: left;
+  font-family: var(--font-prose);
+  min-height: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.streamdown-host .mermaid-skeleton::before {
+  content: "";
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--sdm-muted);
+  border-top-color: transparent;
+  border-radius: 50%;
+  margin-right: 8px;
+  animation: mermaid-spin 0.8s linear infinite;
+}
+@keyframes mermaid-spin {
+  to { transform: rotate(360deg); }
+}
+.streamdown-host .mermaid-error {
+  border-color: #f87171;
+  background: rgba(248, 113, 113, 0.04);
+  text-align: left;
+}
+.streamdown-host .mermaid-error-title {
+  color: #dc2626;
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.streamdown-host .mermaid-error-msg {
+  font-size: 11px;
+  color: var(--sdm-muted);
+  font-family: var(--font-mono, ui-monospace, "SF Mono", monospace);
+  white-space: pre-wrap;
+  margin: 0 0 8px 0;
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 4px;
+}
+.streamdown-host .mermaid-source {
+  font-size: 12px;
+  color: var(--sdm-fg);
+  font-family: var(--font-mono, ui-monospace, "SF Mono", monospace);
+  white-space: pre-wrap;
+  margin: 0;
+  padding: 8px;
+  background: var(--sdm-bg);
+  border-radius: 4px;
+}
+[data-theme="dark"] .streamdown-host .mermaid-block {
+  background: var(--bg-tertiary, #2a2a2e);
+}
+
+/* ===== M3.4: Artifact frame — HTML iframe + React Sandpack 双栈 ===== */
+.streamdown-host .artifact-frame,
+.artifact-preview-body .artifact-frame {
+  border: 1px solid var(--sdm-border);
+  border-radius: 8px;
+  background: var(--bg-elevated, #fafbfc);
+  margin: 12px 0;
+  overflow: hidden;
+}
+.streamdown-host .artifact-header,
+.artifact-preview-body .artifact-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--bg-secondary, #f6f8fa);
+  border-bottom: 1px solid var(--sdm-border);
+}
+.streamdown-host .artifact-tag,
+.artifact-preview-body .artifact-tag {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary, #1f2328);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.streamdown-host .artifact-meta,
+.artifact-preview-body .artifact-meta {
+  font-size: 10px;
+  color: var(--text-tertiary, #656d76);
+  font-family: var(--font-mono, monospace);
+}
+.streamdown-host .artifact-iframe,
+.artifact-preview-body .artifact-iframe {
+  width: 100%;
+  min-height: 520px;
+  border: 0;
+  display: block;
+  background: #fff;
+}
+.streamdown-host .artifact-html-stage,
+.artifact-preview-body .artifact-html-stage {
+  padding: 14px;
+  background:
+    linear-gradient(45deg, rgba(148,163,184,0.10) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(148,163,184,0.10) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(148,163,184,0.10) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(148,163,184,0.10) 75%);
+  background-size: 18px 18px;
+  background-position: 0 0, 0 9px, 9px -9px, -9px 0;
+}
+.streamdown-host .artifact-html-stage .artifact-iframe,
+.artifact-preview-body .artifact-html-stage .artifact-iframe {
+  border: 1px solid var(--border-subtle, #ececef);
+  border-radius: 6px;
+  box-shadow: 0 12px 32px rgba(15,23,42,0.08);
+}
+.artifact-preview-body .artifact-iframe {
+  height: calc(100vh - 156px);
+  min-height: 640px;
+}
+.streamdown-host .artifact-markdown-preview,
+.artifact-preview-body .artifact-markdown-preview {
+  padding: 24px;
+  background: #fff;
+}
+.streamdown-host .artifact-markdown-preview .markdown-body,
+.artifact-preview-body .artifact-markdown-preview .markdown-body {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 4px 0 18px;
+  color: #24292f;
+  line-height: 1.75;
+}
+.streamdown-host .artifact-markdown-preview .markdown-body h1,
+.artifact-preview-body .artifact-markdown-preview .markdown-body h1 {
+  font-size: 26px;
+  line-height: 1.25;
+  margin: 8px 0 18px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #e5e7eb;
+}
+.streamdown-host .artifact-markdown-preview .markdown-body h2,
+.artifact-preview-body .artifact-markdown-preview .markdown-body h2 {
+  font-size: 20px;
+  margin: 24px 0 12px;
+}
+.streamdown-host .artifact-markdown-preview .markdown-body h3,
+.artifact-preview-body .artifact-markdown-preview .markdown-body h3 {
+  font-size: 16px;
+  margin: 18px 0 8px;
+}
+.streamdown-host .artifact-markdown-preview .markdown-body p,
+.artifact-preview-body .artifact-markdown-preview .markdown-body p,
+.streamdown-host .artifact-markdown-preview .markdown-body ul,
+.artifact-preview-body .artifact-markdown-preview .markdown-body ul,
+.streamdown-host .artifact-markdown-preview .markdown-body ol,
+.artifact-preview-body .artifact-markdown-preview .markdown-body ol {
+  margin: 10px 0;
+}
+.streamdown-host .artifact-markdown-preview .markdown-body blockquote,
+.artifact-preview-body .artifact-markdown-preview .markdown-body blockquote {
+  margin: 14px 0;
+  padding: 10px 14px;
+  border-left: 3px solid var(--accent, #635bff);
+  background: #f8fafc;
+  color: #475569;
+}
+.streamdown-host .artifact-source-wrap,
+.artifact-preview-body .artifact-source-wrap {
+  padding: 12px;
+  background: var(--bg-secondary, #fff);
+}
+.streamdown-host .artifact-sandpack {
+  min-height: 360px;
+}
+[data-theme="dark"] .streamdown-host .artifact-frame {
+  background: var(--bg-elevated, #1a1a2e);
+  border-color: var(--border-subtle, #30363d);
+}
+[data-theme="dark"] .streamdown-host .artifact-header {
+  background: var(--bg-secondary, #161b22);
+}
+[data-theme="dark"] .streamdown-host .artifact-iframe {
+  background: #0d1117;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Bug 1b (2026-06-06): Tailwind utility class fallback
+ * Streamdown 2.5 输出 Tailwind 风格的 utility class (text-sm / px-4 / py-2
+ * / font-semibold / whitespace-nowrap / divide-y / border / rounded-md /
+ * bg-background / text-muted-foreground / bg-muted 等), 但 Atlas 项目
+ * 没装 Tailwind, 这些 class 静默失效, 表格/code block 样式退化.
+ * 修法: 在 .streamdown-host 作用域下手动 fallback 这 12 个最常用的 class.
+ * 不引入 tailwind dep (会爆体积), 只补最关键的可视化差异.
+ * ════════════════════════════════════════════════════════════════════════ */
+.streamdown-host .text-sm { font-size: 0.875rem; line-height: 1.25rem; }
+.streamdown-host .text-xs { font-size: 0.75rem; line-height: 1rem; }
+.streamdown-host .text-lg { font-size: 1.125rem; line-height: 1.75rem; }
+.streamdown-host .text-xl { font-size: 1.25rem; line-height: 1.75rem; }
+.streamdown-host .text-2xl { font-size: 1.5rem; line-height: 2rem; }
+.streamdown-host .text-3xl { font-size: 1.875rem; line-height: 2.25rem; }
+.streamdown-host .px-1 { padding-left: 0.25rem; padding-right: 0.25rem; }
+.streamdown-host .px-2 { padding-left: 0.5rem; padding-right: 0.5rem; }
+.streamdown-host .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; }
+.streamdown-host .px-4 { padding-left: 1rem; padding-right: 1rem; }
+.streamdown-host .py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
+.streamdown-host .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+.streamdown-host .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
+.streamdown-host .p-2 { padding: 0.5rem; }
+.streamdown-host .p-3 { padding: 0.75rem; }
+.streamdown-host .p-4 { padding: 1rem; }
+.streamdown-host .m-1 { margin: 0.25rem; }
+.streamdown-host .m-2 { margin: 0.5rem; }
+.streamdown-host .mt-1 { margin-top: 0.25rem; }
+.streamdown-host .mt-2 { margin-top: 0.5rem; }
+.streamdown-host .mt-3 { margin-top: 0.75rem; }
+.streamdown-host .mt-4 { margin-top: 1rem; }
+.streamdown-host .mt-6 { margin-top: 1.5rem; }
+.streamdown-host .mb-1 { margin-bottom: 0.25rem; }
+.streamdown-host .mb-2 { margin-bottom: 0.5rem; }
+.streamdown-host .mb-3 { margin-bottom: 0.75rem; }
+.streamdown-host .mb-4 { margin-bottom: 1rem; }
+.streamdown-host .mb-6 { margin-bottom: 1.5rem; }
+.streamdown-host .my-2 { margin-top: 0.5rem; margin-bottom: 0.5rem; }
+.streamdown-host .my-4 { margin-top: 1rem; margin-bottom: 1rem; }
+.streamdown-host .my-6 { margin-top: 1.5rem; margin-bottom: 1.5rem; }
+.streamdown-host .font-semibold { font-weight: 600; }
+.streamdown-host .font-bold { font-weight: 700; }
+.streamdown-host .font-medium { font-weight: 500; }
+.streamdown-host .font-mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+.streamdown-host .italic { font-style: italic; }
+.streamdown-host .whitespace-nowrap { white-space: nowrap; }
+.streamdown-host .whitespace-pre-wrap { white-space: pre-wrap; }
+.streamdown-host .text-left { text-align: left; }
+.streamdown-host .text-right { text-align: right; }
+.streamdown-host .text-center { text-align: center; }
+.streamdown-host .w-full { width: 100%; }
+.streamdown-host .h-8 { height: 2rem; }
+.streamdown-host .rounded { border-radius: 0.25rem; }
+.streamdown-host .rounded-md { border-radius: 0.375rem; }
+.streamdown-host .rounded-lg { border-radius: 0.5rem; }
+.streamdown-host .rounded-xl { border-radius: 0.75rem; }
+.streamdown-host .border { border: 1px solid var(--border-subtle, #ececef); }
+.streamdown-host .border-border { border-color: var(--border-subtle, #ececef); }
+.streamdown-host .divide-y > * + * { border-top: 1px solid var(--border-subtle, #ececef); }
+.streamdown-host .bg-muted { background-color: var(--bg-tertiary, #f5f5f7); }
+.streamdown-host .bg-muted\/80 { background-color: rgba(245, 245, 247, 0.8); }
+.streamdown-host .bg-background { background-color: var(--bg-primary, #ffffff); }
+.streamdown-host .bg-sidebar { background-color: var(--bg-secondary, #fafafa); }
+.streamdown-host .text-foreground { color: var(--text-primary, #1d1d1f); }
+.streamdown-host .text-muted-foreground { color: var(--text-tertiary, #6b7280); }
+.streamdown-host .text-primary { color: var(--accent, #4f46e5); }
+.streamdown-host .text-primary-foreground { color: #ffffff; }
+.streamdown-host .text-muted { color: var(--text-tertiary, #6b7280); }
+.streamdown-host .flex { display: flex; }
+.streamdown-host .inline-flex { display: inline-flex; }
+.streamdown-host .block { display: block; }
+.streamdown-host .inline-block { display: inline-block; }
+.streamdown-host .items-center { align-items: center; }
+.streamdown-host .justify-end { justify-content: flex-end; }
+.streamdown-host .justify-center { justify-content: center; }
+.streamdown-host .gap-1 { gap: 0.25rem; }
+.streamdown-host .gap-2 { gap: 0.5rem; }
+.streamdown-host .overflow-x-auto { overflow-x: auto; }
+.streamdown-host .overflow-y-auto { overflow-y: auto; }
+.streamdown-host .relative { position: relative; }
+.streamdown-host .sticky { position: sticky; }
+.streamdown-host .top-2 { top: 0.5rem; }
+.streamdown-host .z-10 { z-index: 10; }
+.streamdown-host .border-collapse { border-collapse: collapse; }
+.streamdown-host .list-inside { list-style-position: inside; }
+.streamdown-host .list-decimal { list-style-type: decimal; }
+.streamdown-host .list-disc { list-style-type: disc; }
+.streamdown-host .border-l-4 { border-left-width: 4px; }
+.streamdown-host .pl-4 { padding-left: 1rem; }
+.streamdown-host .pl-6 { padding-left: 1.5rem; }
+.streamdown-host .border-muted-foreground\/30 { border-color: rgba(107, 114, 128, 0.3); }
+.streamdown-host .cursor-pointer { cursor: pointer; }
+.streamdown-host .select-none { user-select: none; }
+
+/* Code block 复制/下载按钮 — 跟 streamdown 风格一致 (sticky 右上角) */
+.streamdown-host .code-block-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  pointer-events: auto;
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: 0.375rem;
+  border: 1px solid var(--border-subtle, #ececef);
+  background: var(--bg-secondary, #fafafa);
+}
+.streamdown-host .code-block-copy,
+.streamdown-host .code-block-download,
+.streamdown-host .artifact-icon-btn {
+  cursor: pointer;
+  padding: 4px;
+  color: var(--text-tertiary, #6b7280);
+  background: transparent;
+  border: none;
+  border-radius: 0.25rem;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+}
+.streamdown-host .code-block-copy:hover,
+.streamdown-host .code-block-download:hover,
+.streamdown-host .artifact-icon-btn:hover {
+  color: var(--text-primary, #1d1d1f);
+  background: var(--bg-tertiary, #f5f5f7);
+}
+
+/* Artifact 头部布局 — segmented tab 跟 icon 按钮排成一行 */
+.streamdown-host .artifact-header,
+.artifact-preview-body .artifact-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.streamdown-host .artifact-actions,
+.artifact-preview-body .artifact-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+/* ===== P3.12 3.4.4 强制隐藏 streamdown 内部浮控件 (左侧破坏布局) =====
+ * M3.3 状态: controls.mermaid=true → streamdown 2.5 在 mermaid block 内
+ * 渲染 "copy/download SVG/PNG/MMD/fullscreen" 5 个浮控件在左侧 + 不跟随主题.
+ * 当前状态: controls.mermaid=false → 不应再有浮控件, 但兜底隐藏防 streamdown
+ * 升级后复活. selectors 覆盖以下 4 个:
+ *   - [data-floating-actions]            (P3.11 备份 grep 记录)
+ *   - .mermaid-block-actions             (M3.4 备份 grep 记录, 内部 co/Ae/fo)
+ *   - .mermaid-block-toolbar             (M3.4 备份 grep 记录, 内部 copy/download)
+ *   - .mermaid-block-floating-actions    (兼容 streamdown 2.5+)
+ * 兜底归零: display: none + visibility: hidden + opacity: 0.
+ */
+.streamdown-host [data-floating-actions],
+.streamdown-host .mermaid-block-actions,
+.streamdown-host .mermaid-block-toolbar,
+.streamdown-host .mermaid-block-floating-actions,
+.streamdown-host [data-streamdown-floating-actions] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* Streamdown table controls also float on the left in this app's chat bubble.
+   Tables stay rendered, but the misplaced copy/download/fullscreen controls
+   are hidden because artifact/code blocks already provide their own toolbar. */
+.streamdown-host [data-streamdown="table-actions"],
+.streamdown-host [data-streamdown-table-actions],
+.streamdown-host .table-actions,
+.streamdown-host .table-floating-actions,
+.streamdown-host [aria-label="Copy table"],
+.streamdown-host [aria-label="Download table"],
+.streamdown-host [aria-label="View fullscreen"] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.streamdown-host table,
+.markdown-body table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 10px 0;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle, #ececef);
+  border-radius: 8px;
+}
+
+.streamdown-host th,
+.streamdown-host td,
+.markdown-body th,
+.markdown-body td {
+  padding: 10px 12px;
+  border-right: 1px solid var(--border-subtle, #ececef);
+  border-bottom: 1px solid var(--border-subtle, #ececef);
+  vertical-align: top;
+}
+
+.streamdown-host th:last-child,
+.streamdown-host td:last-child,
+.markdown-body th:last-child,
+.markdown-body td:last-child {
+  border-right: none;
+}
+
+.streamdown-host tr:last-child td,
+.markdown-body tr:last-child td {
+  border-bottom: none;
+}
+
+.streamdown-host th,
+.markdown-body th {
+  background: var(--bg-tertiary, #f5f5f7);
+  font-weight: 700;
+  text-align: left;
+}
+
+/* ===== P3.12 3.4.4 ArtifactCard 统一容器 ===== */
+.artifact-card {
+  border: 1px solid var(--border-subtle, #ececef);
+  border-radius: 8px;
+  background: var(--bg-secondary, #ffffff);
+  margin: 12px 0;
+  overflow: hidden;
+}
+.artifact-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-subtle, #ececef);
+  background: var(--bg-tertiary, #f5f5f7);
+  min-height: 32px;
+}
+.artifact-card-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.artifact-card-header-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.artifact-card-kind {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 4px;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 18px;
+  white-space: nowrap;
+}
+.artifact-card-title {
+  font-size: 13px;
+  color: var(--text-secondary, #4b5563);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.artifact-card-body {
+  background: var(--bg-secondary, #ffffff);
+}
+.artifact-card-body > .artifact-frame {
+  border: none;
+  border-radius: 0;
+  margin: 0;
+}
+.artifact-card-mermaid .artifact-card-body,
+.artifact-card-html .artifact-card-body,
+.artifact-card-markdown .artifact-card-body,
+.artifact-card-react .artifact-card-body,
+.artifact-card-code .artifact-card-body {
+  /* 让内部组件正常铺满容器 */
+  display: block;
+}
+
+/* ===== P3.12 3.4.4 MermaidBlock 顶部 toolbar (右侧) ===== */
+.mermaid-block-wrap {
+  position: relative;
+  background: var(--bg-secondary, #ffffff);
+}
+.mermaid-block-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border-subtle, #ececef);
+  background: var(--bg-tertiary, #f5f5f7);
+  justify-content: flex-end;
+}
+.mermaid-block-toolbar .ant-btn {
+  font-size: 13px;
+  width: 26px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.mermaid-block-toolbar .ant-btn .anticon {
+  font-size: 13px;
+}
+.mermaid-block {
+  padding: 12px 16px;
+  background: var(--bg-secondary, #ffffff);
+  overflow-x: auto;
+}
+.mermaid-block svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* ===== P3.12 3.4.4 ArtifactPreviewDrawer 全屏预览 ===== */
+.artifact-preview-drawer .ant-drawer-body {
+  padding: 0;
+  background: var(--bg-elevated, #fafafa);
+}
+.artifact-preview-body {
+  background: var(--bg-secondary, #ffffff);
+  height: 100%;
+  min-height: 100%;
+}
+.artifact-preview-body .artifact-card {
+  border: none;
+  border-radius: 0;
+  margin: 0;
+}
+.artifact-preview-body .artifact-card-header {
+  display: none; /* 预览 drawer 已有 header, 不重复 */
+}
+@media (max-width: 768px) {
+  .ant-drawer.artifact-preview-drawer {
+    width: 100% !important;
+  }
+}

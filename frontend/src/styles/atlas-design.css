@@ -1,0 +1,799 @@
+/* ============================================================
+   Atlas Design Language v2 — CSS Variables & Foundation
+   Brand: 靛紫灰 Indigo-Violet (#4F46E5 light / #8B7FE8 dark)
+   Apple WWDC-inspired enterprise AI design system
+   ============================================================ */
+
+/* --- Design Tokens (Light Theme) --- */
+:root,
+[data-theme="light"] {
+  /* Backgrounds — three-section alternation */
+  --bg-primary: #FFFFFF;
+  --bg-secondary: #F5F5F7;
+  --bg-tertiary: #EEEEF0;
+  --bg-inverse: #0A0A0C;
+  --bg-elevated: rgba(255, 255, 255, 0.72);
+
+  /* Text */
+  --text-primary: #1D1D1F;
+  --text-secondary: #86868B;
+  --text-tertiary: #AEAEB2;
+  --text-inverse: #F5F5F7;
+  --text-placeholder: #C7C7CC;
+
+  /* Accent — Atlas Indigo-Violet, used ≤5% of page */
+  --accent: #4F46E5;
+  --accent-soft: rgba(79, 70, 229, 0.07);
+  --accent-hover: #4338CA;
+  --accent-glow: rgba(79, 70, 229, 0.25);
+
+  /* Semantic */
+  --color-success: #10B981;
+  --color-warning: #F59E0B;
+  --color-danger: #EF4444;
+  --color-info: #3B82F6;
+  --color-evidence-high: #DC2626;
+
+  /* Borders & Dividers */
+  --border-subtle: rgba(0, 0, 0, 0.05);
+  --border-default: rgba(0, 0, 0, 0.10);
+  --border-strong: rgba(0, 0, 0, 0.16);
+
+  /* Shadows — subtle only */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.03);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.05);
+  --shadow-glow: 0 0 40px var(--accent-glow);
+
+  /* Glass — sidebar / topbar */
+  --glass-bg: rgba(255, 255, 255, 0.70);
+  --glass-blur: saturate(180%) blur(20px);
+  --glass-border: rgba(0, 0, 0, 0.06);
+}
+
+/* --- Dark Theme --- */
+[data-theme="dark"] {
+  --bg-primary: #0A0A0C;
+  --bg-secondary: #161618;
+  --bg-tertiary: #1E1E22;
+  --bg-inverse: #FFFFFF;
+  --bg-elevated: rgba(22, 22, 24, 0.75);
+
+  --text-primary: #F5F5F7;
+  --text-secondary: #98989E;
+  --text-tertiary: #6E6E73;
+  --text-inverse: #1D1D1F;
+  --text-placeholder: #48484A;
+
+  --accent: #8B7FE8;
+  --accent-soft: rgba(139, 127, 232, 0.10);
+  --accent-hover: #A59BF0;
+  --accent-glow: rgba(139, 127, 232, 0.35);
+
+  --color-success: #34D399;
+  --color-warning: #FBBF24;
+  --color-danger: #F87171;
+  --color-info: #60A5FA;
+  --color-evidence-high: #F87171;
+
+  --border-subtle: rgba(255, 255, 255, 0.05);
+  --border-default: rgba(255, 255, 255, 0.10);
+  --border-strong: rgba(255, 255, 255, 0.16);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.3);
+  --shadow-glow: 0 0 50px var(--accent-glow);
+
+  --glass-bg: rgba(22, 22, 24, 0.75);
+  --glass-blur: saturate(180%) blur(24px);
+  --glass-border: rgba(255, 255, 255, 0.08);
+}
+
+/* ============================================================
+   Atlas Phase A Tokens (added 2026-06-03, see docs/DESIGN.md)
+   5 套 token: --font-prose / --shadow-popover / --sider-* /
+                --workspace-* / --composer-* / --activity-* /
+                --tool-card / --thinking-card / --profile-*
+   ============================================================ */
+
+/* --- Font role: prose (assistant 散文, 此前缺) --- */
+:root {
+  --font-prose: Georgia, "Source Serif 4", "Noto Serif SC", "Songti SC", serif;
+}
+
+/* --- Popover / Modal 专用阴影 (对话流内禁止使用) --- */
+:root,
+[data-theme="light"] {
+  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.08), 0 2px 6px rgba(0, 0, 0, 0.04);
+}
+[data-theme="dark"] {
+  --shadow-popover: 0 12px 32px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+/* --- Sider 侧栏规约 (4 tab 共用, Phase A 保持 220px 现状) --- */
+:root {
+  --sider-width:              220px;            /* 当前实际值, Phase B 决定改 240px */
+  --sider-width-collapsed:    64px;
+  --sider-bg:                 var(--glass-bg);
+  --sider-blur:               var(--glass-blur);
+  --sider-border-right:       var(--glass-border);
+  --sider-header-height:      56px;
+  --sider-nav-item-height:    40px;
+  --sider-nav-item-padding:   9px 12px;
+  --sider-nav-item-radius:    var(--radius-sm);
+  --sider-nav-item-active-bg:     var(--accent-soft);
+  --sider-nav-item-active-color:  var(--accent);
+  --sider-nav-item-active-fw:     var(--fw-semibold);
+  --sider-nav-section-title-fs:        11px;
+  --sider-nav-section-title-color:     var(--text-tertiary);
+  --sider-nav-section-title-ls:        0.06em;  /* 当前值, 改 0.14em 视觉会跳, Phase B 决定 */
+  --sider-nav-section-title-padding:   12px 12px 6px;
+}
+
+/* --- Workspace 右栏(证据/文件预览)规约 --- */
+:root {
+  --workspace-width:           360px;
+  --workspace-width-min:       280px;
+  --workspace-width-max:       480px;
+  --workspace-bg:              var(--bg-elevated);
+  --workspace-border-left:     var(--border-subtle);
+  --workspace-resizer-w:       4px;
+  --workspace-resizer-hover:   var(--accent);
+  --workspace-resizer-idle:    var(--text-tertiary);
+}
+
+/* --- Composer Footer(粘底输入区)规约 --- */
+:root {
+  --composer-min-height:       56px;
+  --composer-max-height:       200px;
+  --composer-padding:          12px 16px;
+  --composer-bg:               var(--bg-primary);
+  --composer-border-top:       var(--border-subtle);
+  --composer-shadow-when-stuck: var(--elev-1);
+  --composer-context-ring-size:        28px;
+  --composer-context-ring-stroke:      2px;
+  --composer-chip-bg:          transparent;
+  --composer-chip-hover-bg:    var(--bg-secondary);
+  --composer-chip-active-bg:   var(--accent-soft);
+}
+
+/* --- Activity 工具调用折叠(借鉴 Hermes DESIGN.md) --- */
+:root {
+  --activity-summary-height:       24px;
+  --activity-summary-fs:           11px;
+  --activity-summary-color:        var(--text-tertiary);
+  --activity-summary-padding:      0 8px;
+  --activity-summary-radius:       var(--radius-xs);
+  --activity-summary-hover-bg:     var(--bg-secondary);  /* 不使用 --accent-soft, 保持克制 */
+  --activity-summary-running-dot:  var(--accent);
+}
+
+/* --- Tool Card 展开后单卡片(对话流内零阴影) --- */
+:root {
+  --tool-card-padding:        8px 12px;
+  --tool-card-fs:             12px;
+  --tool-card-color:          var(--text-secondary);
+  --tool-card-radius:         var(--radius-sm);
+  --tool-card-border:         var(--border-subtle);
+  --tool-card-status-pending: var(--text-tertiary);
+  --tool-card-status-running: var(--accent);
+  --tool-card-status-success: var(--color-success);
+  --tool-card-status-error:   var(--color-danger);
+}
+
+/* --- Thinking Card 思考块(比 assistant 散文更暗) --- */
+:root {
+  --thinking-card-padding:    6px 12px;
+  --thinking-card-fs:         11px;
+  --thinking-card-color:      var(--text-tertiary);
+  --thinking-card-radius:     var(--radius-xs);
+  --thinking-card-border:     none;                    /* 无 border, 用左 2px 竖线 */
+  --thinking-card-rail:       var(--border-subtle);    /* 左 2px 竖线色 */
+  --thinking-card-rail-w:     2px;
+  --thinking-card-font:       var(--font-mono);        /* 强制 mono, 区别于 prose */
+  --thinking-card-lh:         1.45;
+}
+
+/* --- Profile 三档徽章(atlas / atlas-ro / atlas-audited) --- */
+:root {
+  --profile-ro-badge-bg:           var(--color-warning);
+  --profile-ro-badge-fg:           var(--text-inverse);
+  --profile-audited-badge-bg:      var(--color-info);
+  --profile-audited-badge-fg:      var(--text-inverse);
+  --profile-badge-size:            14px;
+  --profile-badge-offset:          -2px;
+  --profile-badge-fs:              9px;
+  --profile-badge-radius:          50%;                  /* 圆形徽章 */
+  --profile-badge-fw:              var(--fw-bold);
+}
+
+/* --- Radius / Space / Easing / Elevation tokens --- */
+:root {
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-pill: 999px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  --dur-instant: 0.1s;
+  --dur-fast: 0.18s;
+  --dur-base: 0.25s;
+  --dur-slow: 0.4s;
+}
+
+/* --- Elevation (light) --- */
+:root,
+[data-theme="light"] {
+  --elev-1: 0 1px 0 rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.04);
+  --elev-2: 0 4px 12px rgba(0,0,0,0.06), 0 1px 3px rgba(0,0,0,0.04);
+  --elev-3: 0 12px 32px rgba(0,0,0,0.08), 0 2px 6px rgba(0,0,0,0.04);
+  --elev-inset: inset 0 1px 0 rgba(255,255,255,0.6);
+}
+[data-theme="dark"] {
+  --elev-1: 0 1px 0 rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.3);
+  --elev-2: 0 4px 16px rgba(0,0,0,0.4), 0 1px 3px rgba(0,0,0,0.3);
+  --elev-3: 0 16px 40px rgba(0,0,0,0.5), 0 2px 8px rgba(0,0,0,0.3);
+  --elev-inset: inset 0 1px 0 rgba(255,255,255,0.04);
+}
+
+/* --- Typography --- */
+:root {
+  --font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display',
+    'PingFang SC', 'Helvetica Neue', sans-serif;
+  --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Menlo', monospace;
+
+  /* Scale — Apple WWDC inspired */
+  --fs-hero: clamp(72px, 10vw, 120px);
+  --fs-section: clamp(40px, 6vw, 72px);
+  --fs-page: 32px;
+  --fs-h2: 24px;
+  --fs-h3: 20px;
+  --fs-body: 16px;
+  --fs-small: 14px;
+  --fs-caption: 12px;
+  --fs-mono: 12px;
+
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+  --fw-black: 900;
+
+  --ls-hero: -0.03em;
+  --ls-section: -0.02em;
+  --ls-page: -0.01em;
+  --ls-body: 0;
+  --ls-caption: 0.04em;
+  --ls-uppercase: 0.14em;
+}
+
+/* --- Base Reset --- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  font-family: var(--font-family);
+  font-size: var(--fs-body);
+  font-weight: var(--fw-regular);
+  line-height: 1.6;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  overflow-x: hidden;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+a:hover {
+  color: var(--accent-hover);
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+}
+
+/* --- Scrollbar --- */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
+
+/* --- Animations --- */
+@keyframes breath {
+  0%, 100% { transform: scale(1); opacity: 0.7; }
+  50% { transform: scale(1.06); opacity: 1; }
+}
+@keyframes pulse-fast {
+  0%, 100% { transform: scale(1); opacity: 0.8; }
+  50% { transform: scale(1.12); opacity: 1; }
+}
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes slide-from-right {
+  from { opacity: 0; transform: translateX(20px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes expand-width {
+  from { width: 0; opacity: 0; }
+  to { width: 100%; opacity: 1; }
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* --- Shared Tag/Chip --- */
+.atlas-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: var(--radius-xs);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  font-feature-settings: 'tnum';
+}
+.atlas-chip--accent { color: var(--accent); background: var(--accent-soft); }
+.atlas-chip--neutral { color: var(--text-secondary); background: var(--border-subtle); }
+.atlas-chip--success { color: var(--color-success); background: color-mix(in srgb, var(--color-success) 10%, transparent); }
+.atlas-chip--warning { color: var(--color-warning); background: color-mix(in srgb, var(--color-warning) 10%, transparent); }
+.atlas-chip--danger { color: var(--color-danger); background: color-mix(in srgb, var(--color-danger) 10%, transparent); }
+
+/* --- Generic stat card (used in Overview/Admin/EmployeeDetail) --- */
+.stat-card {
+  padding: 14px 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+.stat-card:hover { border-color: var(--border-default); }
+.stat-card .label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-uppercase);
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+.stat-card .value {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+  line-height: 1.1;
+  font-feature-settings: 'tnum';
+}
+.stat-card .delta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  margin-top: 4px;
+  font-weight: 500;
+}
+.stat-card .delta.up { color: var(--color-success); }
+.stat-card .delta.down { color: var(--color-danger); }
+
+/* --- Generic employee mini card --- */
+.employee-card {
+  padding: 10px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+}
+.employee-card:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.employee-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+  letter-spacing: -0.01em;
+}
+
+/* --- Copilot panel (Overview alt layout — kept for fallback) --- */
+.copilot-panel {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.copilot-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+.copilot-orb {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), #8B5CF6);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 4px 12px var(--accent-glow);
+}
+.copilot-orb .ring {
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  opacity: 0.4;
+  animation: breath 2.4s ease-in-out infinite;
+}
+.copilot-title { font-size: 14px; font-weight: 600; color: var(--text-primary); }
+.copilot-subtitle { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
+.copilot-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.copilot-msg { display: flex; gap: 10px; align-items: flex-start; }
+.copilot-msg-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.copilot-msg-bubble {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  white-space: pre-wrap;
+  max-width: 78%;
+}
+.copilot-msg.user { flex-direction: row-reverse; }
+.copilot-msg.user .copilot-msg-bubble { background: var(--accent-soft); color: var(--text-primary); }
+.copilot-quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 16px 8px;
+  flex-shrink: 0;
+}
+.copilot-quick-btn {
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--border-subtle);
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  border: none;
+  transition: all var(--dur-fast) var(--ease-out);
+}
+.copilot-quick-btn:hover { color: var(--accent); background: var(--accent-soft); }
+.copilot-attach-btns {
+  display: flex;
+  gap: 4px;
+  padding: 0 16px;
+  flex-shrink: 0;
+}
+.copilot-attach-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-xs);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--dur-fast) var(--ease-out);
+}
+.copilot-attach-btn:hover { color: var(--accent); background: var(--accent-soft); }
+.copilot-input-area {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px 14px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-subtle);
+}
+.copilot-input {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 13px;
+  color: var(--text-primary);
+  font-family: inherit;
+}
+.copilot-input::placeholder { color: var(--text-placeholder); }
+.copilot-send-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-xs);
+  color: var(--accent);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+.copilot-send-btn:hover { background: var(--accent-soft); }
+
+/* --- Evidence finding card --- */
+.evidence-finding {
+  padding: 14px 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  margin-bottom: 10px;
+  border-left-width: 3px;
+  border-left-style: solid;
+}
+.evidence-finding.critical { border-left-color: var(--color-danger); }
+.evidence-finding.high { border-left-color: var(--color-warning); }
+.evidence-finding.medium { border-left-color: #FBBF24; }
+
+.timeline-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  position: relative;
+}
+.timeline-step:not(:last-child)::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 18px;
+  bottom: -8px;
+  width: 1px;
+  background: var(--border-subtle);
+}
+.timeline-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  margin-top: 4px;
+  flex-shrink: 0;
+  border: 2px solid var(--bg-elevated);
+  box-shadow: 0 0 0 1px var(--border-default);
+}
+.timeline-dot.done { background: var(--color-success); box-shadow: 0 0 0 1px var(--color-success); }
+.timeline-dot.active { background: var(--accent); box-shadow: 0 0 0 1px var(--accent); animation: pulse-fast 1.4s ease-in-out infinite; }
+.timeline-dot.pending { background: transparent; }
+
+.typing-dots::after {
+  content: '...';
+  animation: typing-blink 1.4s steps(4, end) infinite;
+}
+@keyframes typing-blink {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+/* --- Utility --- */
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0;
+}
+
+/* ============================================================
+   Atlas M3.5 — UI 升级层 (2026-06-04)
+   原则:Calm Console / 玻璃态增强 / 微动效 / 角色色带 / AI 原生
+   依赖 token,不改 9 套基础;新增 5 套 motion 派生 token
+   ============================================================ */
+
+/* --- Motion Tokens (M3.5 新增) --- */
+:root {
+  --motion-fast:    120ms;
+  --motion-base:    200ms;
+  --motion-slow:    320ms;
+  --motion-ease:    cubic-bezier(0.4, 0, 0.2, 1);     /* Material standard */
+  --motion-ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --motion-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1); /* Apple-like 弹性 */
+  --motion-press-scale: 0.97;
+}
+
+/* --- 玻璃态增强(M3.5 加 -webkit- 兼容 + 增强 4 套层) --- */
+.glass-layer-1 { /* 侧栏 */
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+}
+.glass-layer-2 { /* 顶栏 */
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: saturate(200%) blur(28px);
+  backdrop-filter: saturate(200%) blur(28px);
+  border-bottom: 1px solid var(--glass-border);
+}
+.glass-layer-3 { /* Popover / Dropdown */
+  background: var(--bg-elevated);
+  -webkit-backdrop-filter: saturate(200%) blur(32px);
+  backdrop-filter: saturate(200%) blur(32px);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-popover);
+}
+.glass-layer-4 { /* Composer 粘底 */
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: saturate(180%) blur(24px);
+  backdrop-filter: saturate(180%) blur(24px);
+  border-top: 1px solid var(--glass-border);
+}
+
+/* --- 对话气泡角色色带(M3.5 AI 原生) --- */
+.message-bubble {
+  position: relative;
+  padding: 12px 16px;
+  border-radius: 14px;
+  transition: box-shadow var(--motion-base) var(--motion-ease),
+              transform var(--motion-base) var(--motion-ease);
+}
+.message-bubble:hover {
+  box-shadow: var(--shadow-md);
+}
+.message-bubble.user {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  border-bottom-right-radius: 4px;        /* user 右下小角 = 自己说话方向 */
+}
+.message-bubble.user::before {
+  content: '';
+  position: absolute;
+  left: -2px; top: 12px;
+  width: 3px; height: 18px;
+  background: var(--accent);
+  border-radius: 0 2px 2px 0;
+  opacity: 0.7;
+}
+.message-bubble.assistant {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border-bottom-left-radius: 4px;         /* assistant 左下小角 = 对方说话方向 */
+  font-family: var(--font-prose);
+}
+.message-bubble.assistant::before {
+  content: '';
+  position: absolute;
+  left: -2px; top: 12px;
+  width: 3px; height: 18px;
+  background: linear-gradient(180deg, var(--accent), transparent);
+  border-radius: 0 2px 2px 0;
+  opacity: 0.5;
+}
+.message-bubble.streaming {
+  position: relative;
+}
+.message-bubble.streaming::after {
+  content: '';
+  position: absolute;
+  right: 8px; bottom: 8px;
+  width: 6px; height: 6px;
+  background: var(--accent);
+  border-radius: 50%;
+  animation: pulse-fast 1.2s var(--motion-ease) infinite;
+}
+
+/* --- Composer focus 态(M3.5 光晕 ring) --- */
+.composer-shell {
+  transition: box-shadow var(--motion-base) var(--motion-ease),
+              border-color var(--motion-base) var(--motion-ease);
+}
+.composer-shell:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft), var(--shadow-md);
+}
+
+/* --- Sider 选中态(M3.5 微动 + 内嵌光带) --- */
+.sider-nav-item {
+  position: relative;
+  transition: background var(--motion-fast) var(--motion-ease),
+              color var(--motion-fast) var(--motion-ease);
+}
+.sider-nav-item:hover:not(.active) {
+  background: var(--bg-secondary);
+}
+.sider-nav-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: var(--fw-semibold);
+}
+.sider-nav-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 8px; bottom: 8px;
+  width: 2px;
+  background: var(--accent);
+  border-radius: 0 2px 2px 0;
+}
+.sider-nav-item:active {
+  transform: scale(var(--motion-press-scale));
+}
+
+/* --- 通用 transition 工具类(M3.5) --- */
+.atlas-transition {
+  transition: background var(--motion-base) var(--motion-ease),
+              color var(--motion-base) var(--motion-ease),
+              border-color var(--motion-base) var(--motion-ease),
+              box-shadow var(--motion-base) var(--motion-ease),
+              transform var(--motion-base) var(--motion-ease);
+}
+.atlas-press {
+  transition: transform var(--motion-fast) var(--motion-ease);
+}
+.atlas-press:active {
+  transform: scale(var(--motion-press-scale));
+}
+
+/* --- 减少动效偏好(M3.5 无障碍) --- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

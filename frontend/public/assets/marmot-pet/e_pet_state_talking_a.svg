@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" shape-rendering="crispEdges">
+  <title>Electronic Pet Capybara - Talking State A</title>
+  <defs>
+    <style>
+      .outline{fill:#101218}
+      .fur{fill:#d99a5d}
+      .fur2{fill:#be7e49}
+      .shade{fill:#b07242;opacity:.45}
+      .muzzle{fill:#b87a4c}
+      .muzzle2{fill:#825238}
+      .white{fill:#f5f7f6}
+      .black{fill:#101218}
+      .pink{fill:#ef8f86}
+      .note{fill:#f4edd0}
+    </style>
+  </defs>
+
+  <g id="reference_frame" opacity="0">
+    <rect x="0" y="0" width="512" height="512" fill="none"/>
+    <rect x="64" y="64" width="384" height="384" fill="none" stroke="#00f"/>
+  </g>
+
+  <g id="pet_root">
+    <g id="body" data-rive-origin="256,300">
+      <path id="body_outline" class="outline" d="M136 176h32v-32h48v-16h80v16h48v32h32v48h32v80h24v112h-32v32H112v-32H80V304h24v-80h32z"/>
+      <path id="body_fill" class="fur" d="M152 184h32v-32h48v-16h48v16h48v32h32v48h32v80h24v96h-32v24H128v-24H96v-96h24v-80h32z"/>
+      <path id="body_shadow_left" class="shade" d="M128 288h40v128h-40zm40-96h32v88h-32zm24 224h152v16H192z"/>
+      <path id="body_shadow_right" class="shade" d="M336 184h24v64h32v72h24v88h-40V296h-24v-72h-16z"/>
+      <rect id="neck_shadow" class="fur2" x="188" y="278" width="144" height="14"/>
+    </g>
+
+    <g id="ears" data-rive-origin="256,105">
+      <g id="ear_left" data-rive-origin="168,98">
+        <rect class="outline" x="144" y="72" width="48" height="48" rx="16"/>
+        <rect class="fur2" x="156" y="84" width="28" height="28" rx="10"/>
+      </g>
+      <g id="ear_right" data-rive-origin="344,98">
+        <rect class="outline" x="320" y="72" width="48" height="48" rx="16"/>
+        <rect class="fur2" x="328" y="84" width="28" height="28" rx="10"/>
+      </g>
+    </g>
+
+    <g id="head" data-rive-origin="256,192">
+      <path id="head_outline" class="outline" d="M136 104h48V88h144v16h48v32h24v112h-24v40h-40v24H176v-24h-40v-40h-24V136h24z"/>
+      <path id="head_fill" class="fur" d="M152 112h40V96h128v16h40v32h24v96h-24v40h-40v16H184v-16h-40v-40h-24v-96h32z"/>
+      <path id="cheek_shadow" class="shade" d="M272 120h72v24h24v88h-16v32h-56v-16h24v-32h16v-56h-32v-24h-32z"/>
+    </g>
+
+    <g id="eyes_open" data-rive-visible="idle,breathing,talking,thinking" opacity="1">
+      <g id="eye_left_open" data-rive-origin="214,164">
+        <rect class="outline" x="176" y="128" width="72" height="72" rx="26"/>
+        <rect class="white" x="188" y="140" width="48" height="48" rx="18"/>
+        <rect id="pupil_left" class="black" x="212" y="160" width="12" height="12"/>
+      </g>
+      <g id="eye_right_open" data-rive-origin="308,154">
+        <rect class="outline" x="272" y="116" width="72" height="72" rx="26"/>
+        <rect class="white" x="284" y="128" width="48" height="48" rx="18"/>
+        <rect id="pupil_right" class="black" x="304" y="148" width="12" height="12"/>
+      </g>
+    </g>
+
+    <g id="eyes_blink" data-rive-visible="blink" opacity="0">
+      <rect class="black" x="188" y="162" width="48" height="10"/>
+      <rect class="black" x="284" y="150" width="48" height="10"/>
+    </g>
+
+    <g id="muzzle" data-rive-origin="285,227">
+      <path class="muzzle" d="M232 200h80v16h32v48h-16v32H216v-32h-16v-48h32z"/>
+      <rect class="muzzle2" x="248" y="218" width="18" height="10"/>
+      <rect class="muzzle2" x="302" y="218" width="14" height="10"/>
+      <rect class="black" x="264" y="222" width="10" height="10"/>
+      <rect class="black" x="300" y="222" width="10" height="10"/>
+    </g>
+
+    <g id="mouth_idle" data-rive-visible="idle,breathing,thinking" opacity="0">
+      <rect class="black" x="282" y="244" width="8" height="64"/>
+      <rect class="black" x="258" y="306" width="32" height="8"/>
+    </g>
+
+    <g id="mouth_talk_a" data-rive-visible="talking" opacity="1">
+      <rect class="black" x="270" y="248" width="36" height="56"/>
+      <rect class="pink" x="278" y="272" width="20" height="22"/>
+    </g>
+
+    <g id="mouth_talk_b" data-rive-visible="talking" opacity="0">
+      <rect class="black" x="268" y="254" width="40" height="28"/>
+      <rect class="pink" x="280" y="268" width="16" height="8"/>
+    </g>
+
+    <g id="sleep_face" data-rive-visible="sleeping" opacity="0">
+      <rect class="black" x="188" y="160" width="52" height="8"/>
+      <rect class="black" x="284" y="150" width="52" height="8"/>
+      <rect class="black" x="262" y="268" width="56" height="8"/>
+      <g id="zzz" class="white">
+        <rect x="362" y="86" width="42" height="8"/>
+        <rect x="394" y="94" width="8" height="8"/>
+        <rect x="386" y="102" width="8" height="8"/>
+        <rect x="378" y="110" width="42" height="8"/>
+        <rect x="404" y="50" width="30" height="8"/>
+        <rect x="426" y="58" width="8" height="8"/>
+        <rect x="418" y="66" width="30" height="8"/>
+      </g>
+    </g>
+
+    <g id="arms" data-rive-origin="256,340">
+      <g id="arm_left" data-rive-origin="136,324">
+        <rect class="outline" x="72" y="300" width="56" height="24"/>
+        <rect class="outline" x="88" y="324" width="24" height="48"/>
+        <rect class="fur" x="80" y="308" width="40" height="16"/>
+        <rect class="fur" x="96" y="324" width="12" height="40"/>
+      </g>
+      <g id="arm_right" data-rive-origin="376,324">
+        <rect class="outline" x="384" y="300" width="56" height="24"/>
+        <rect class="outline" x="400" y="324" width="24" height="48"/>
+        <rect class="fur" x="392" y="308" width="40" height="16"/>
+        <rect class="fur" x="404" y="324" width="12" height="40"/>
+      </g>
+    </g>
+
+    <g id="thinking_bulb" data-rive-visible="thinking" opacity="0">
+      <rect class="outline" x="370" y="78" width="48" height="48" rx="18"/>
+      <rect class="note" x="380" y="88" width="28" height="28" rx="10"/>
+      <rect class="outline" x="390" y="126" width="12" height="20"/>
+      <rect class="outline" x="382" y="146" width="28" height="8"/>
+      <rect class="outline" x="358" y="98" width="8" height="8"/>
+      <rect class="outline" x="424" y="98" width="8" height="8"/>
+      <rect class="outline" x="392" y="64" width="8" height="8"/>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,236 @@
+{
+  "version": "2026-06-09",
+  "skills": [
+    {
+      "name": "文档提取",
+      "slug": "document-extraction",
+      "description": "读取 DOCX、PDF、Excel、PPT、TXT、Markdown 等企业文件, 提取摘要、关键片段和可引用上下文。",
+      "category": "document",
+      "version": "1.0.0",
+      "scope": "tenant",
+      "visibility": "tenant",
+      "mutable": false
+    },
+    {
+      "name": "三表财务建模",
+      "slug": "financial-modeling",
+      "description": "支持收入、毛利、现金流、预算、回款和经营指标分析, 输出经营判断和管理动作。",
+      "category": "finance",
+      "version": "1.0.0",
+      "scope": "tenant",
+      "visibility": "tenant",
+      "mutable": false
+    },
+    {
+      "name": "合同风险审查",
+      "slug": "contract-risk-review",
+      "description": "识别合同条款中的履约、付款、违约、授权、数据和合规风险, 输出风险等级和修改建议。",
+      "category": "legal",
+      "version": "1.0.0",
+      "scope": "tenant",
+      "visibility": "tenant",
+      "mutable": false
+    },
+    {
+      "name": "竞品与市场研究",
+      "slug": "market-competitive-research",
+      "description": "分析客户行业、竞品替代、市场机会和销售切入点, 区分事实、推断和建议。",
+      "category": "market",
+      "version": "1.0.0",
+      "scope": "tenant",
+      "visibility": "tenant",
+      "mutable": false
+    },
+    {
+      "name": "方案写作",
+      "slug": "proposal-writing",
+      "description": "将客户需求、产品能力、价格边界和推进路径组织成可交付销售方案。",
+      "category": "sales",
+      "version": "1.0.0",
+      "scope": "tenant",
+      "visibility": "tenant",
+      "mutable": false
+    },
+    {
+      "name": "招聘筛选",
+      "slug": "recruiting-screening",
+      "description": "根据 JD 和候选人材料做结构化匹配、候选人排序、面试问题和合规提醒。",
+      "category": "hr",
+      "version": "1.0.0",
+      "scope": "tenant",
+      "visibility": "tenant",
+      "mutable": false
+    },
+    {
+      "name": "会议纪要与项目跟踪",
+      "slug": "meeting-project-tracking",
+      "description": "将会议讨论整理为决议、待办、责任人、截止时间、风险和验收标准。",
+      "category": "project",
+      "version": "1.0.0",
+      "scope": "tenant",
+      "visibility": "tenant",
+      "mutable": false
+    }
+  ],
+  "employees": [
+    {
+      "display_name": "文档情报分析员",
+      "avatar": "文",
+      "description": "读取企业文件, 提取事实、风险、建议和引用片段。",
+      "model": "mimo-v2.5-pro",
+      "provider": "hermes",
+      "temperature": 0.3,
+      "max_tokens": 4096,
+      "toolsets": ["document-extraction"],
+      "skill_slugs": ["document-extraction"],
+      "system_prompt": "你是企业文档情报分析员。你的任务是读取用户上传的文件, 提取事实、数据、风险和待确认事项。回答时必须优先依据文件内容, 明确说明使用了哪些文件或片段。不要编造未提供的信息。输出优先使用 Markdown 表格、要点和简短结论。"
+    },
+    {
+      "display_name": "财务经营分析师",
+      "avatar": "财",
+      "description": "分析收入质量、毛利、回款、现金流和经营风险。",
+      "model": "mimo-v2.5-pro",
+      "provider": "hermes",
+      "temperature": 0.25,
+      "max_tokens": 4096,
+      "toolsets": ["financial-modeling"],
+      "skill_slugs": ["document-extraction", "financial-modeling"],
+      "system_prompt": "你是严谨的财务经营分析师。你关注收入质量、毛利、现金流、回款、成本和经营风险。回答必须基于用户提供的数据或文件, 优先给出数字口径、关键假设、风险判断和管理动作。不要替法务、销售或 HR 做最终判断, 群聊时只回答财务经营部分。"
+    },
+    {
+      "display_name": "法务合规顾问",
+      "avatar": "法",
+      "description": "审查合同条款、授权审批、数据和商业合规风险。",
+      "model": "mimo-v2.5-pro",
+      "provider": "hermes",
+      "temperature": 0.2,
+      "max_tokens": 4096,
+      "toolsets": ["contract-risk-review"],
+      "skill_slugs": ["document-extraction", "contract-risk-review"],
+      "system_prompt": "你是企业法务合规顾问。你负责识别合同、授权、审批、数据、劳动用工和商业合规风险。回答要区分高/中/低风险, 给出条款依据、待确认问题和可执行修改建议。不要冒充律师出具正式法律意见; 对缺失材料要明确列出需要补充的文件。"
+    },
+    {
+      "display_name": "销售方案顾问",
+      "avatar": "销",
+      "description": "生成客户方案、价值主张、报价逻辑和销售推进计划。",
+      "model": "mimo-v2.5-pro",
+      "provider": "hermes",
+      "temperature": 0.55,
+      "max_tokens": 4096,
+      "toolsets": ["proposal-writing"],
+      "skill_slugs": ["proposal-writing", "document-extraction"],
+      "system_prompt": "你是企业销售方案顾问。你负责把客户背景、痛点、产品能力和商业约束转化为可执行销售方案。回答要包含客户价值、方案结构、推进路径、异议处理和下一步动作。涉及价格和合同风险时, 只给业务建议, 需要财务或法务员工补充专业判断。"
+    },
+    {
+      "display_name": "市场竞品研究员",
+      "avatar": "市",
+      "description": "分析行业趋势、竞品差异、客户需求和市场机会。",
+      "model": "mimo-v2.5-pro",
+      "provider": "hermes",
+      "temperature": 0.45,
+      "max_tokens": 4096,
+      "toolsets": ["market-competitive-research"],
+      "skill_slugs": ["market-competitive-research", "document-extraction"],
+      "system_prompt": "你是市场竞品研究员。你负责从用户提供资料和可用信息中提炼市场趋势、竞品差异、客户需求和机会点。输出要区分事实、推断和建议。没有来源时必须说明不确定性, 不要把猜测写成事实。"
+    },
+    {
+      "display_name": "HR 招聘与员工服务专员",
+      "avatar": "H",
+      "description": "做岗位匹配、候选人初筛、面试问题和员工服务答疑。",
+      "model": "mimo-v2.5-pro",
+      "provider": "hermes",
+      "temperature": 0.35,
+      "max_tokens": 4096,
+      "toolsets": ["recruiting-screening"],
+      "skill_slugs": ["recruiting-screening", "document-extraction"],
+      "system_prompt": "你是 HR 招聘与员工服务专员。你负责根据岗位要求和候选人材料做结构化初筛、面试问题设计和员工服务答疑。回答必须避免年龄、性别、婚育等不适当歧视维度。涉及劳动合规风险时, 请提示需要法务员工复核。"
+    },
+    {
+      "display_name": "运营增长顾问",
+      "avatar": "运",
+      "description": "拆解业务指标、渠道治理、投诉闭环和增长实验。",
+      "model": "mimo-v2.5-pro",
+      "provider": "hermes",
+      "temperature": 0.4,
+      "max_tokens": 4096,
+      "toolsets": ["project-tracking"],
+      "skill_slugs": ["meeting-project-tracking", "document-extraction"],
+      "system_prompt": "你是运营增长顾问。你负责把业务问题拆成指标、流程、责任人和行动计划。回答要包含目标、动作、负责人、周期、验收指标和风险。不要只给空泛建议, 每条建议都应能被团队执行和追踪。"
+    },
+    {
+      "display_name": "项目交付经理",
+      "avatar": "项",
+      "description": "整理会议纪要、项目计划、风险清单和任务追踪表。",
+      "model": "mimo-v2.5-pro",
+      "provider": "hermes",
+      "temperature": 0.3,
+      "max_tokens": 4096,
+      "toolsets": ["meeting-project-tracking"],
+      "skill_slugs": ["meeting-project-tracking", "document-extraction"],
+      "system_prompt": "你是项目交付经理。你负责把讨论内容转化为清晰的项目计划、待办事项、风险和交付物。输出要包含责任人、截止时间、依赖关系和验收标准。缺少责任人或时间时, 标记为待确认。"
+    }
+  ],
+  "templates": [
+    {
+      "name": "经营分析作战室",
+      "description": "财务、法务、运营三方接力, 将经营简报转为管理层报告、风险清单和行动计划。",
+      "category": "business-review",
+      "visibility": "tenant",
+      "primary_employee": "财务经营分析师",
+      "participants": ["法务合规顾问", "运营增长顾问"],
+      "strategy": "relay",
+      "failure_strategy": "continue_with_next_employee",
+      "output_type": "markdown_html",
+      "default_prompt": "请基于上传的经营简报和数据表, 按财务、法务、运营角色接力分析, 输出管理层摘要、风险表格、HTML 看板和 30 天行动清单。"
+    },
+    {
+      "name": "合同审查作战室",
+      "description": "法务、财务、销售三方评估合同风险、商业条款和谈判策略。",
+      "category": "contract-review",
+      "visibility": "tenant",
+      "primary_employee": "法务合规顾问",
+      "participants": ["财务经营分析师", "销售方案顾问"],
+      "strategy": "relay",
+      "failure_strategy": "stop_on_primary_failure",
+      "output_type": "markdown",
+      "default_prompt": "请审查上传合同, 输出风险等级、条款修改建议、财务影响和谈判策略。"
+    },
+    {
+      "name": "销售攻坚作战室",
+      "description": "市场、销售、财务协同完成客户背景分析、销售方案和报价边界。",
+      "category": "sales",
+      "visibility": "tenant",
+      "primary_employee": "市场竞品研究员",
+      "participants": ["销售方案顾问", "财务经营分析师"],
+      "strategy": "relay",
+      "failure_strategy": "continue_with_next_employee",
+      "output_type": "markdown",
+      "default_prompt": "请基于客户背景和销售线索, 生成行业痛点、竞品对比、销售方案、报价边界和推进计划。"
+    },
+    {
+      "name": "招聘初筛作战室",
+      "description": "HR 和法务协同完成候选人初筛、面试题和合规提醒。",
+      "category": "hr",
+      "visibility": "tenant",
+      "primary_employee": "HR 招聘与员工服务专员",
+      "participants": ["法务合规顾问"],
+      "strategy": "relay",
+      "failure_strategy": "continue_with_next_employee",
+      "output_type": "markdown",
+      "default_prompt": "请基于岗位说明和候选人清单, 输出候选人排序、面试问题和招聘合规提醒。"
+    },
+    {
+      "name": "项目例会闭环",
+      "description": "项目经理和运营顾问将会议纪要转成待办、责任人、风险和复盘。",
+      "category": "project",
+      "visibility": "tenant",
+      "primary_employee": "项目交付经理",
+      "participants": ["运营增长顾问"],
+      "strategy": "relay",
+      "failure_strategy": "continue_with_next_employee",
+      "output_type": "markdown",
+      "default_prompt": "请把会议纪要整理成结论、待办、责任人、截止时间、风险和下次议题。"
+    }
+  ]
+}
+

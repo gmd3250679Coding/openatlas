@@ -1,0 +1,21 @@
+/* highlight.js dark theme for code blocks */
+.hljs {
+  background: #1e1e2e;
+  padding: 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.6;
+  display: block;
+}
+.hljs-keyword, .hljs-selector-tag, .hljs-title, .hljs-section,
+.hljs-doctag, .hljs-name, .hljs-strong { color: #c678dd; }
+.hljs-string, .hljs-attr, .hljs-template-variable { color: #98c379; }
+.hljs-comment, .hljs-quote { color: #5c6370; font-style: italic; }
+.hljs-number, .hljs-literal, .hljs-variable, .hljs-template-tag,
+.hljs-tag .hljs-attr { color: #d19a66; }
+.hljs-type, .hljs-built_in { color: #e5c07b; }
+.hljs-link, .hljs-symbol, .hljs-bullet { color: #61afef; }
+.hljs-meta { color: #56b6c2; }
+.hljs-deletion { color: #e06c75; }
+.hljs-addition { color: #98c379; }

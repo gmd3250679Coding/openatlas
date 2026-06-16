@@ -1,0 +1,31 @@
+/**
+ * katex-override.css — Override KaTeX's default font sizing and color so that
+ * math blocks inside Streamdown blend with Atlas's prose typography (M3.3).
+ *
+ * KaTeX ships with its own CSS that hard-codes fonts and sizes; we keep the
+ * layout/positioning rules and just retune scale + color to match
+ * --sdm-fg / --font-prose.
+ */
+.streamdown-host .katex,
+.streamdown-host .katex-display {
+  color: var(--sdm-fg);
+  font-size: 1.05em; /* match prose body */
+}
+.streamdown-host .katex-display {
+  margin: 16px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 8px 0;
+}
+.streamdown-host .katex-display > .katex {
+  font-size: 1.1em;
+}
+/* Inline math shouldn't be larger than surrounding text */
+.streamdown-host p .katex {
+  font-size: inherit;
+}
+/* When data-theme switches to dark, keep KaTeX glyphs legible */
+[data-theme="dark"] .streamdown-host .katex,
+[data-theme="dark"] .streamdown-host .katex-display {
+  color: var(--text-primary, #e5e7eb);
+}
