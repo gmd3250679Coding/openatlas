@@ -426,6 +426,14 @@ def run() -> dict:
 
     report.append(expect("job scheduler metadata", job_scheduler_metadata))
 
+    def stale_session_maintenance_route():
+        dry = request("POST", "/sessions/maintenance/stale?dry_run=true&limit=5", {}, token=token)
+        if "stale" not in dry or "items" not in dry:
+            raise SmokeError(f"stale maintenance route missing payload: {dry}")
+        return {"stale": dry.get("stale"), "scanned": dry.get("scanned"), "dry_run": dry.get("dry_run")}
+
+    report.append(expect("stale session maintenance", stale_session_maintenance_route))
+
     def template_create_use():
         sid = request("POST", "/sessions", {
             "employee_id": emp_id,

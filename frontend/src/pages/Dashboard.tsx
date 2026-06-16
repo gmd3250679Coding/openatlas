@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Button, Tag, message } from 'antd';
 import {
   fetchDashboardMe, fetchDashboardTenant, fetchDashboardSystem, fetchMe,
-  fetchRuntimeStatus, fetchTenantIsolation,
+  fetchRuntimeStatus, fetchTenantIsolation, maintainStaleSessions,
 } from '../services/api';
 
 type Variant = 'me' | 'tenant' | 'system';
@@ -63,7 +63,7 @@ export default function Dashboard() {
       {!loading && !err && data && (
         <div>
           {variant === 'me' && <MeView data={data} />}
-          {variant === 'tenant' && <TenantView data={data} />}
+          {variant === 'tenant' && <TenantView data={data} onReload={() => load(variant)} />}
           {variant === 'system' && <SystemView data={data} />}
         </div>
       )}
@@ -114,10 +114,24 @@ function MeView({ data }: { data: any }) {
   );
 }
 
-function TenantView({ data }: { data: any }) {
+function TenantView({ data, onReload }: { data: any; onReload?: () => Promise<void> | void }) {
   const gw = data.gateway || {};
   const maturity = data.maturity || {};
   const maturityTone = toneForMaturity(num(maturity.score, 100));
+  const [maintaining, setMaintaining] = useState(false);
+  const staleCount = num(maturity.signals?.stale_sessions);
+  const handleMaintainStale = async () => {
+    setMaintaining(true);
+    try {
+      const res = await maintainStaleSessions(50);
+      message.success(`已维护 ${res?.updated || 0} 个陈旧任务`);
+      await onReload?.();
+    } catch (ex: any) {
+      message.error(`维护失败: ${ex?.message || ex}`);
+    } finally {
+      setMaintaining(false);
+    }
+  };
   return (
     <div>
       <h3 style={{ marginTop: 0 }}>租户概览 — {data.tenant?.slug}</h3>
@@ -142,6 +156,11 @@ function TenantView({ data }: { data: any }) {
                 Runtime {maturity.signals?.runtime_ok ? '健康' : '需检查'} · 卡住任务 {num(maturity.signals?.stale_sessions)} · 上下文覆盖 {Math.round(num(maturity.signals?.context_coverage) * 100)}% · 交付物覆盖 {Math.round(num(maturity.signals?.artifact_coverage) * 100)}%
               </div>
             </div>
+            {staleCount > 0 && (
+              <Button size="small" loading={maintaining} onClick={handleMaintainStale} style={{ marginLeft: 'auto' }}>
+                维护陈旧任务
+              </Button>
+            )}
           </div>
           {maturity.risk_items?.length > 0 && (
             <div style={{ marginTop: 12, display: 'grid', gap: 6 }}>
@@ -167,7 +186,7 @@ function TenantView({ data }: { data: any }) {
         <Metric label="失败率" value={`${Math.round(num(data.failure_rate) * 1000) / 10}%`} />
         <Metric label="任务交付物" value={num(data.artifacts?.count)} sub={Object.entries(data.artifacts?.kinds || {}).map(([k, v]) => `${k}:${v}`).join(' · ') || '暂无'} />
         <Metric label="Skill 失败率" value={`${Math.round(num(data.skill_health?.failure_rate) * 1000) / 10}%`}
-          sub={`runs ${num(data.skill_health?.runs)} · fail ${num(data.skill_health?.failures)}`} />
+          sub={`recent ${num(data.skill_health?.runs)}/${num(data.skill_health?.total_runs)} · fail ${num(data.skill_health?.failures)}`} />
         <Metric label="Gateway" value={text(gw.status)}
           sub={gw.port ? `port ${gw.port} · pid ${gw.pid}` : 'no runtime'} />
       </div>

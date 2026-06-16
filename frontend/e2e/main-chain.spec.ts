@@ -77,95 +77,112 @@ test.describe('OpenAtlas main chain', () => {
       window.localStorage.setItem('atlas_show_test_fixtures', 'true');
     });
     const token = await loginApi(request);
-    const [primary, relay] = await ensureEmployees(request, token);
-    const template = await createTemplate(request, token, primary);
+    const cleanupSessions: string[] = [];
+    const cleanupTemplates: string[] = [];
+    try {
+      const [primary, relay] = await ensureEmployees(request, token);
+      const template = await createTemplate(request, token, primary);
+      cleanupTemplates.push(template.id);
 
-    await loginUi(page);
+      await loginUi(page);
 
-    await page.goto(`/overview?employee=${primary.id}`);
-    const workbenchComposer = page.getByPlaceholder('跟 Atlas 说点什么…');
-    await expect(workbenchComposer).toBeVisible();
+      await page.goto(`/overview?employee=${primary.id}`);
+      const workbenchComposer = page.getByPlaceholder('跟 Atlas 说点什么…');
+      await expect(workbenchComposer).toBeVisible();
 
-    const docx = Buffer.from(DOCX_BASE64, 'base64');
-    await page.locator('input[type="file"]').first().setInputFiles({
-      name: 'openatlas-e2e-report.docx',
-      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      buffer: docx,
-    });
-    await expect(page.getByText('openatlas-e2e-report.docx')).toBeVisible();
+      const docx = Buffer.from(DOCX_BASE64, 'base64');
+      await page.locator('input[type="file"]').first().setInputFiles({
+        name: 'openatlas-e2e-report.docx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        buffer: docx,
+      });
+      await expect(page.getByText('openatlas-e2e-report.docx')).toBeVisible();
 
-    const prompt = `OPENATLAS_E2E_WORKBENCH_${Date.now()}`;
-    await workbenchComposer.fill(`请阅读附件并回复 ${prompt}`);
-    await workbenchComposer.press('Enter');
-    await expect(page.getByText(prompt).first()).toBeVisible();
-    await expect(page.getByText(/已注入|extracted|uploaded|已上传/).first()).toBeVisible();
-    if (STRICT_MODEL) {
-      await expect(page.locator('.message-bubble').filter({ hasNotText: prompt }).last()).toBeVisible({ timeout: 60_000 });
-    }
-    const activeComposer = page.locator('textarea').last();
-    await expect(activeComposer).toBeVisible({ timeout: 30_000 });
-    await expect(activeComposer).toBeDisabled({ timeout: 10_000 }).catch(() => undefined);
-    const approvalDeadline = Date.now() + 120_000;
-    while (Date.now() < approvalDeadline && !(await activeComposer.isEnabled().catch(() => false))) {
-      const oneShotApproval = page.getByRole('button', { name: /仅本次允许/ }).first();
-      if (await oneShotApproval.isVisible({ timeout: 1_000 }).catch(() => false)) {
-        await oneShotApproval.click({ force: true });
-      } else {
-        await page.waitForTimeout(1_000);
+      const prompt = `OPENATLAS_E2E_WORKBENCH_${Date.now()}`;
+      await workbenchComposer.fill(`请阅读附件并回复 ${prompt}`);
+      await workbenchComposer.press('Enter');
+      await expect(page.getByText(prompt).first()).toBeVisible();
+      await expect(page.getByText(/已注入|extracted|uploaded|已上传/).first()).toBeVisible();
+      const workbenchSessionId = new URL(page.url()).searchParams.get('conversation');
+      if (workbenchSessionId) cleanupSessions.push(workbenchSessionId);
+      if (STRICT_MODEL) {
+        await expect(page.locator('.message-bubble').filter({ hasNotText: prompt }).last()).toBeVisible({ timeout: 60_000 });
+      }
+      const activeComposer = page.locator('textarea').last();
+      await expect(activeComposer).toBeVisible({ timeout: 30_000 });
+      await expect(activeComposer).toBeDisabled({ timeout: 10_000 }).catch(() => undefined);
+      const approvalDeadline = Date.now() + 120_000;
+      while (Date.now() < approvalDeadline && !(await activeComposer.isEnabled().catch(() => false))) {
+        const oneShotApproval = page.getByRole('button', { name: /仅本次允许/ }).first();
+        if (await oneShotApproval.isVisible({ timeout: 1_000 }).catch(() => false)) {
+          await oneShotApproval.click({ force: true });
+        } else {
+          await page.waitForTimeout(1_000);
+        }
+      }
+      await expect(activeComposer).toBeEnabled({ timeout: 5_000 });
+
+      const session = await api<any>(request, 'POST', '/sessions', token, {
+        employee_id: primary.id,
+        title: `E2E History ${Date.now()}`,
+      });
+      cleanupSessions.push(session.id);
+      const historyStream = await request.post(`${API_BASE}/sessions/${session.id}/chat/stream`, {
+        headers: { Authorization: `Bearer ${token}` },
+        data: { message: `E2E_HISTORY_${Date.now()}。请严格只输出 OK。` },
+        timeout: 120_000,
+      });
+      expect(historyStream.ok()).toBeTruthy();
+      await historyStream.text();
+      await page.goto('/history?showTestFixtures=1');
+      await expect(page.getByRole('heading', { name: '对话历史' })).toBeVisible();
+      await page.getByText(session.title).first().click();
+      await expect(page).toHaveURL(/\/overview/);
+
+      const group = await api<any>(request, 'POST', '/sessions', token, {
+        employee_id: primary.id,
+        participant_ids: [relay.id],
+        title: `E2E Group ${Date.now()}`,
+      });
+      cleanupSessions.push(group.id);
+      const groupStream = await request.post(`${API_BASE}/sessions/${group.id}/chat/stream`, {
+        headers: { Authorization: `Bearer ${token}` },
+        data: { message: `E2E_GROUP_RELAY_${Date.now()}。两位员工每人严格只输出 OK。`, relay_employee_ids: [relay.id] },
+        timeout: 120_000,
+      });
+      expect(groupStream.ok()).toBeTruthy();
+      const groupText = await groupStream.text();
+      expect((groupText.match(/event: agent_join/g) || []).length).toBeGreaterThanOrEqual(2);
+      expect(groupText).toContain('speaker_employee_id');
+
+      await page.goto(`/employee/${primary.id}`);
+      await expect(page.getByText(primary.display_name).first()).toBeVisible();
+      const beforeBindings = await api<{ items: any[] }>(request, 'GET', `/skill-bindings?target_type=employee&target_id=${primary.id}`, token);
+      await page.getByRole('button', { name: '绑定 Skill' }).click();
+      await page.getByRole('dialog', { name: '绑定市场 Skill' }).getByRole('button', { name: /绑\s*定/ }).click();
+      await expect.poll(async () => {
+        const after = await api<{ items: any[] }>(request, 'GET', `/skill-bindings?target_type=employee&target_id=${primary.id}`, token);
+        return after.items.length;
+      }).toBeGreaterThan(beforeBindings.items.length);
+
+      await page.goto('/skill-market');
+      await page.getByRole('button', { name: '浏览 Skills Hub' }).click();
+      await expect(page.getByText('Hermes Skills Hub')).toBeVisible();
+
+      const templatedSession = await api<any>(request, 'POST', `/collaboration-templates/${template.id}/sessions`, token, {
+        title: `E2E Template Use ${Date.now()}`,
+      });
+      cleanupSessions.push(templatedSession.id);
+      expect(templatedSession.reusable_template_id).toBe(template.id);
+      await page.goto(`/overview?conversation=${templatedSession.id}`);
+      await expect(page.locator('textarea')).toBeVisible();
+    } finally {
+      for (const sid of cleanupSessions.reverse()) {
+        await api(request, 'DELETE', `/sessions/${sid}`, token).catch(() => undefined);
+      }
+      for (const tid of cleanupTemplates.reverse()) {
+        await api(request, 'DELETE', `/collaboration-templates/${tid}`, token).catch(() => undefined);
       }
     }
-    await expect(activeComposer).toBeEnabled({ timeout: 5_000 });
-
-    const session = await api<any>(request, 'POST', '/sessions', token, {
-      employee_id: primary.id,
-      title: `E2E History ${Date.now()}`,
-    });
-    const historyStream = await request.post(`${API_BASE}/sessions/${session.id}/chat/stream`, {
-      headers: { Authorization: `Bearer ${token}` },
-      data: { message: `E2E_HISTORY_${Date.now()}。请严格只输出 OK。` },
-      timeout: 120_000,
-    });
-    expect(historyStream.ok()).toBeTruthy();
-    await historyStream.text();
-    await page.goto('/history?showTestFixtures=1');
-    await expect(page.getByRole('heading', { name: '对话历史' })).toBeVisible();
-    await page.getByText(session.title).first().click();
-    await expect(page).toHaveURL(/\/overview/);
-
-    const group = await api<any>(request, 'POST', '/sessions', token, {
-      employee_id: primary.id,
-      participant_ids: [relay.id],
-      title: `E2E Group ${Date.now()}`,
-    });
-    const groupStream = await request.post(`${API_BASE}/sessions/${group.id}/chat/stream`, {
-      headers: { Authorization: `Bearer ${token}` },
-      data: { message: `E2E_GROUP_RELAY_${Date.now()}。两位员工每人严格只输出 OK。`, relay_employee_ids: [relay.id] },
-      timeout: 120_000,
-    });
-    expect(groupStream.ok()).toBeTruthy();
-    const groupText = await groupStream.text();
-    expect((groupText.match(/event: agent_join/g) || []).length).toBeGreaterThanOrEqual(2);
-    expect(groupText).toContain('speaker_employee_id');
-
-    await page.goto(`/employee/${primary.id}`);
-    await expect(page.getByText(primary.display_name).first()).toBeVisible();
-    const beforeBindings = await api<{ items: any[] }>(request, 'GET', `/skill-bindings?target_type=employee&target_id=${primary.id}`, token);
-    await page.getByRole('button', { name: '绑定 Skill' }).click();
-    await page.getByRole('dialog', { name: '绑定市场 Skill' }).getByRole('button', { name: /绑\s*定/ }).click();
-    await expect.poll(async () => {
-      const after = await api<{ items: any[] }>(request, 'GET', `/skill-bindings?target_type=employee&target_id=${primary.id}`, token);
-      return after.items.length;
-    }).toBeGreaterThan(beforeBindings.items.length);
-
-    await page.goto('/skill-market');
-    await page.getByRole('button', { name: '浏览 Skills Hub' }).click();
-    await expect(page.getByText('Hermes Skills Hub')).toBeVisible();
-
-    const templatedSession = await api<any>(request, 'POST', `/collaboration-templates/${template.id}/sessions`, token, {
-      title: `E2E Template Use ${Date.now()}`,
-    });
-    expect(templatedSession.reusable_template_id).toBe(template.id);
-    await page.goto(`/overview?conversation=${templatedSession.id}`);
-    await expect(page.locator('textarea')).toBeVisible();
   });
 });

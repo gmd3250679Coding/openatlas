@@ -5,6 +5,7 @@ Runs the checks that protect the main Hermes/OpenAtlas paths:
 - tenant isolation smoke
 - frontend production build
 - Playwright E2E
+- product maturity audit
 
 The script assumes the OpenAtlas backend and frontend dev server are already
 running. Use scripts/dev-stack.sh when you want startup + quality in one step.
@@ -54,11 +55,14 @@ def main() -> int:
         ("isolation_smoke", [python, str(BACKEND / "scripts" / "isolation_smoke.py")], ROOT),
         ("frontend_build", ["npm", "run", "build"], FRONTEND),
         ("frontend_e2e", ["npm", "run", "test:e2e", "--", "--reporter=list"], FRONTEND),
+        ("maturity_audit", [python, str(BACKEND / "scripts" / "maturity_audit.py")], ROOT),
     ]
     if os.environ.get("OPENATLAS_QUALITY_SKIP_E2E") == "1":
         steps = [s for s in steps if s[0] != "frontend_e2e"]
     if os.environ.get("OPENATLAS_QUALITY_SKIP_ISOLATION") == "1":
         steps = [s for s in steps if s[0] != "isolation_smoke"]
+    if os.environ.get("OPENATLAS_QUALITY_SKIP_MATURITY") == "1":
+        steps = [s for s in steps if s[0] != "maturity_audit"]
 
     results = []
     for label, cmd, cwd in steps:

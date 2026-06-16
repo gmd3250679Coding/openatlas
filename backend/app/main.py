@@ -903,11 +903,12 @@ def _find_hermes_skill_md(hermes_home: Path, skill: SkillPackage) -> tuple[Path 
 
 
 def _build_employee_skills_block(db: Session, employee_id: str | None, hermes_home: Path) -> tuple[str, list[dict]]:
-    """Load bound Hermes SKILL.md files as prompt context for Gateway chat.
+    """Load bound Skill instructions as prompt context for Gateway chat.
 
     Gateway session APIs do not dispatch slash commands, so OpenAtlas maps its
-    employee skill bindings to the same installed SKILL.md instructions Hermes
-    would load for a skill command.
+    employee Hermes skill bindings to installed SKILL.md instructions. OpenAtlas
+    managed or forked skills without a hermes: source are injected as governed
+    metadata instead of being reported as missing Hermes packages.
     """
     if not employee_id:
         return "", []
@@ -929,6 +930,42 @@ def _build_employee_skills_block(db: Session, employee_id: str | None, hermes_ho
     evidence: list[dict] = []
     total = 0
     for binding, skill in rows[:20]:
+        source_ref = str(getattr(skill, "source_ref", "") or "")
+        if not source_ref.startswith("hermes:"):
+            content = (
+                f"## {skill.name}\n"
+                f"OpenAtlas binding_mode: {binding.binding_mode}\n"
+                "Source: OpenAtlas governed skill metadata\n\n"
+                f"{(skill.description or 'No detailed skill description configured.').strip()[:1200]}"
+            )
+            if total + len(content) > _MAX_HERMES_SKILLS_TOTAL_CHARS:
+                missing.append(f"- {skill.name}: skipped because skill prompt budget is full")
+                evidence.append({
+                    "id": skill.id,
+                    "name": skill.name,
+                    "slug": skill.slug,
+                    "version": skill.version,
+                    "binding_id": binding.id,
+                    "binding_mode": binding.binding_mode,
+                    "status": "skipped_budget",
+                    "source": "openatlas_metadata",
+                    "summary": "skill prompt budget is full",
+                })
+                continue
+            total += len(content)
+            parts.append(content)
+            evidence.append({
+                "id": skill.id,
+                "name": skill.name,
+                "slug": skill.slug,
+                "version": skill.version,
+                "binding_id": binding.id,
+                "binding_mode": binding.binding_mode,
+                "status": "injected",
+                "source": "openatlas_metadata",
+                "summary": (skill.description or "OpenAtlas governed skill metadata").strip()[:360],
+            })
+            continue
         md_path, err = _find_hermes_skill_md(hermes_home, skill)
         if not md_path:
             missing.append(f"- {skill.name}: {err}")
@@ -2019,7 +2056,9 @@ def _tenant_dashboard_metrics(db: Session, tid: str, *, user_id: str | None = No
     files = file_q.all()
     audits = audit_q.all()
     sessions = sess_q.all()
-    skill_runs = skill_run_q.all()
+    skill_runs_all = skill_run_q.order_by(SkillRun.created_at.desc()).all()
+    skill_window = int(os.environ.get("OPENATLAS_DASHBOARD_SKILL_RUN_WINDOW", "100"))
+    skill_runs = skill_runs_all[:max(1, skill_window)]
     artifacts = artifact_q.all()
     input_tokens = sum(int(m.input_tokens or 0) for m in messages)
     output_tokens = sum(int(m.output_tokens or 0) for m in messages)
@@ -2043,6 +2082,8 @@ def _tenant_dashboard_metrics(db: Session, tid: str, *, user_id: str | None = No
         "artifacts": len(artifacts),
         "artifact_kinds": {k: sum(1 for a in artifacts if a.kind == k) for k in sorted({a.kind for a in artifacts})},
         "skill_runs": len(skill_runs),
+        "skill_runs_total": len(skill_runs_all),
+        "skill_run_window": max(1, skill_window),
         "skill_failures": skill_fail,
         "skill_failure_rate": round(skill_fail / max(1, len(skill_runs)), 4),
         "audit_events": len(audits),
@@ -2200,8 +2241,13 @@ def _hermes_message_role_content(item: dict[str, Any]) -> tuple[str, str]:
 
 
 def _artifact_from_path(path: str | Path, *, source: str = "hermes_tool") -> dict | None:
+    if isinstance(path, str) and (not path.strip() or len(path) > 4096 or "\n" in path or "\r" in path):
+        return None
     p = Path(path).expanduser()
-    if not p.exists() or not p.is_file():
+    try:
+        if not p.exists() or not p.is_file():
+            return None
+    except OSError:
         return None
     try:
         resolved = p.resolve()
@@ -2269,6 +2315,10 @@ def _candidate_paths_from_payload(payload: Any) -> list[str]:
 
     def add_from_string(value: str) -> None:
         if not value:
+            return
+        if "\n" in value or "\r" in value:
+            for line in re.split(r"[\r\n]+", value):
+                add_from_string(line.strip())
             return
         # JSON strings often carry path fields as plain values.
         if value.startswith("~") or value.startswith("/"):
@@ -2998,6 +3048,84 @@ async def create_session(
         "message_count": _session_message_count(db, rec.id, rec.message_count),
         "created_at": rec.created_at.isoformat(),
         "updated_at": rec.updated_at.isoformat(),
+    }
+
+
+@app.post("/api/sessions/maintenance/stale")
+async def maintain_stale_sessions(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+    dry_run: bool = Query(default=False),
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Reconcile and close stale current-user running sessions.
+
+    The operation is deliberately non-destructive: old running sessions are
+    either completed by transcript reconciliation or moved to needs_input with a
+    clear summary so they no longer pollute the active run queue indefinitely.
+    """
+    rows = (
+        db.query(SessionRecord)
+        .filter(
+            SessionRecord.tenant_id == p.tenant.id,
+            SessionRecord.user_id == p.user.id,
+            SessionRecord.archived == False,  # noqa: E712
+            SessionRecord.task_status == "running",
+        )
+        .order_by(SessionRecord.updated_at.asc())
+        .limit(limit)
+        .all()
+    )
+    stale_rows = [r for r in rows if _is_stale_running_session(r)]
+    target = None
+    changed: list[dict[str, Any]] = []
+    for rec in stale_rows:
+        imported = 0
+        previous = rec.task_status or "draft"
+        if not dry_run:
+            if target is None:
+                target = await hermes_client.resolve_target(db, p.tenant.id)
+            emp = db.get(DigitalEmployee, rec.employee_id) if rec.employee_id else None
+            imported = await _reconcile_hermes_session_transcript(
+                db,
+                target=target,
+                rec=rec,
+                tenant_id=p.tenant.id,
+                user_id=p.user.id,
+                employee_id=rec.employee_id,
+                speaker_name=emp.display_name if emp else "",
+            )
+            db.refresh(rec)
+            if rec.task_status == "running" and _is_stale_running_session(rec):
+                rec.task_status = "needs_input"
+                rec.task_summary = (
+                    "任务超过 30 分钟没有新事件。OpenAtlas 已停止运行等待，"
+                    "请打开会话补充信息、重新进行或检查 Hermes Runtime。"
+                )
+                if (rec.title or "").strip() in {"", "新会话"} and (rec.last_message or "").strip():
+                    rec.title = (rec.last_message or "").strip().replace("\n", " ")[:64]
+                rec.updated_at = datetime.now(timezone.utc)
+            audit(db, principal=p, action="session.maintain_stale", resource_type="session",
+                  resource_id=rec.id, request=request,
+                  extra={"previous_status": previous, "task_status": rec.task_status, "imported": imported})
+        changed.append({
+            "id": rec.id,
+            "title": rec.title,
+            "previous_status": previous,
+            "task_status": rec.task_status,
+            "imported": imported,
+            "is_stale": _is_stale_running_session(rec),
+        })
+    if not dry_run:
+        db.commit()
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "scanned": len(rows),
+        "stale": len(stale_rows),
+        "updated": 0 if dry_run else len(changed),
+        "items": changed,
     }
 
 
@@ -4025,7 +4153,7 @@ async def session_chat_stream(
                     db_ctx.close()
                 yield trace_event(
                     "context",
-                    "注入上下文证据",
+                    "注入本轮上下文",
                     f"Skill {len(skill_evidence)} 个，记忆 {len(eff)} 条，附件 {len(file_provenance)} 个",
                     speaker,
                     skill_count=len(skill_evidence),
@@ -6553,6 +6681,8 @@ def dashboard_tenant(
         "failure_rate": metrics["failure_rate"],
         "skill_health": {
             "runs": metrics["skill_runs"],
+            "total_runs": metrics["skill_runs_total"],
+            "window": metrics["skill_run_window"],
             "failures": metrics["skill_failures"],
             "failure_rate": metrics["skill_failure_rate"],
         },

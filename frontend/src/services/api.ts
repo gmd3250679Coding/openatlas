@@ -673,6 +673,10 @@ export async function fetchEffectiveMemories(employeeId?: string): Promise<Memor
 export async function fetchDashboardMe(): Promise<any> { return apiFetch('/dashboard/me'); }
 export async function fetchDashboardTenant(): Promise<any> { return apiFetch('/dashboard/tenant'); }
 export async function fetchDashboardSystem(): Promise<any> { return apiFetch('/dashboard/system'); }
+export async function maintainStaleSessions(limit = 20): Promise<any> {
+  const q = new URLSearchParams({ limit: String(limit) });
+  return apiFetch(`/sessions/maintenance/stale?${q.toString()}`, { method: 'POST', body: '{}' });
+}
 
 export async function refreshSessionSummary(sessionId: string | number): Promise<any> {
   const realId = await resolveRealSessionId(sessionId);
