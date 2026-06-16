@@ -700,6 +700,18 @@ export async function resumeSessionTask(sessionId: string | number, message = ''
   });
 }
 
+export async function recoverSessionTask(sessionId: string | number): Promise<any> {
+  const realId = await resolveRealSessionId(sessionId);
+  return apiFetch(`/sessions/${realId}/recover`, { method: 'POST', body: '{}' });
+}
+
+export async function fetchSessionHealth(sessionId: string | number, reconcile = false): Promise<any> {
+  const realId = await resolveRealSessionId(sessionId);
+  const q = new URLSearchParams();
+  if (reconcile) q.set('reconcile', 'true');
+  return apiFetch(`/sessions/${realId}/health${q.toString() ? `?${q.toString()}` : ''}`);
+}
+
 export async function fetchSessionContext(sessionId: string | number): Promise<any> {
   const realId = await resolveRealSessionId(sessionId);
   return apiFetch(`/sessions/${realId}/context`);

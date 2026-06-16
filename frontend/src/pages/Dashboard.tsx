@@ -116,9 +116,44 @@ function MeView({ data }: { data: any }) {
 
 function TenantView({ data }: { data: any }) {
   const gw = data.gateway || {};
+  const maturity = data.maturity || {};
+  const maturityTone = toneForMaturity(num(maturity.score, 100));
   return (
     <div>
       <h3 style={{ marginTop: 0 }}>租户概览 — {data.tenant?.slug}</h3>
+      {maturity.score !== undefined && (
+        <div style={{
+          marginBottom: 16,
+          padding: 16,
+          borderRadius: 8,
+          border: `1px solid ${maturityTone.border}`,
+          background: maturityTone.bg,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div>
+              <div style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>产品成熟度</div>
+              <div style={{ fontSize: 30, fontWeight: 800 }}>{maturity.score}</div>
+            </div>
+            <div style={{ minWidth: 0 }}>
+              <Tag color={maturity.score >= 90 ? 'green' : maturity.score >= 75 ? 'gold' : 'red'}>
+                {maturity.level || 'pilot'}
+              </Tag>
+              <div style={{ marginTop: 8, color: 'var(--text-secondary)', fontSize: 13 }}>
+                Runtime {maturity.signals?.runtime_ok ? '健康' : '需检查'} · 卡住任务 {num(maturity.signals?.stale_sessions)} · 上下文覆盖 {Math.round(num(maturity.signals?.context_coverage) * 100)}% · 交付物覆盖 {Math.round(num(maturity.signals?.artifact_coverage) * 100)}%
+              </div>
+            </div>
+          </div>
+          {maturity.risk_items?.length > 0 && (
+            <div style={{ marginTop: 12, display: 'grid', gap: 6 }}>
+              {maturity.risk_items.slice(0, 4).map((risk: any) => (
+                <div key={risk.code} style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                  <strong>{risk.severity}</strong> · {risk.message}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
         <Metric label="用户" value={num(data.users)} />
         <Metric label="员工" value={num(data.employees)} />
@@ -279,6 +314,14 @@ function SystemView({ data }: { data: any }) {
       ]} />
     </div>
   );
+}
+
+function toneForMaturity(score: number) {
+  const color = score >= 90 ? '#10b981' : score >= 75 ? '#f59e0b' : '#ef4444';
+  return {
+    bg: `color-mix(in srgb, ${color} 10%, var(--bg-primary))`,
+    border: `color-mix(in srgb, ${color} 36%, var(--border-default))`,
+  };
 }
 
 function InfoStrip({ items }: { items: Array<[string, string]> }) {

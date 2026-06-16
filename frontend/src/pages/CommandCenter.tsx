@@ -25,7 +25,7 @@ import {
   fetchCurrentUser, updateMyQuickPrompts,
   refreshSessionSummary, patchSessionTaskStatus, archiveArtifact,
   fetchCollaborationTemplates, createSessionFromTemplate,
-  fetchRunQueue, resumeSessionTask,
+  fetchRunQueue, resumeSessionTask, recoverSessionTask,
   replayEmployeeEvents, type CanvasReplay,  // M5
   type Conversation, type Attachment, type Employee,
 } from '../services/api';
@@ -199,6 +199,7 @@ interface SessionMeta {
   summary?: any;
   artifacts?: any[];
   context_injections?: any[];
+  health?: any;
 }
 
 // Phase 2.6: 快捷指令默认值（DB 加载前的占位 + 兜底）
@@ -413,6 +414,7 @@ export default function CommandCenter() {
         task_summary: detail?.task_summary,
         summary_updated_at: detail?.summary_updated_at,
         summary: detail?.summary,
+        health: detail?.health || prev[sid]?.health,
         artifacts: Array.isArray(detail?.artifacts) ? detail.artifacts : (prev[sid]?.artifacts || []),
         context_injections: Array.isArray(detail?.context_injections) ? detail.context_injections : (prev[sid]?.context_injections || []),
       },
@@ -587,6 +589,29 @@ export default function CommandCenter() {
       message.error(`归档失败: ${e?.message || e}`);
     }
   }, [activeSessionId]);
+
+  const recoverActiveSession = useCallback(async () => {
+    if (!activeSessionId) return;
+    try {
+      const res = await recoverSessionTask(activeSessionId);
+      setSessionMetaById((prev) => ({
+        ...prev,
+        [activeSessionId]: {
+          ...(prev[activeSessionId] || {}),
+          id: activeSessionId,
+          task_status: res?.task_status || prev[activeSessionId]?.task_status,
+          task_summary: res?.task_summary || prev[activeSessionId]?.task_summary,
+          summary_updated_at: res?.summary_updated_at || prev[activeSessionId]?.summary_updated_at,
+          artifacts: Array.isArray(res?.artifacts) ? res.artifacts : (prev[activeSessionId]?.artifacts || []),
+          health: res?.health || prev[activeSessionId]?.health,
+        },
+      }));
+      await loadRunQueue();
+      message.success(`已补同步 ${res?.imported || 0} 条 Hermes 记录`);
+    } catch (e: any) {
+      message.error(`恢复失败: ${e?.message || e}`);
+    }
+  }, [activeSessionId, loadRunQueue]);
   // P3.12 3.4.3: setActiveSessionIdSafe — 切会话时先 abort 当前流, 再切
   const setActiveSessionIdSafe = useCallback((sid: string | null) => {
     if (sid !== activeSessionId) {
@@ -3092,6 +3117,7 @@ export default function CommandCenter() {
         runQueue={runQueue}
         onOpenRun={(sid) => handleSwitchConversation(sid)}
         onResumeTask={handleResumeActiveTask}
+        onRecoverSession={recoverActiveSession}
         onPatchTaskStatus={patchActiveTaskStatus}
         onRefreshSummary={refreshActiveSummary}
         onArchiveArtifact={archiveActiveArtifact}

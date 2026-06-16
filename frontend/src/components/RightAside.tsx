@@ -69,10 +69,12 @@ interface Props {
     summary_updated_at?: string | null;
     artifacts?: any[];
     context_injections?: any[];
+    health?: any;
   };
   runQueue?: any[];
   onOpenRun?: (sessionId: string) => void;
   onResumeTask?: () => Promise<void> | void;
+  onRecoverSession?: () => Promise<void> | void;
   onPatchTaskStatus?: (status: string) => Promise<void> | void;
   onRefreshSummary?: () => Promise<void> | void;
   onArchiveArtifact?: (artifactId: string) => Promise<void> | void;
@@ -100,6 +102,7 @@ export default function RightAside({
   runQueue = [],
   onOpenRun,
   onResumeTask,
+  onRecoverSession,
   onPatchTaskStatus,
   onRefreshSummary,
   onArchiveArtifact,
@@ -140,7 +143,7 @@ export default function RightAside({
       .map((a: any, i: number) => ({
         artifactId: a.id,
         name: a.name || `交付物-${i + 1}.${extensionForKind(a.kind, a.mime_type)}`,
-        meta: `${a.kind || 'artifact'} · ${String(a.content || '').length} 字`,
+        meta: artifactMeta(a),
         content: a.kind === 'html' ? wrapHtml(String(a.content || '')) : String(a.content || ''),
         mime: a.mime_type || mimeForKind(a.kind),
         kind: inferKindFromName(a.name || a.kind || 'FILE'),
@@ -160,6 +163,7 @@ export default function RightAside({
   const allEmpty = tunnels.length === 0 && conclusions.length === 0 && files.length === 0 && messages.length === 0;
   const savedSummary = sessionMeta?.task_summary?.trim();
   const taskStatus = sessionMeta?.task_status || (isProcessing ? 'running' : messages.length > 0 ? 'completed' : 'draft');
+  const health = sessionMeta?.health;
   const contextRows = sessionMeta?.context_injections || [];
   const currentRunQueue = runQueue.filter((item: any) => activeSessionId && String(item.id) === String(activeSessionId));
   const otherRunQueue = runQueue.filter((item: any) => !activeSessionId || String(item.id) !== String(activeSessionId));
@@ -259,6 +263,55 @@ export default function RightAside({
               {latestUserMessage?.text || currentRunQueue[0]?.last_message || sessionMeta?.task_summary || '当前会话还没有任务输入。'}
             </div>
           </div>
+          {health && (
+            <div style={{
+              marginTop: 10,
+              padding: 10,
+              border: `1px solid ${healthBorder(health.status)}`,
+              borderRadius: 8,
+              background: healthBg(health.status),
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <strong style={{ fontSize: 12, color: 'var(--text-primary)' }}>会话健康</strong>
+                <span style={{
+                  marginLeft: 'auto',
+                  fontSize: 11,
+                  fontWeight: 800,
+                  color: healthText(health.status),
+                }}>
+                  {health.score ?? '-'} / 100
+                </span>
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
+                {healthLabel(health.status)} · 上下文 {health.counts?.context_injections || 0} · 交付物 {health.counts?.artifacts || 0}
+              </div>
+              {(health.issues || []).slice(0, 2).map((issue: any) => (
+                <div key={issue.code} style={{ marginTop: 6, fontSize: 11, color: healthText(health.status), lineHeight: 1.45 }}>
+                  {issue.message}
+                </div>
+              ))}
+              {onRecoverSession && (health.recommended_actions || []).some((a: any) => a.kind === 'recover') && (
+                <button
+                  type="button"
+                  onClick={() => onRecoverSession()}
+                  style={{
+                    marginTop: 8,
+                    border: `1px solid ${healthBorder(health.status)}`,
+                    background: 'var(--bg-primary)',
+                    color: healthText(health.status),
+                    borderRadius: 7,
+                    height: 28,
+                    padding: '0 10px',
+                    fontSize: 11,
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  补同步 / 恢复会话
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
       {tab === 'progress' && tunnels.length > 0 && (
@@ -807,6 +860,49 @@ function outputKindTone(kind: string) {
   if (normalized === 'PDF') return '#ef4444';
   if (normalized === 'DOCX') return '#3b82f6';
   return 'var(--accent)';
+}
+
+function artifactMeta(a: any) {
+  const bits = [`${a.kind || 'artifact'}`, `${String(a.content || '').length} 字`];
+  const prov = a.provenance || {};
+  if (prov.employee_name) bits.push(prov.employee_name);
+  const counts = prov.context_counts || {};
+  const contextBits = Object.entries(counts).filter(([, v]) => Number(v) > 0).map(([k, v]) => `${k}:${v}`);
+  if (contextBits.length) bits.push(`上下文 ${contextBits.join('/')}`);
+  if (prov.query_excerpt) bits.push(`Query: ${String(prov.query_excerpt).slice(0, 28)}`);
+  return bits.join(' · ');
+}
+
+function healthLabel(status: string) {
+  const s = String(status || '');
+  if (s === 'action_required') return '需要处理';
+  if (s === 'warning') return '有风险';
+  if (s === 'running') return '运行中';
+  return '健康';
+}
+
+function healthBg(status: string) {
+  const s = String(status || '');
+  if (s === 'action_required') return 'color-mix(in srgb, #ef4444 10%, var(--bg-primary))';
+  if (s === 'warning') return 'color-mix(in srgb, #f59e0b 10%, var(--bg-primary))';
+  if (s === 'running') return 'color-mix(in srgb, #3b82f6 10%, var(--bg-primary))';
+  return 'color-mix(in srgb, #10b981 10%, var(--bg-primary))';
+}
+
+function healthBorder(status: string) {
+  const s = String(status || '');
+  if (s === 'action_required') return 'color-mix(in srgb, #ef4444 36%, var(--border-subtle))';
+  if (s === 'warning') return 'color-mix(in srgb, #f59e0b 36%, var(--border-subtle))';
+  if (s === 'running') return 'color-mix(in srgb, #3b82f6 36%, var(--border-subtle))';
+  return 'color-mix(in srgb, #10b981 36%, var(--border-subtle))';
+}
+
+function healthText(status: string) {
+  const s = String(status || '');
+  if (s === 'action_required') return 'color-mix(in srgb, #ef4444 82%, var(--text-primary))';
+  if (s === 'warning') return 'color-mix(in srgb, #f59e0b 82%, var(--text-primary))';
+  if (s === 'running') return 'color-mix(in srgb, #3b82f6 82%, var(--text-primary))';
+  return 'color-mix(in srgb, #10b981 82%, var(--text-primary))';
 }
 
 function mimeForKind(kind?: string) {

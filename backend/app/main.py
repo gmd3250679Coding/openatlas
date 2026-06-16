@@ -1693,6 +1693,99 @@ def _is_stale_running_session(row: SessionRecord) -> bool:
     return (datetime.now(timezone.utc) - updated_at).total_seconds() > 30 * 60
 
 
+def _session_health_snapshot(db: Session, rec: SessionRecord) -> dict:
+    rows = db.query(MessageRecord).filter_by(session_id=rec.id).order_by(MessageRecord.created_at.asc()).all()
+    artifacts = db.query(TaskArtifact).filter(
+        TaskArtifact.session_id == rec.id,
+        TaskArtifact.tenant_id == rec.tenant_id,
+        TaskArtifact.archived == False,  # noqa: E712
+    ).all()
+    contexts = db.query(ContextInjection).filter(
+        ContextInjection.session_id == rec.id,
+        ContextInjection.tenant_id == rec.tenant_id,
+    ).all()
+    canvas_events = db.query(CanvasEvent).filter(
+        CanvasEvent.session_id == rec.id,
+        CanvasEvent.tenant_id == rec.tenant_id,
+    ).order_by(CanvasEvent.created_at.desc()).limit(20).all()
+    latest_user = next((r for r in reversed(rows) if r.role == "user"), None)
+    latest_assistant_after_user = None
+    if latest_user:
+        latest_assistant_after_user = next(
+            (
+                r for r in reversed(rows)
+                if r.role == "assistant" and r.created_at >= latest_user.created_at
+            ),
+            None,
+        )
+    pending_runs = [
+        {"run_id": rid, **meta}
+        for rid, meta in _PENDING_HERMES_RUNS.items()
+        if meta.get("session_id") == rec.id
+    ]
+    issues: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
+    status = rec.task_status or "draft"
+    if status == "failed":
+        issues.append({"code": "task_failed", "severity": "critical", "message": "任务已标记失败，需要重新执行或人工处理。"})
+        actions.append({"key": "retry", "label": "重新进行", "kind": "task_status", "value": "running"})
+    if status == "needs_input":
+        issues.append({"code": "needs_input", "severity": "warning", "message": rec.task_summary or "任务需要用户补充信息。"})
+        actions.append({"key": "resume", "label": "继续补充", "kind": "resume"})
+    if _is_stale_running_session(rec):
+        issues.append({"code": "stale_running", "severity": "critical", "message": "任务运行中但超过 30 分钟没有更新。"})
+        actions.append({"key": "recover", "label": "补同步结果", "kind": "recover"})
+        actions.append({"key": "inspect_runtime", "label": "检查 Runtime", "kind": "runtime"})
+    if latest_user and not latest_assistant_after_user:
+        issues.append({"code": "awaiting_assistant", "severity": "warning", "message": "最近一轮用户输入后还没有可见模型回复。"})
+        actions.append({"key": "recover", "label": "补同步 Hermes 会话", "kind": "recover"})
+    if latest_user and not contexts:
+        issues.append({"code": "missing_context_trace", "severity": "warning", "message": "本会话缺少上下文注入记录，难以追溯文件、Skill、记忆来源。"})
+        actions.append({"key": "retry_with_context", "label": "重新带上下文执行", "kind": "resume"})
+    if rows and not artifacts:
+        assistant_text = "\n\n".join(r.content or "" for r in rows if r.role == "assistant")
+        if _extract_task_artifacts(assistant_text, prefix="health-probe"):
+            issues.append({"code": "unregistered_artifact", "severity": "warning", "message": "回复中疑似包含交付物，但没有登记到输出物。"})
+            actions.append({"key": "recover", "label": "重新抽取交付物", "kind": "recover"})
+    if pending_runs:
+        issues.append({"code": "pending_hermes_run", "severity": "info", "message": f"仍有 {len(pending_runs)} 个 Hermes Run 处于可追踪状态。"})
+    latest_event = canvas_events[0] if canvas_events else None
+    score = 100
+    severity_penalty = {"critical": 28, "warning": 14, "info": 4}
+    for issue in issues:
+        score -= severity_penalty.get(issue.get("severity"), 8)
+    if rows and not contexts:
+        score -= 10
+    if artifacts and not any((_artifact_provenance(db, a).get("context_counts") or {}) for a in artifacts[:3]):
+        score -= 8
+    score = max(0, min(100, score))
+    health_status = "healthy"
+    if any(i.get("severity") == "critical" for i in issues):
+        health_status = "action_required"
+    elif any(i.get("severity") == "warning" for i in issues):
+        health_status = "warning"
+    elif status == "running" or pending_runs:
+        health_status = "running"
+    return {
+        "status": health_status,
+        "score": score,
+        "task_status": status,
+        "is_stale": _is_stale_running_session(rec),
+        "issues": issues,
+        "recommended_actions": actions,
+        "pending_runs": [{"run_id": item.get("run_id"), "created_at": item.get("created_at")} for item in pending_runs],
+        "counts": {
+            "messages": len(rows),
+            "user_turns": sum(1 for r in rows if r.role == "user"),
+            "assistant_turns": sum(1 for r in rows if r.role == "assistant"),
+            "context_injections": len(contexts),
+            "artifacts": len(artifacts),
+            "canvas_events": db.query(CanvasEvent).filter(CanvasEvent.session_id == rec.id, CanvasEvent.tenant_id == rec.tenant_id).count(),
+        },
+        "latest_runtime_event": _canvas_event_to_dict(latest_event) if latest_event else None,
+    }
+
+
 def _context_to_dict(row: ContextInjection) -> dict:
     try:
         payload = json.loads(row.payload or "{}")
@@ -1715,8 +1808,39 @@ def _context_to_dict(row: ContextInjection) -> dict:
     }
 
 
-def _artifact_to_dict(row: TaskArtifact) -> dict:
+def _artifact_provenance(db: Session, row: TaskArtifact) -> dict:
+    msg = db.get(MessageRecord, row.message_id) if row.message_id else None
+    context_q = db.query(ContextInjection).filter(
+        ContextInjection.session_id == row.session_id,
+        ContextInjection.tenant_id == row.tenant_id,
+    )
+    if msg and msg.id:
+        context_q = context_q.filter(ContextInjection.message_id == msg.id)
+    context_rows = context_q.order_by(ContextInjection.created_at.desc()).limit(40).all()
+    context_counts: dict[str, int] = {}
+    for c in context_rows:
+        context_counts[c.kind] = context_counts.get(c.kind, 0) + 1
+    user_q = db.query(MessageRecord).filter(
+        MessageRecord.session_id == row.session_id,
+        MessageRecord.role == "user",
+    )
+    if row.created_at:
+        user_q = user_q.filter(MessageRecord.created_at <= row.created_at)
+    user_msg = user_q.order_by(MessageRecord.created_at.desc()).first()
     return {
+        "source": row.source,
+        "employee_id": msg.speaker_employee_id if msg else None,
+        "employee_name": msg.speaker_name if msg else "",
+        "message_id": row.message_id,
+        "turn_index": msg.turn_index if msg else None,
+        "query_excerpt": (user_msg.content or "")[:180] if user_msg else "",
+        "context_counts": context_counts,
+        "context_items": [_context_to_dict(c) for c in context_rows[:12]],
+    }
+
+
+def _artifact_to_dict(row: TaskArtifact, db: Session | None = None) -> dict:
+    out = {
         "id": row.id,
         "session_id": row.session_id,
         "message_id": row.message_id,
@@ -1729,6 +1853,9 @@ def _artifact_to_dict(row: TaskArtifact) -> dict:
         "archived": row.archived,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
+    if db is not None:
+        out["provenance"] = _artifact_provenance(db, row)
+    return out
 
 
 def _record_context_injections(
@@ -2231,7 +2358,7 @@ def _persist_tool_event_artifacts(
             )
             db.add(row)
             db.flush()
-            persisted.append(_artifact_to_dict(row))
+            persisted.append(_artifact_to_dict(row, db))
             seen.add(key)
         db.commit()
         return persisted
@@ -3120,8 +3247,87 @@ async def session_detail(
         "canvas_state": canvas_state,
         "reusable_template_id": rec.reusable_template_id,
         "summary": _session_summary(db, rec),
-        "artifacts": [_artifact_to_dict(a) for a in artifacts],
+        "artifacts": [_artifact_to_dict(a, db) for a in artifacts],
         "context_injections": [_context_to_dict(c) for c in context_rows],
+        "health": _session_health_snapshot(db, rec),
+    }
+
+
+@app.get("/api/sessions/{sid}/health")
+async def session_health(
+    sid: str,
+    reconcile: bool = Query(default=False),
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    rec = db.get(SessionRecord, sid)
+    if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
+        raise HTTPException(404, "session not found")
+    imported = 0
+    if reconcile:
+        target = await hermes_client.resolve_target(db, p.tenant.id)
+        emp = db.get(DigitalEmployee, rec.employee_id) if rec.employee_id else None
+        imported = await _reconcile_hermes_session_transcript(
+            db,
+            target=target,
+            rec=rec,
+            tenant_id=p.tenant.id,
+            user_id=p.user.id,
+            employee_id=rec.employee_id,
+            speaker_name=emp.display_name if emp else "",
+        )
+    return {"id": rec.id, "imported": imported, "health": _session_health_snapshot(db, rec)}
+
+
+@app.post("/api/sessions/{sid}/recover")
+async def recover_session(
+    sid: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    rec = db.get(SessionRecord, sid)
+    if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
+        raise HTTPException(404, "session not found")
+    target = await hermes_client.resolve_target(db, p.tenant.id)
+    emp = db.get(DigitalEmployee, rec.employee_id) if rec.employee_id else None
+    imported = await _reconcile_hermes_session_transcript(
+        db,
+        target=target,
+        rec=rec,
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        employee_id=rec.employee_id,
+        speaker_name=emp.display_name if emp else "",
+    )
+    snapshot = _session_summary(db, rec)
+    artifacts = db.query(TaskArtifact).filter(
+        TaskArtifact.session_id == rec.id,
+        TaskArtifact.tenant_id == p.tenant.id,
+        TaskArtifact.archived == False,  # noqa: E712
+    ).order_by(TaskArtifact.created_at.desc()).limit(20).all()
+    parts = [snapshot.get("summary") or "本会话还没有可总结的内容。"]
+    if artifacts:
+        parts.append("交付物: " + " / ".join(a.name for a in artifacts[:6]))
+    rec.task_summary = "\n".join(parts)
+    rec.summary_updated_at = datetime.now(timezone.utc)
+    if rec.task_status == "running" and not _is_stale_running_session(rec):
+        pass
+    elif rec.task_status == "running" and not imported:
+        rec.task_status = "needs_input"
+    rec.updated_at = datetime.now(timezone.utc)
+    audit(db, principal=p, action="session.recover", resource_type="session",
+          resource_id=rec.id, request=request, extra={"imported": imported, "artifacts": len(artifacts)})
+    db.commit()
+    db.refresh(rec)
+    return {
+        "id": rec.id,
+        "imported": imported,
+        "task_status": rec.task_status,
+        "task_summary": rec.task_summary,
+        "summary_updated_at": rec.summary_updated_at.isoformat() if rec.summary_updated_at else None,
+        "artifacts": [_artifact_to_dict(a, db) for a in artifacts],
+        "health": _session_health_snapshot(db, rec),
     }
 
 
@@ -3516,7 +3722,7 @@ def list_session_artifacts(
         TaskArtifact.session_id == sid,
         TaskArtifact.tenant_id == p.tenant.id,
     ).order_by(TaskArtifact.created_at.desc()).all()
-    return {"items": [_artifact_to_dict(r) for r in rows]}
+    return {"items": [_artifact_to_dict(r, db) for r in rows]}
 
 
 @app.post("/api/artifacts/{artifact_id}/archive")
@@ -3532,7 +3738,7 @@ def archive_artifact(
     audit(db, principal=p, action="artifact.archive", resource_type="artifact",
           resource_id=art.id, request=request, extra={"session_id": art.session_id, "kind": art.kind})
     db.commit()
-    return _artifact_to_dict(art)
+    return _artifact_to_dict(art, db)
 
 
 @app.post("/api/hermes-runs/{run_id}/approval")
@@ -6275,6 +6481,53 @@ def dashboard_tenant(
                 "target_type": b.target_type,
                 "target_id": b.target_id,
             })
+    session_rows = db.query(SessionRecord).filter(SessionRecord.tenant_id == tid, SessionRecord.archived == False).all()  # noqa: E712
+    stale_sessions = sum(1 for s in session_rows if _is_stale_running_session(s))
+    running_sessions = sum(1 for s in session_rows if (s.task_status or "") == "running")
+    context_sessions = {
+        r.session_id for r in db.query(ContextInjection.session_id).filter(ContextInjection.tenant_id == tid).distinct().all()
+    }
+    artifact_sessions = {
+        r.session_id for r in db.query(TaskArtifact.session_id).filter(TaskArtifact.tenant_id == tid, TaskArtifact.archived == False).distinct().all()  # noqa: E712
+    }
+    active_session_count = max(1, len(session_rows))
+    context_coverage = round(len(context_sessions) / active_session_count, 3)
+    artifact_coverage = round(len(artifact_sessions) / active_session_count, 3)
+    risk_items: list[dict[str, Any]] = []
+    score = 100
+    runtime_ok = runtime and str(runtime.status) in {"RuntimeStatus.running", "running", "starting"}
+    if not runtime_ok:
+        score -= 18
+        risk_items.append({"code": "runtime_not_running", "severity": "critical", "message": "Hermes Runtime 未处于 running/starting 状态。"})
+    if metrics["failure_rate"] > 0.08:
+        score -= 14
+        risk_items.append({"code": "high_task_failure_rate", "severity": "warning", "message": f"任务失败率 {metrics['failure_rate']:.1%} 偏高。"})
+    if stale_sessions:
+        score -= min(24, stale_sessions * 8)
+        risk_items.append({"code": "stale_sessions", "severity": "critical", "message": f"{stale_sessions} 个运行中会话超过 30 分钟没有更新。"})
+    if metrics["skill_failure_rate"] > 0.08:
+        score -= 12
+        risk_items.append({"code": "skill_failure_rate", "severity": "warning", "message": f"Skill 失败率 {metrics['skill_failure_rate']:.1%} 偏高。"})
+    if context_coverage < 0.5 and len(session_rows) >= 3:
+        score -= 10
+        risk_items.append({"code": "low_context_coverage", "severity": "warning", "message": "多数会话缺少文件/Skill/记忆注入追踪。"})
+    if artifact_coverage < 0.25 and len(session_rows) >= 3:
+        score -= 8
+        risk_items.append({"code": "low_artifact_coverage", "severity": "info", "message": "会话交付物覆盖率偏低，任务闭环感不足。"})
+    maturity = {
+        "score": max(0, min(100, score)),
+        "level": "production_ready" if score >= 90 else ("beta" if score >= 75 else "pilot"),
+        "risk_items": risk_items,
+        "signals": {
+            "runtime_ok": bool(runtime_ok),
+            "running_sessions": running_sessions,
+            "stale_sessions": stale_sessions,
+            "context_coverage": context_coverage,
+            "artifact_coverage": artifact_coverage,
+            "skill_failure_rate": metrics["skill_failure_rate"],
+            "task_failure_rate": metrics["failure_rate"],
+        },
+    }
     return {
         "tenant": {"id": tid, "slug": p.tenant.slug, "name": p.tenant.name,
                    "plan": p.tenant.plan, "max_sessions": p.tenant.max_sessions,
@@ -6311,6 +6564,7 @@ def dashboard_tenant(
             "hermes_home": runtime.hermes_home_path if runtime else None,
             "health_checked_at": runtime.health_checked_at.isoformat() if runtime and runtime.health_checked_at else None,
         },
+        "maturity": maturity,
     }
 
 

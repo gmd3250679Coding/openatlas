@@ -309,6 +309,14 @@ def run() -> dict:
         if not stream_result["files"] or stream_result["files"][0].get("extracted_chars", 0) <= 0:
             raise SmokeError(f"stream did not report injected file metadata: {stream_result['files']}")
         detail = request("GET", f"/sessions/{sid}", token=token)
+        if not detail.get("health") or "score" not in detail["health"]:
+            raise SmokeError(f"session detail missing health snapshot: {detail}")
+        health = request("GET", f"/sessions/{sid}/health", token=token)
+        if not health.get("health") or "recommended_actions" not in health["health"]:
+            raise SmokeError(f"session health endpoint missing actionable payload: {health}")
+        recovered = request("POST", f"/sessions/{sid}/recover", {}, token=token)
+        if not recovered.get("health") or "score" not in recovered["health"]:
+            raise SmokeError(f"session recover missing health payload: {recovered}")
         messages = request("GET", f"/sessions/{sid}/messages", token=token)
         listed = request("GET", f"/files?session_id={sid}", token=token)
         file_detail = request("GET", f"/files/{uploaded['id']}", token=token)
@@ -331,6 +339,7 @@ def run() -> dict:
             "session_id": sid,
             "stream": stream_result,
             "message_count": len(messages["items"]),
+            "health_score": recovered["health"].get("score"),
             "summary": detail.get("summary", {}),
             "file": {"listed": len(listed.get("items", [])), "summary": file_detail.get("summary"), "snippets": file_detail.get("snippets", [])[:1]},
             "pptx": {"extracted_chars": pptx_uploaded.get("extracted_chars"), "summary": pptx_detail.get("summary")},
@@ -382,9 +391,11 @@ def run() -> dict:
         if market.get("binding_count", 0) < 1:
             raise SmokeError(f"skill binding_count did not update: {market}")
         tenant_dashboard = request("GET", "/dashboard/tenant", token=token)
-        for key in ("token_usage", "files", "failure_rate", "skill_usage", "gateway"):
+        for key in ("token_usage", "files", "failure_rate", "skill_usage", "gateway", "maturity"):
             if key not in tenant_dashboard:
                 raise SmokeError(f"dashboard missing {key}: {tenant_dashboard}")
+        if "score" not in tenant_dashboard.get("maturity", {}):
+            raise SmokeError(f"dashboard maturity missing score: {tenant_dashboard.get('maturity')}")
         audit_rows = request("GET", f"/audit?resource_id={skill['id']}&limit=10", token=token)
         if not any(row.get("resource_id") == skill["id"] for row in audit_rows):
             raise SmokeError(f"audit resource_id trace missing for skill {skill['id']}: {audit_rows}")
