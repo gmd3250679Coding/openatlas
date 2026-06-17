@@ -26,7 +26,7 @@ import {
   refreshSessionSummary, patchSessionTaskStatus, archiveArtifact, patchArtifact,
   fetchCollaborationTemplates, createSessionFromTemplate,
   fetchRunQueue, resumeSessionTask, recoverSessionTask,
-  replayEmployeeEvents, replaySessionEvents, actionWorkflowNode, resumeWorkflowCheckpoint, type CanvasReplay,  // M5
+  replayEmployeeEvents, replaySessionEvents, actionWorkflowNode, resumeWorkflowCheckpoint, actionWorkflowStep, type CanvasReplay,  // M5
   type Conversation, type Attachment, type Employee,
 } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
@@ -1006,24 +1006,89 @@ export default function CommandCenter() {
     }
   }, [activeSessionId]);
 
-  const handleResumeCheckpoint = useCallback(async (checkpointId: string) => {
-    if (!activeSessionId || !checkpointId) return;
-    try {
-      const res = await resumeWorkflowCheckpoint(activeSessionId, checkpointId, { mode: 'fork_resume' });
-      setSessionMetaById((prev) => ({
-        ...prev,
-        [activeSessionId]: {
-          ...(prev[activeSessionId] || {}),
-          task_status: res?.task_status || 'running',
-          task_summary: '已创建恢复分支，正在从检查点继续执行。',
-        },
-      }));
-      message.success('已创建 Replay Fork，正在后台恢复执行');
-      const replay = await replaySessionEvents(activeSessionId);
-      setReplayData(replay);
-    } catch (e: any) {
-      message.error(`恢复检查点失败: ${e?.message || e}`);
-    }
+  const handleResumeCheckpoint = useCallback((checkpoint: any, node?: any, step?: any) => {
+    if (!activeSessionId || !checkpoint?.id) return;
+    const checkpointSummary = checkpoint.summary || step?.summary || step?.title || checkpoint.checkpoint_type || '协作检查点';
+    const artifactPolicy = checkpoint.artifact_policy || {};
+    Modal.confirm({
+      title: '从检查点创建恢复分支？',
+      okText: '创建分支并继续',
+      cancelText: '取消',
+      centered: true,
+      width: 520,
+      content: (
+        <div style={{ display: 'grid', gap: 8, color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.6 }}>
+          <div><strong style={{ color: 'var(--text-primary)' }}>恢复点：</strong>{node?.label || node?.node_id || '协作节点'} · {checkpointSummary}</div>
+          <div><strong style={{ color: 'var(--text-primary)' }}>将复用：</strong>检查点之前的会话上下文、员工角色、Skill/文件/记忆注入记录。</div>
+          <div><strong style={{ color: 'var(--text-primary)' }}>将重新执行：</strong>该节点从检查点之后的步骤，并把结果写入新的 Replay Fork。</div>
+          <div><strong style={{ color: 'var(--text-primary)' }}>交付物策略：</strong>{artifactPolicy.on_resume === 'create_new_version' ? '生成新版本，不覆盖原产物' : '保留原产物并追加恢复结果'}</div>
+          {step?.tool_name && <div><strong style={{ color: 'var(--text-primary)' }}>相关工具：</strong>{step.tool_name}</div>}
+          {(step?.risk_level === 'high' || step?.status === 'waiting_approval') && (
+            <div style={{ color: '#b45309' }}>该步骤涉及高风险或人工确认，恢复执行时可能再次触发审批。</div>
+          )}
+        </div>
+      ),
+      async onOk() {
+        try {
+          const res = await resumeWorkflowCheckpoint(activeSessionId, checkpoint.id, { mode: 'fork_resume' });
+          setSessionMetaById((prev) => ({
+            ...prev,
+            [activeSessionId]: {
+              ...(prev[activeSessionId] || {}),
+              task_status: res?.task_status || 'running',
+              task_summary: '已创建恢复分支，正在从检查点继续执行。',
+            },
+          }));
+          message.success('已创建 Replay Fork，正在后台恢复执行');
+          const replay = await replaySessionEvents(activeSessionId);
+          setReplayData(replay);
+        } catch (e: any) {
+          message.error(`恢复检查点失败: ${e?.message || e}`);
+          throw e;
+        }
+      },
+    });
+  }, [activeSessionId]);
+
+  const handleWorkflowStepAction = useCallback((step: any, action: 'retry' | 'skip', node?: any) => {
+    if (!activeSessionId || !step?.id) return;
+    const actionText = action === 'retry' ? '重试工具步骤' : '跳过工具并继续';
+    Modal.confirm({
+      title: `${actionText}？`,
+      okText: action === 'retry' ? '重试并继续' : '跳过并继续',
+      cancelText: '取消',
+      centered: true,
+      width: 520,
+      content: (
+        <div style={{ display: 'grid', gap: 8, color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.6 }}>
+          <div><strong style={{ color: 'var(--text-primary)' }}>节点：</strong>{node?.label || node?.node_id || '协作节点'}</div>
+          <div><strong style={{ color: 'var(--text-primary)' }}>步骤：</strong>{step.title || step.event_type}</div>
+          <div><strong style={{ color: 'var(--text-primary)' }}>工具：</strong>{step.tool_name || '未知工具'}</div>
+          <div><strong style={{ color: 'var(--text-primary)' }}>当前状态：</strong>{step.status}</div>
+          <div><strong style={{ color: 'var(--text-primary)' }}>恢复方式：</strong>{action === 'retry' ? '创建恢复分支，优先重新调用或替代该工具完成目标。' : '创建恢复分支，明确记录跳过影响，并继续产出可用结果。'}</div>
+          <div style={{ color: 'var(--text-tertiary)' }}>恢复结果会作为新分支写入回放，不会覆盖原始执行记录。</div>
+        </div>
+      ),
+      async onOk() {
+        try {
+          const res = await actionWorkflowStep(activeSessionId, step.id, action);
+          setSessionMetaById((prev) => ({
+            ...prev,
+            [activeSessionId]: {
+              ...(prev[activeSessionId] || {}),
+              task_status: res?.task_status || 'running',
+              task_summary: action === 'retry' ? '已创建工具重试分支。' : '已创建跳过并继续分支。',
+            },
+          }));
+          message.success(action === 'retry' ? '已创建工具重试分支' : '已创建跳过并继续分支');
+          const replay = await replaySessionEvents(activeSessionId);
+          setReplayData(replay);
+        } catch (e: any) {
+          message.error(`步骤操作失败: ${e?.message || e}`);
+          throw e;
+        }
+      },
+    });
   }, [activeSessionId]);
 
   const handleCanvasHubPointerDown = useCallback((e: ReactPointerEvent<HTMLButtonElement>) => {
@@ -3487,11 +3552,47 @@ export default function CommandCenter() {
                               {Array.isArray(step.artifact_ids) && step.artifact_ids.length > 0 && (
                                 <span style={{ fontSize: 10, color: 'var(--accent)' }}>交付物 {step.artifact_ids.length}</span>
                               )}
+                              {(step.status === 'failed' || step.status === 'stalled' || String(step.event_type || '').startsWith('tool.')) && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleWorkflowStepAction(step, 'retry', node)}
+                                    style={{
+                                      border: '1px solid rgba(59,130,246,0.3)',
+                                      background: 'rgba(59,130,246,0.08)',
+                                      color: '#2563eb',
+                                      borderRadius: 999,
+                                      padding: '3px 8px',
+                                      fontSize: 10,
+                                      cursor: 'pointer',
+                                    }}
+                                  >
+                                    重试工具
+                                  </button>
+                                  {(step.status === 'failed' || step.status === 'stalled') && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleWorkflowStepAction(step, 'skip', node)}
+                                      style={{
+                                        border: '1px solid rgba(245,158,11,0.35)',
+                                        background: 'rgba(245,158,11,0.08)',
+                                        color: '#b45309',
+                                        borderRadius: 999,
+                                        padding: '3px 8px',
+                                        fontSize: 10,
+                                        cursor: 'pointer',
+                                      }}
+                                    >
+                                      跳过继续
+                                    </button>
+                                  )}
+                                </>
+                              )}
                               {checkpoints.map((checkpoint: any) => (
                                 <button
                                   key={checkpoint.id}
                                   type="button"
-                                  onClick={() => handleResumeCheckpoint(checkpoint.id)}
+                                  onClick={() => handleResumeCheckpoint(checkpoint, node, step)}
                                   style={{
                                     border: '1px solid rgba(139,127,232,0.35)',
                                     background: 'var(--accent-soft)',

@@ -1595,3 +1595,16 @@ export async function resumeWorkflowCheckpoint(
     body: JSON.stringify({ mode: opts.mode || 'fork_resume', message: opts.message || '' }),
   });
 }
+
+export async function actionWorkflowStep(
+  sessionId: number | string,
+  stepEventId: string,
+  action: 'retry' | 'skip',
+  message = '',
+): Promise<any> {
+  const realId = await resolveRealSessionId(sessionId);
+  return apiFetch(`/sessions/${realId}/workflow-steps/${encodeURIComponent(stepEventId)}/action`, {
+    method: 'POST',
+    body: JSON.stringify({ action, message }),
+  });
+}

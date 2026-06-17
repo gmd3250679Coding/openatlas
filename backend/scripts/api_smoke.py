@@ -329,6 +329,7 @@ def run() -> dict:
         employee_node = next((n for n in replay_nodes if n.get("employee_id")), None)
         node_action = {}
         checkpoint_resume = {}
+        step_action_route = {}
         if employee_node:
             node_action = request("POST", f"/sessions/{sid}/workflow-nodes/{employee_node['id']}/action", {
                 "action": "continue",
@@ -342,6 +343,15 @@ def run() -> dict:
                 }, token=token)
                 if not checkpoint_resume.get("continuation_message") or checkpoint_resume.get("mode") != "prompt_only":
                     raise SmokeError(f"workflow checkpoint prompt resume failed: {checkpoint_resume}")
+            step_action_route = expect_http_error(
+                "POST",
+                f"/sessions/{sid}/workflow-steps/openatlas-smoke-missing-step/action",
+                404,
+                token=token,
+                body={"action": "retry"},
+            )
+            if not step_action_route.get("ok"):
+                raise SmokeError(f"workflow step action route/guard failed: {step_action_route}")
         messages = request("GET", f"/sessions/{sid}/messages", token=token)
         listed = request("GET", f"/files?session_id={sid}", token=token)
         file_detail = request("GET", f"/files/{uploaded['id']}", token=token)
@@ -374,6 +384,7 @@ def run() -> dict:
                 "checkpoint_count": len(replay.get("checkpoints") or []),
                 "node_action": bool(node_action.get("continuation_message")),
                 "checkpoint_resume": bool(checkpoint_resume.get("continuation_message")),
+                "step_action_route": bool(step_action_route.get("ok")),
             },
             "summary": detail.get("summary", {}),
             "file": {"listed": len(listed.get("items", [])), "summary": file_detail.get("summary"), "snippets": file_detail.get("snippets", [])[:1]},

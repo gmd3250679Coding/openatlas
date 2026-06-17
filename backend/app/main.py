@@ -358,6 +358,11 @@ class WorkflowCheckpointResumeIn(BaseModel):
     message: str = Field(default="", max_length=4000)
 
 
+class WorkflowStepActionIn(BaseModel):
+    action: str = Field(default="retry", pattern="^(retry|skip)$")
+    message: str = Field(default="", max_length=4000)
+
+
 class ArtifactPatchIn(BaseModel):
     name: str | None = Field(default=None, max_length=255)
     status: str | None = Field(default=None, max_length=24)
@@ -4670,6 +4675,202 @@ async def resume_workflow_checkpoint(
         "ok": True,
         "mode": "fork_resume",
         "task_status": rec.task_status,
+        "checkpoint": _workflow_checkpoint_to_dict(checkpoint),
+        "fork": _workflow_fork_to_dict(fork),
+        "workflow_run": _workflow_run_to_dict(child_wf, [child_node]),
+        "continuation_message": prompt,
+    }
+
+
+@app.post("/api/sessions/{sid}/workflow-steps/{step_event_id}/action")
+async def workflow_step_action(
+    sid: str,
+    step_event_id: str,
+    body: WorkflowStepActionIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    rec = db.get(SessionRecord, sid)
+    if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
+        raise HTTPException(404, "session not found")
+    step = db.get(WorkflowStepEvent, step_event_id)
+    if not step or step.tenant_id != p.tenant.id or step.session_id != sid:
+        raise HTTPException(404, "workflow step not found")
+    parent_wf = db.get(WorkflowRun, step.workflow_run_id)
+    parent_node = db.get(WorkflowNodeRun, step.workflow_node_run_id) if step.workflow_node_run_id else None
+    if not parent_wf or parent_wf.tenant_id != p.tenant.id:
+        raise HTTPException(404, "workflow run not found")
+    if not parent_node or not parent_node.employee_id:
+        raise HTTPException(400, "workflow step is not attached to an executable employee node")
+
+    checkpoint = db.query(WorkflowCheckpoint).filter(
+        WorkflowCheckpoint.tenant_id == p.tenant.id,
+        WorkflowCheckpoint.session_id == sid,
+        WorkflowCheckpoint.step_event_id == step.id,
+    ).order_by(WorkflowCheckpoint.created_at.desc()).first()
+    payload = _json_loads_obj(step.payload_json, {})
+    if not checkpoint:
+        checkpoint = WorkflowCheckpoint(
+            tenant_id=p.tenant.id,
+            user_id=p.user.id,
+            session_id=sid,
+            workflow_run_id=parent_wf.id,
+            workflow_node_run_id=parent_node.id,
+            step_event_id=step.id,
+            checkpoint_type=f"tool.{body.action}",
+            status="available",
+            summary=step.summary or step.title or step.event_type,
+            context_snapshot_json=json.dumps({
+                "event_type": step.event_type,
+                "title": step.title,
+                "summary": step.summary,
+                "input_summary": step.input_summary,
+                "output_summary": step.output_summary,
+                "tool_name": step.tool_name,
+                "payload": payload,
+            }, ensure_ascii=False),
+            hermes_session_id=rec.hermes_session_id,
+            hermes_run_id=str(payload.get("hermes_run_id") or ""),
+            upstream_node_outputs_json=json.dumps({}, ensure_ascii=False),
+            artifact_policy_json=json.dumps({
+                "artifact_ids": _json_loads_obj(step.artifact_ids, []),
+                "on_resume": "create_new_version",
+            }, ensure_ascii=False),
+        )
+        db.add(checkpoint)
+        db.flush()
+
+    action = body.action or "retry"
+    verb = "重新执行该工具步骤" if action == "retry" else "跳过该工具步骤并继续后续任务"
+    prompt = body.message.strip() or (
+        "请从 OpenAtlas 协作工作流的具体工具步骤恢复执行。\n"
+        f"恢复动作: {verb}\n"
+        f"节点: {parent_node.label or parent_node.node_id}\n"
+        f"工具: {step.tool_name or payload.get('tool_name') or payload.get('name') or '未知工具'}\n"
+        f"步骤状态: {step.status}\n"
+        f"步骤摘要: {step.summary or step.output_summary or step.input_summary or step.event_type}\n"
+        f"原始用户任务: {rec.last_message or parent_node.input_summary}\n"
+        f"工具上下文: {json.dumps(payload, ensure_ascii=False)[:1600]}\n"
+        "要求: 复用该步骤之前已经完成的信息；不要重复已成功完成的上游工作；"
+        + ("优先重新调用或替代该工具完成目标。" if action == "retry" else "明确说明该工具被跳过后的影响，并继续产出可用结果。")
+    )
+
+    now = datetime.now(timezone.utc)
+    child_wf = WorkflowRun(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=sid,
+        template_id=parent_wf.template_id,
+        status="queued",
+        strategy=parent_wf.strategy,
+        summary=f"{'重试' if action == 'retry' else '跳过'}工具步骤: {step.tool_name or step.title or step.event_type}",
+        payload=json.dumps({
+            "parent_workflow_run_id": parent_wf.id,
+            "forked_from_checkpoint_id": checkpoint.id,
+            "forked_from_node_run_id": parent_node.id,
+            "forked_from_step_event_id": step.id,
+            "step_action": action,
+            "resume_prompt": prompt[:1000],
+        }, ensure_ascii=False),
+        started_at=now,
+        updated_at=now,
+    )
+    db.add(child_wf)
+    db.flush()
+    child_node = WorkflowNodeRun(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        workflow_run_id=child_wf.id,
+        session_id=sid,
+        employee_id=parent_node.employee_id,
+        node_id=parent_node.node_id,
+        label=parent_node.label,
+        status="queued",
+        input_summary=prompt[:4000],
+        payload=json.dumps({
+            "parent_node_run_id": parent_node.id,
+            "checkpoint_id": checkpoint.id,
+            "step_event_id": step.id,
+            "step_action": action,
+            "recovery": True,
+        }, ensure_ascii=False),
+    )
+    db.add(child_node)
+    db.flush()
+    fork = WorkflowRunFork(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=sid,
+        parent_workflow_run_id=parent_wf.id,
+        child_workflow_run_id=child_wf.id,
+        forked_from_node_run_id=parent_node.id,
+        forked_from_checkpoint_id=checkpoint.id,
+        reason=f"step_{action}",
+        payload_json=json.dumps({"prompt": prompt[:1000], "step_event_id": step.id, "action": action}, ensure_ascii=False),
+        created_by=p.user.id,
+    )
+    db.add(fork)
+    _record_workflow_step(
+        db,
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=sid,
+        workflow_run_id=child_wf.id,
+        workflow_node_run_id=child_node.id,
+        employee_id=child_node.employee_id,
+        event_type=f"tool.{action}_requested",
+        title="工具步骤恢复",
+        summary=f"{'重试' if action == 'retry' else '跳过并继续'}工具步骤: {step.tool_name or step.title or step.event_type}",
+        input_summary=prompt[:1000],
+        payload={
+            "parent_workflow_run_id": parent_wf.id,
+            "forked_from_node_run_id": parent_node.id,
+            "forked_from_checkpoint_id": checkpoint.id,
+            "forked_from_step_event_id": step.id,
+            "step_action": action,
+        },
+        checkpoint_type=f"tool.{action}_requested",
+        hermes_session_id=rec.hermes_session_id,
+        hermes_run_id=checkpoint.hermes_run_id,
+    )
+    rec.task_status = "running"
+    rec.task_summary = f"已创建工具步骤恢复分支，正在{'重试' if action == 'retry' else '跳过并继续'}。"
+    if action == "skip":
+        step.status = "skipped"
+    db.add(CanvasEvent(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=sid,
+        employee_id=child_node.employee_id,
+        event_type=f"tool.{action}_requested",
+        node_id=child_node.node_id,
+        payload=json.dumps({
+            "parent_workflow_run_id": parent_wf.id,
+            "child_workflow_run_id": child_wf.id,
+            "checkpoint_id": checkpoint.id,
+            "step_event_id": step.id,
+            "action": action,
+        }, ensure_ascii=False),
+    ))
+    audit(db, principal=p, action=f"workflow_step.{action}", resource_type="workflow_step_event",
+          resource_id=step.id, request=request, extra={
+              "session_id": sid,
+              "parent_workflow_run_id": parent_wf.id,
+              "child_workflow_run_id": child_wf.id,
+          })
+    db.commit()
+    asyncio.create_task(_execute_checkpoint_resume(
+        workflow_run_id=child_wf.id,
+        workflow_node_run_id=child_node.id,
+        checkpoint_id=checkpoint.id,
+        prompt=prompt,
+    ))
+    return {
+        "ok": True,
+        "action": action,
+        "task_status": rec.task_status,
+        "step": _workflow_step_to_dict(step),
         "checkpoint": _workflow_checkpoint_to_dict(checkpoint),
         "fork": _workflow_fork_to_dict(fork),
         "workflow_run": _workflow_run_to_dict(child_wf, [child_node]),
