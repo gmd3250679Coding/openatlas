@@ -31,6 +31,9 @@ from app.db.models import (
     Tenant,
     User,
     UserRole,
+    WorkflowCheckpoint,
+    WorkflowRunFork,
+    WorkflowStepEvent,
 )
 
 

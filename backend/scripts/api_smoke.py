@@ -323,15 +323,25 @@ def run() -> dict:
         replay = request("GET", f"/sessions/{sid}/replay", token=token)
         if not replay.get("workflow_run") or not replay.get("runs"):
             raise SmokeError(f"session replay missing workflow/run evidence: {replay}")
+        if not replay.get("steps") or not replay.get("checkpoints"):
+            raise SmokeError(f"session replay missing step timeline/checkpoints: {replay}")
         replay_nodes = (replay.get("workflow_run") or {}).get("nodes") or []
         employee_node = next((n for n in replay_nodes if n.get("employee_id")), None)
         node_action = {}
+        checkpoint_resume = {}
         if employee_node:
             node_action = request("POST", f"/sessions/{sid}/workflow-nodes/{employee_node['id']}/action", {
                 "action": "continue",
             }, token=token)
             if not node_action.get("continuation_message") or node_action.get("task_status") != "needs_input":
                 raise SmokeError(f"workflow node action did not prepare continuation: {node_action}")
+            node_checkpoints = employee_node.get("checkpoints") or []
+            if node_checkpoints:
+                checkpoint_resume = request("POST", f"/sessions/{sid}/workflow-checkpoints/{node_checkpoints[0]['id']}/resume", {
+                    "mode": "prompt_only",
+                }, token=token)
+                if not checkpoint_resume.get("continuation_message") or checkpoint_resume.get("mode") != "prompt_only":
+                    raise SmokeError(f"workflow checkpoint prompt resume failed: {checkpoint_resume}")
         messages = request("GET", f"/sessions/{sid}/messages", token=token)
         listed = request("GET", f"/files?session_id={sid}", token=token)
         file_detail = request("GET", f"/files/{uploaded['id']}", token=token)
@@ -360,7 +370,10 @@ def run() -> dict:
                 "workflow_status": (replay.get("workflow_run") or {}).get("status"),
                 "node_count": len((replay.get("workflow_run") or {}).get("nodes") or []),
                 "event_count": len(replay.get("events") or []),
+                "step_count": len(replay.get("steps") or []),
+                "checkpoint_count": len(replay.get("checkpoints") or []),
                 "node_action": bool(node_action.get("continuation_message")),
+                "checkpoint_resume": bool(checkpoint_resume.get("continuation_message")),
             },
             "summary": detail.get("summary", {}),
             "file": {"listed": len(listed.get("items", [])), "summary": file_detail.get("summary"), "snippets": file_detail.get("snippets", [])[:1]},

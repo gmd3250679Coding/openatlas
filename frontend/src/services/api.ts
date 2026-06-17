@@ -1241,6 +1241,9 @@ export type CanvasReplay = {
   session_title?: string;
   total?: number;
   events: any[];
+  steps?: any[];
+  checkpoints?: any[];
+  forks?: any[];
   runs?: any[];
   artifacts?: any[];
   workflow_run?: any;
@@ -1559,6 +1562,9 @@ export async function replaySessionEvents(sessionId: number | string): Promise<C
     session_title: r?.session?.title || '当前会话',
     total: r?.total ?? 0,
     events: Array.isArray(r?.events) ? r.events : [],
+    steps: Array.isArray(r?.steps) ? r.steps : [],
+    checkpoints: Array.isArray(r?.checkpoints) ? r.checkpoints : [],
+    forks: Array.isArray(r?.forks) ? r.forks : [],
     runs: Array.isArray(r?.runs) ? r.runs : [],
     artifacts: Array.isArray(r?.artifacts) ? r.artifacts : [],
     workflow_run: r?.workflow_run || null,
@@ -1575,5 +1581,17 @@ export async function actionWorkflowNode(
   return apiFetch(`/sessions/${realId}/workflow-nodes/${encodeURIComponent(nodeRunId)}/action`, {
     method: 'POST',
     body: JSON.stringify({ action, message }),
+  });
+}
+
+export async function resumeWorkflowCheckpoint(
+  sessionId: number | string,
+  checkpointId: string,
+  opts: { mode?: 'fork_resume' | 'prompt_only'; message?: string } = {},
+): Promise<any> {
+  const realId = await resolveRealSessionId(sessionId);
+  return apiFetch(`/sessions/${realId}/workflow-checkpoints/${encodeURIComponent(checkpointId)}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({ mode: opts.mode || 'fork_resume', message: opts.message || '' }),
   });
 }

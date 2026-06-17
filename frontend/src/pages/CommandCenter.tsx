@@ -26,7 +26,7 @@ import {
   refreshSessionSummary, patchSessionTaskStatus, archiveArtifact, patchArtifact,
   fetchCollaborationTemplates, createSessionFromTemplate,
   fetchRunQueue, resumeSessionTask, recoverSessionTask,
-  replayEmployeeEvents, replaySessionEvents, actionWorkflowNode, type CanvasReplay,  // M5
+  replayEmployeeEvents, replaySessionEvents, actionWorkflowNode, resumeWorkflowCheckpoint, type CanvasReplay,  // M5
   type Conversation, type Attachment, type Employee,
 } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
@@ -754,6 +754,7 @@ export default function CommandCenter() {
   // M5 (Event Log): Replay Modal 状态
   const [replayOpen, setReplayOpen] = useState(false);
   const [replayData, setReplayData] = useState<CanvasReplay | null>(null);
+  const [expandedReplayNodes, setExpandedReplayNodes] = useState<Record<string, boolean>>({});
   // M4.4.4: 浮动按钮 badge 计数 (画布节点 done/总数)
   const [canvasBadge, setCanvasBadge] = useState<{ done: number; total: number }>({ done: 0, total: 0 });
   // M4.4: 协作画布 imperative handle (用 Callback ref,因为 Ant Modal wrap)
@@ -1002,6 +1003,26 @@ export default function CommandCenter() {
       message.success(action === 'retry' ? '已生成节点重试提示' : '已生成节点继续提示');
     } catch (e: any) {
       message.error(`节点操作失败: ${e?.message || e}`);
+    }
+  }, [activeSessionId]);
+
+  const handleResumeCheckpoint = useCallback(async (checkpointId: string) => {
+    if (!activeSessionId || !checkpointId) return;
+    try {
+      const res = await resumeWorkflowCheckpoint(activeSessionId, checkpointId, { mode: 'fork_resume' });
+      setSessionMetaById((prev) => ({
+        ...prev,
+        [activeSessionId]: {
+          ...(prev[activeSessionId] || {}),
+          task_status: res?.task_status || 'running',
+          task_summary: '已创建恢复分支，正在从检查点继续执行。',
+        },
+      }));
+      message.success('已创建 Replay Fork，正在后台恢复执行');
+      const replay = await replaySessionEvents(activeSessionId);
+      setReplayData(replay);
+    } catch (e: any) {
+      message.error(`恢复检查点失败: ${e?.message || e}`);
     }
   }, [activeSessionId]);
 
@@ -3398,6 +3419,96 @@ export default function CommandCenter() {
                   {Array.isArray(node.artifact_ids) && node.artifact_ids.length > 0 && (
                     <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
                       交付物 {node.artifact_ids.length} 个
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 4 }}>
+                    <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+                      步骤 {Array.isArray(node.steps) ? node.steps.length : 0}
+                    </span>
+                    <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+                      检查点 {Array.isArray(node.checkpoints) ? node.checkpoints.length : 0}
+                    </span>
+                    {Array.isArray(node.steps) && node.steps.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setExpandedReplayNodes((prev) => ({ ...prev, [node.id]: !prev[node.id] }))}
+                        style={{
+                          border: 'none',
+                          background: 'transparent',
+                          color: 'var(--accent)',
+                          fontSize: 11,
+                          padding: 0,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {expandedReplayNodes[node.id] ? '收起步骤' : '展开步骤'}
+                      </button>
+                    )}
+                  </div>
+                  {expandedReplayNodes[node.id] && Array.isArray(node.steps) && node.steps.length > 0 && (
+                    <div style={{
+                      marginTop: 8,
+                      display: 'grid',
+                      gap: 6,
+                      borderTop: '1px solid var(--border-subtle)',
+                      paddingTop: 8,
+                    }}>
+                      {node.steps.map((step: any) => {
+                        const checkpoints = Array.isArray(node.checkpoints)
+                          ? node.checkpoints.filter((c: any) => c.step_event_id === step.id)
+                          : [];
+                        const stepColor = step.status === 'failed'
+                          ? '#ef4444'
+                          : step.status === 'stalled'
+                            ? '#f59e0b'
+                            : step.status === 'waiting_approval'
+                              ? '#8b5cf6'
+                              : '#10b981';
+                        return (
+                          <div key={step.id} style={{
+                            display: 'grid',
+                            gap: 4,
+                            padding: '8px 10px',
+                            borderRadius: 8,
+                            background: 'var(--bg-primary)',
+                            border: '1px solid var(--border-subtle)',
+                          }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <span style={{ width: 7, height: 7, borderRadius: 999, background: stepColor, flexShrink: 0 }} />
+                              <strong style={{ fontSize: 12, color: 'var(--text-primary)' }}>{step.title || step.event_type}</strong>
+                              <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--text-tertiary)' }}>{step.status}</span>
+                            </div>
+                            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.45 }}>
+                              {step.summary || step.output_summary || step.input_summary || step.event_type}
+                            </div>
+                            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                              <span style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>{step.event_type}</span>
+                              {step.tool_name && <span style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>tool: {step.tool_name}</span>}
+                              {Array.isArray(step.artifact_ids) && step.artifact_ids.length > 0 && (
+                                <span style={{ fontSize: 10, color: 'var(--accent)' }}>交付物 {step.artifact_ids.length}</span>
+                              )}
+                              {checkpoints.map((checkpoint: any) => (
+                                <button
+                                  key={checkpoint.id}
+                                  type="button"
+                                  onClick={() => handleResumeCheckpoint(checkpoint.id)}
+                                  style={{
+                                    border: '1px solid rgba(139,127,232,0.35)',
+                                    background: 'var(--accent-soft)',
+                                    color: 'var(--accent)',
+                                    borderRadius: 999,
+                                    padding: '3px 8px',
+                                    fontSize: 10,
+                                    cursor: 'pointer',
+                                  }}
+                                >
+                                  从这里恢复执行
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
                   {activeSessionId && node.id && (

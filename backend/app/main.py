@@ -55,8 +55,11 @@ from app.db.models import (
     TaskArtifact,
     User,
     UserRole,
+    WorkflowCheckpoint,
     WorkflowNodeRun,
     WorkflowRun,
+    WorkflowRunFork,
+    WorkflowStepEvent,
 )
 from app.db.session import SessionLocal, get_db, init_db
 from app.services import hermes_client
@@ -347,6 +350,11 @@ class RunStopIn(BaseModel):
 
 class WorkflowNodeActionIn(BaseModel):
     action: str = Field(default="continue", pattern="^(retry|continue)$")
+    message: str = Field(default="", max_length=4000)
+
+
+class WorkflowCheckpointResumeIn(BaseModel):
+    mode: str = Field(default="fork_resume", pattern="^(fork_resume|prompt_only)$")
     message: str = Field(default="", max_length=4000)
 
 
@@ -2284,6 +2292,591 @@ def _workflow_run_to_dict(row: WorkflowRun, nodes: list[WorkflowNodeRun] | None 
     }
 
 
+def _workflow_step_to_dict(row: WorkflowStepEvent) -> dict:
+    return {
+        "id": row.id,
+        "session_id": row.session_id,
+        "workflow_run_id": row.workflow_run_id,
+        "workflow_node_run_id": row.workflow_node_run_id,
+        "employee_id": row.employee_id,
+        "event_type": row.event_type,
+        "status": row.status,
+        "title": row.title,
+        "summary": row.summary,
+        "input_summary": row.input_summary,
+        "output_summary": row.output_summary,
+        "raw_event_ref": row.raw_event_ref,
+        "payload": _json_loads_obj(row.payload_json, {}),
+        "risk_level": row.risk_level,
+        "tool_name": row.tool_name,
+        "artifact_ids": _json_loads_obj(row.artifact_ids, []),
+        "file_ids": _json_loads_obj(row.file_ids, []),
+        "is_checkpoint": bool(row.is_checkpoint),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _workflow_checkpoint_to_dict(row: WorkflowCheckpoint) -> dict:
+    return {
+        "id": row.id,
+        "session_id": row.session_id,
+        "workflow_run_id": row.workflow_run_id,
+        "workflow_node_run_id": row.workflow_node_run_id,
+        "step_event_id": row.step_event_id,
+        "checkpoint_type": row.checkpoint_type,
+        "status": row.status,
+        "summary": row.summary,
+        "context_snapshot": _json_loads_obj(row.context_snapshot_json, {}),
+        "hermes_session_id": row.hermes_session_id,
+        "hermes_run_id": row.hermes_run_id,
+        "upstream_node_outputs": _json_loads_obj(row.upstream_node_outputs_json, {}),
+        "artifact_policy": _json_loads_obj(row.artifact_policy_json, {}),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _workflow_fork_to_dict(row: WorkflowRunFork) -> dict:
+    return {
+        "id": row.id,
+        "session_id": row.session_id,
+        "parent_workflow_run_id": row.parent_workflow_run_id,
+        "child_workflow_run_id": row.child_workflow_run_id,
+        "forked_from_node_run_id": row.forked_from_node_run_id,
+        "forked_from_checkpoint_id": row.forked_from_checkpoint_id,
+        "reason": row.reason,
+        "payload": _json_loads_obj(row.payload_json, {}),
+        "created_by": row.created_by,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _step_status_for_event(event_type: str) -> str:
+    if event_type.endswith(".failed") or event_type in {"node.failed", "run.failed", "error"}:
+        return "failed"
+    if event_type in {"tool.started", "run.started", "node.started"}:
+        return "running"
+    if event_type in {"approval.required", "openatlas.approval_required"}:
+        return "waiting_approval"
+    if event_type in {"openatlas.run_idle", "openatlas.run_detached", "node.stalled"}:
+        return "stalled"
+    return "completed"
+
+
+def _step_title_for_event(event_type: str, payload: dict[str, Any]) -> str:
+    if event_type.startswith("tool."):
+        return f"工具: {payload.get('tool_name') or payload.get('name') or payload.get('tool') or 'tool'}"
+    if event_type in {"openatlas.reasoning", "reasoning.summary"}:
+        return "思考摘要"
+    if event_type in {"openatlas.context", "context.injected"}:
+        return "上下文注入"
+    if event_type in {"openatlas.approval_required", "approval.required"}:
+        return "等待人工确认"
+    if event_type.startswith("artifact."):
+        return "交付物"
+    if event_type in {"openatlas.run_idle", "openatlas.run_detached", "node.stalled"}:
+        return "长任务停滞"
+    if event_type == "assistant.delta":
+        return "模型回复"
+    return event_type
+
+
+def _should_checkpoint_event(event_type: str, status: str) -> bool:
+    return (
+        event_type in {
+            "node.started",
+            "context.injected",
+            "tool.completed",
+            "artifact.created",
+            "node.completed",
+            "node.failed",
+            "openatlas.run_idle",
+            "openatlas.run_detached",
+            "approval.resolved",
+        }
+        or status in {"failed", "stalled", "waiting_approval"}
+    )
+
+
+def _record_workflow_step(
+    db: Session,
+    *,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    workflow_run_id: str,
+    workflow_node_run_id: str | None,
+    employee_id: str | None,
+    event_type: str,
+    payload: dict[str, Any] | None = None,
+    title: str = "",
+    summary: str = "",
+    input_summary: str = "",
+    output_summary: str = "",
+    raw_event_ref: str = "",
+    risk_level: str = "low",
+    tool_name: str = "",
+    artifact_ids: list[str] | None = None,
+    file_ids: list[str] | None = None,
+    checkpoint_type: str | None = None,
+    hermes_session_id: str = "",
+    hermes_run_id: str = "",
+) -> WorkflowStepEvent:
+    payload = payload or {}
+    status = _step_status_for_event(event_type)
+    artifact_ids = artifact_ids or []
+    file_ids = file_ids or []
+    row = WorkflowStepEvent(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+        workflow_run_id=workflow_run_id,
+        workflow_node_run_id=workflow_node_run_id,
+        employee_id=employee_id,
+        event_type=event_type,
+        status=status,
+        title=(title or _step_title_for_event(event_type, payload))[:255],
+        summary=(summary or str(payload.get("summary") or payload.get("detail") or payload.get("message") or payload.get("label") or ""))[:4000],
+        input_summary=input_summary[:4000],
+        output_summary=output_summary[:4000],
+        raw_event_ref=raw_event_ref[:128],
+        payload_json=json.dumps(payload, ensure_ascii=False),
+        risk_level=risk_level[:24],
+        tool_name=(tool_name or str(payload.get("tool_name") or payload.get("name") or payload.get("tool") or ""))[:128],
+        artifact_ids=json.dumps(artifact_ids, ensure_ascii=False),
+        file_ids=json.dumps(file_ids, ensure_ascii=False),
+        is_checkpoint=bool(checkpoint_type or _should_checkpoint_event(event_type, status)),
+    )
+    db.add(row)
+    db.flush()
+    if row.is_checkpoint:
+        checkpoint = WorkflowCheckpoint(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            workflow_run_id=workflow_run_id,
+            workflow_node_run_id=workflow_node_run_id,
+            step_event_id=row.id,
+            checkpoint_type=checkpoint_type or event_type,
+            status="available",
+            summary=row.summary or row.title,
+            context_snapshot_json=json.dumps({
+                "event_type": event_type,
+                "input_summary": input_summary,
+                "output_summary": output_summary,
+                "payload": payload,
+            }, ensure_ascii=False),
+            hermes_session_id=hermes_session_id[:128],
+            hermes_run_id=hermes_run_id[:128],
+            upstream_node_outputs_json=json.dumps({}, ensure_ascii=False),
+            artifact_policy_json=json.dumps({
+                "artifact_ids": artifact_ids,
+                "on_resume": "create_new_version",
+            }, ensure_ascii=False),
+        )
+        db.add(checkpoint)
+        db.flush()
+    return row
+
+
+def _record_workflow_step_safely(**kwargs: Any) -> None:
+    db = SessionLocal()
+    try:
+        _record_workflow_step(db, **kwargs)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+async def _execute_checkpoint_resume(
+    *,
+    workflow_run_id: str,
+    workflow_node_run_id: str,
+    checkpoint_id: str,
+    prompt: str,
+    reasoning_effort: str | None = None,
+) -> None:
+    """Run a checkpoint recovery branch in the background.
+
+    This intentionally keeps the first implementation linear: resume one node,
+    persist its transcript/artifacts, and leave downstream replay/fan-out to the
+    next executor iteration.
+    """
+    session_run_id = ""
+    hermes_run_id = ""
+    assistant_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_records: list[dict[str, Any]] = []
+    artifact_ids: list[str] = []
+    with SessionLocal() as db:
+        wf = db.get(WorkflowRun, workflow_run_id)
+        node = db.get(WorkflowNodeRun, workflow_node_run_id)
+        checkpoint = db.get(WorkflowCheckpoint, checkpoint_id)
+        if not wf or not node or not checkpoint:
+            return
+        rec = db.get(SessionRecord, wf.session_id)
+        emp = db.get(DigitalEmployee, node.employee_id) if node.employee_id else None
+        if not rec:
+            return
+        run_row = _create_session_run(
+            db,
+            tenant_id=wf.tenant_id,
+            user_id=wf.user_id,
+            session_id=wf.session_id,
+            employee_id=node.employee_id,
+            status="running",
+            stage="recovery",
+            reason="从检查点恢复执行",
+            payload={
+                "workflow_run_id": wf.id,
+                "workflow_node_run_id": node.id,
+                "checkpoint_id": checkpoint.id,
+            },
+        )
+        session_run_id = run_row.id
+        node.status = "running"
+        node.run_id = session_run_id
+        node.input_summary = prompt[:4000]
+        node.started_at = node.started_at or datetime.now(timezone.utc)
+        wf.status = "running"
+        wf.summary = f"从检查点恢复执行: {checkpoint.summary or checkpoint.checkpoint_type}"
+        rec.task_status = "running"
+        rec.task_summary = "正在从协作检查点恢复执行。"
+        _record_workflow_step(
+            db,
+            tenant_id=wf.tenant_id,
+            user_id=wf.user_id,
+            session_id=wf.session_id,
+            workflow_run_id=wf.id,
+            workflow_node_run_id=node.id,
+            employee_id=node.employee_id,
+            event_type="node.resume_started",
+            title="从检查点恢复",
+            summary=checkpoint.summary or "从检查点恢复执行",
+            input_summary=prompt[:1000],
+            payload={"checkpoint_id": checkpoint.id, "checkpoint_type": checkpoint.checkpoint_type},
+            checkpoint_type="node.resume_started",
+            hermes_session_id=rec.hermes_session_id,
+        )
+        db.commit()
+        target = await hermes_client.resolve_target(db, wf.tenant_id)
+        try:
+            system_message = ""
+            if emp:
+                hermes_home = _tenant_hermes_home(db, wf.tenant_id)
+                system_message, _eff, _skills = _build_employee_system_message(
+                    db,
+                    tenant_id=wf.tenant_id,
+                    user_id=wf.user_id,
+                    employee_id=emp.id,
+                    hermes_home=hermes_home,
+                    file_ctx_block="",
+                    recent_context_block="",
+                )
+        except Exception:
+            system_message = ""
+
+    try:
+        with SessionLocal() as db:
+            wf = db.get(WorkflowRun, workflow_run_id)
+            node = db.get(WorkflowNodeRun, workflow_node_run_id)
+            rec = db.get(SessionRecord, wf.session_id) if wf else None
+            if not wf or not node or not rec:
+                return
+            run = await hermes_client.create_run(
+                target,
+                message=prompt,
+                session_id=rec.hermes_session_id,
+                system_message=system_message or None,
+                reasoning_effort=reasoning_effort,
+            )
+            hermes_run_id = str(run.get("run_id") or "")
+            _remember_hermes_run(
+                hermes_run_id,
+                tenant_id=wf.tenant_id,
+                user_id=wf.user_id,
+                session_id=wf.session_id,
+                employee_id=node.employee_id or "",
+                hermes_session_id=rec.hermes_session_id,
+            )
+            _update_session_run(db, session_run_id, status="running", stage="runtime", reason="Hermes recovery run started", event_type="run.started", hermes_run_id=hermes_run_id)
+            _update_workflow_node_run(
+                db,
+                workflow_run=wf,
+                tenant_id=wf.tenant_id,
+                user_id=wf.user_id,
+                session_id=wf.session_id,
+                employee_id=node.employee_id,
+                node_id=node.node_id,
+                label=node.label,
+                status="running",
+                event_type="run.started",
+                session_run_id=session_run_id,
+                hermes_run_id=hermes_run_id,
+            )
+            _record_workflow_step(
+                db,
+                tenant_id=wf.tenant_id,
+                user_id=wf.user_id,
+                session_id=wf.session_id,
+                workflow_run_id=wf.id,
+                workflow_node_run_id=node.id,
+                employee_id=node.employee_id,
+                event_type="run.started",
+                title="Hermes 恢复 Run 启动",
+                summary=f"Hermes run {hermes_run_id} 已启动",
+                payload={**run, "hermes_run_id": hermes_run_id},
+                checkpoint_type="run.started",
+                hermes_session_id=rec.hermes_session_id,
+                hermes_run_id=hermes_run_id,
+            )
+            db.commit()
+
+        idle_timeout = max(15.0, float(os.environ.get("OPENATLAS_RUN_EVENT_IDLE_TIMEOUT_SECONDS", "60")))
+        stream = hermes_client.stream_run_events(target, hermes_run_id).__aiter__()
+        last_event_at = datetime.now(timezone.utc)
+        while True:
+            try:
+                run_ev = await asyncio.wait_for(stream.__anext__(), timeout=idle_timeout)
+                last_event_at = datetime.now(timezone.utc)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                idle_for = int((datetime.now(timezone.utc) - last_event_at).total_seconds())
+                with SessionLocal() as db:
+                    wf = db.get(WorkflowRun, workflow_run_id)
+                    node = db.get(WorkflowNodeRun, workflow_node_run_id)
+                    rec = db.get(SessionRecord, wf.session_id) if wf else None
+                    if wf and node and rec:
+                        _update_session_run(db, session_run_id, status="stalled", stage="runtime", reason="Hermes 长时间未推送新事件", event_type="openatlas.run_idle", hermes_run_id=hermes_run_id)
+                        node.status = "stalled"
+                        wf.status = "stalled"
+                        rec.task_status = "running"
+                        rec.task_summary = "恢复执行暂时无新事件，后台补同步仍在继续。"
+                        _record_workflow_step(
+                            db,
+                            tenant_id=wf.tenant_id,
+                            user_id=wf.user_id,
+                            session_id=wf.session_id,
+                            workflow_run_id=wf.id,
+                            workflow_node_run_id=node.id,
+                            employee_id=node.employee_id,
+                            event_type="openatlas.run_idle",
+                            title="恢复执行停滞",
+                            summary=f"{idle_for} 秒无新事件，已保留恢复检查点。",
+                            payload={"idle_seconds": idle_for, "hermes_run_id": hermes_run_id},
+                            checkpoint_type="stalled",
+                            hermes_session_id=rec.hermes_session_id,
+                            hermes_run_id=hermes_run_id,
+                        )
+                        db.commit()
+                _schedule_detached_run_reconcile(hermes_run_id)
+                return
+
+            ev_name = run_ev.get("event") or "message"
+            ev_data = run_ev.get("data") if isinstance(run_ev.get("data"), dict) else {"raw": run_ev.get("data")}
+            with SessionLocal() as db:
+                wf = db.get(WorkflowRun, workflow_run_id)
+                node = db.get(WorkflowNodeRun, workflow_node_run_id)
+                rec = db.get(SessionRecord, wf.session_id) if wf else None
+                if not wf or not node or not rec:
+                    return
+                if ev_name == "message.delta":
+                    delta = str(ev_data.get("delta") or "")
+                    if delta:
+                        assistant_parts.append(delta)
+                elif ev_name == "reasoning.available":
+                    text = str(ev_data.get("text") or "")
+                    if text:
+                        reasoning_parts.append(text)
+                        _record_workflow_step(
+                            db,
+                            tenant_id=wf.tenant_id,
+                            user_id=wf.user_id,
+                            session_id=wf.session_id,
+                            workflow_run_id=wf.id,
+                            workflow_node_run_id=node.id,
+                            employee_id=node.employee_id,
+                            event_type="reasoning.summary",
+                            title="思考摘要",
+                            summary=text[:1000],
+                            payload={**ev_data, "hermes_run_id": hermes_run_id},
+                            hermes_session_id=rec.hermes_session_id,
+                            hermes_run_id=hermes_run_id,
+                        )
+                elif ev_name == "tool.started":
+                    tool_name = str(ev_data.get("tool") or ev_data.get("tool_name") or "tool")
+                    tool_records.append({"name": tool_name, "status": "running", "payload": ev_data})
+                    _record_workflow_step(
+                        db,
+                        tenant_id=wf.tenant_id,
+                        user_id=wf.user_id,
+                        session_id=wf.session_id,
+                        workflow_run_id=wf.id,
+                        workflow_node_run_id=node.id,
+                        employee_id=node.employee_id,
+                        event_type="tool.started",
+                        title=f"工具: {tool_name}",
+                        summary=str(ev_data.get("preview") or ev_data.get("command") or tool_name),
+                        payload={**ev_data, "hermes_run_id": hermes_run_id},
+                        risk_level="high" if _is_approval_sensitive_tool(tool_name) else "low",
+                        tool_name=tool_name,
+                        hermes_session_id=rec.hermes_session_id,
+                        hermes_run_id=hermes_run_id,
+                    )
+                elif ev_name == "tool.completed":
+                    payload = {
+                        **ev_data,
+                        "tool_name": ev_data.get("tool") or ev_data.get("tool_name") or "tool",
+                        "result": ev_data.get("result") or ev_data.get("output"),
+                        "error": ev_data.get("error"),
+                        "hermes_run_id": hermes_run_id,
+                    }
+                    tool_name = str(payload.get("tool_name") or "tool")
+                    live_artifacts = _persist_tool_event_artifacts(
+                        tenant_id=wf.tenant_id,
+                        user_id=wf.user_id,
+                        session_id=wf.session_id,
+                        payload=payload,
+                        run_id=session_run_id,
+                        employee_id=node.employee_id,
+                        hermes_run_id=hermes_run_id,
+                    )
+                    new_artifact_ids = [str(a.get("id")) for a in live_artifacts if a.get("id")]
+                    artifact_ids.extend(new_artifact_ids)
+                    _record_workflow_step(
+                        db,
+                        tenant_id=wf.tenant_id,
+                        user_id=wf.user_id,
+                        session_id=wf.session_id,
+                        workflow_run_id=wf.id,
+                        workflow_node_run_id=node.id,
+                        employee_id=node.employee_id,
+                        event_type="tool.failed" if payload.get("error") else "tool.completed",
+                        title=f"工具: {tool_name}",
+                        summary=str(payload.get("error") or payload.get("label") or tool_name),
+                        payload=payload,
+                        risk_level="high" if _is_approval_sensitive_tool(tool_name) else "low",
+                        tool_name=tool_name,
+                        artifact_ids=new_artifact_ids,
+                        checkpoint_type="tool.failed" if payload.get("error") else "tool.completed",
+                        hermes_session_id=rec.hermes_session_id,
+                        hermes_run_id=hermes_run_id,
+                    )
+                elif ev_name == "run.completed":
+                    completed = str(ev_data.get("output") or ev_data.get("final_response") or "")
+                    if completed:
+                        assistant_parts.append(completed)
+                    break
+                elif ev_name == "run.failed":
+                    raise RuntimeError(str(ev_data.get("error") or "Hermes recovery run failed"))
+                db.commit()
+
+        full = "".join(assistant_parts).strip()
+        with SessionLocal() as db:
+            wf = db.get(WorkflowRun, workflow_run_id)
+            node = db.get(WorkflowNodeRun, workflow_node_run_id)
+            rec = db.get(SessionRecord, wf.session_id) if wf else None
+            if not wf or not node or not rec:
+                return
+            if full:
+                msg_row = MessageRecord(
+                    session_id=wf.session_id,
+                    role="assistant",
+                    content=full,
+                    reasoning=json.dumps(reasoning_parts, ensure_ascii=False),
+                    tool_calls=json.dumps(tool_records, ensure_ascii=False),
+                    speaker_employee_id=node.employee_id,
+                    speaker_name=node.label,
+                )
+                db.add(msg_row)
+                db.flush()
+                for art in _extract_task_artifacts(full, prefix=f"{node.label or '节点'}-恢复执行"):
+                    artifact = TaskArtifact(
+                        tenant_id=wf.tenant_id,
+                        user_id=wf.user_id,
+                        session_id=wf.session_id,
+                        message_id=msg_row.id,
+                        kind=art["kind"],
+                        name=art["name"],
+                        mime_type=art["mime_type"],
+                        content=art["content"],
+                        source="assistant",
+                        run_id=session_run_id,
+                        employee_id=node.employee_id,
+                        version=_next_artifact_version(db, session_id=wf.session_id, name=art["name"]),
+                        provenance_payload=json.dumps({
+                            "origin": "workflow_checkpoint_resume",
+                            "checkpoint_id": checkpoint_id,
+                            "hermes_run_id": hermes_run_id,
+                        }, ensure_ascii=False),
+                    )
+                    db.add(artifact)
+                    db.flush()
+                    artifact_ids.append(artifact.id)
+            node.status = "done"
+            node.output_summary = full[:4000]
+            node.artifact_ids = json.dumps(list(dict.fromkeys(artifact_ids)), ensure_ascii=False)
+            node.completed_at = datetime.now(timezone.utc)
+            wf.status = "completed"
+            wf.summary = "检查点恢复执行完成。"
+            wf.completed_at = datetime.now(timezone.utc)
+            rec.task_status = "completed" if full else "needs_input"
+            rec.task_summary = "检查点恢复执行完成。" if full else "恢复执行没有返回可见内容。"
+            _update_session_run(db, session_run_id, status="completed", stage="assistant", reason="checkpoint resume completed", event_type="run.completed", hermes_run_id=hermes_run_id)
+            _record_workflow_step(
+                db,
+                tenant_id=wf.tenant_id,
+                user_id=wf.user_id,
+                session_id=wf.session_id,
+                workflow_run_id=wf.id,
+                workflow_node_run_id=node.id,
+                employee_id=node.employee_id,
+                event_type="node.completed",
+                title="恢复节点完成",
+                summary="检查点恢复执行完成。",
+                output_summary=full[:1000],
+                payload={"checkpoint_id": checkpoint_id, "hermes_run_id": hermes_run_id},
+                artifact_ids=list(dict.fromkeys(artifact_ids)),
+                checkpoint_type="node.completed",
+                hermes_session_id=rec.hermes_session_id,
+                hermes_run_id=hermes_run_id,
+            )
+            db.commit()
+    except Exception as exc:
+        with SessionLocal() as db:
+            wf = db.get(WorkflowRun, workflow_run_id)
+            node = db.get(WorkflowNodeRun, workflow_node_run_id)
+            rec = db.get(SessionRecord, wf.session_id) if wf else None
+            if wf and node and rec:
+                node.status = "failed"
+                node.error = str(exc)[:4000]
+                wf.status = "failed"
+                wf.summary = str(exc)[:1000]
+                wf.completed_at = datetime.now(timezone.utc)
+                rec.task_status = "failed"
+                rec.task_summary = str(exc)[:1000]
+                _update_session_run(db, session_run_id, status="failed", stage="recovery", reason=str(exc), event_type="node.failed", hermes_run_id=hermes_run_id)
+                _record_workflow_step(
+                    db,
+                    tenant_id=wf.tenant_id,
+                    user_id=wf.user_id,
+                    session_id=wf.session_id,
+                    workflow_run_id=wf.id,
+                    workflow_node_run_id=node.id,
+                    employee_id=node.employee_id,
+                    event_type="node.failed",
+                    title="恢复执行失败",
+                    summary=str(exc)[:1000],
+                    payload={"checkpoint_id": checkpoint_id, "hermes_run_id": hermes_run_id},
+                    checkpoint_type="node.failed",
+                    hermes_session_id=rec.hermes_session_id,
+                    hermes_run_id=hermes_run_id,
+                )
+                db.commit()
+
+
 def _create_session_run(
     db: Session,
     *,
@@ -3821,10 +4414,40 @@ def get_session_replay(
         SessionRun.session_id == sid,
         SessionRun.tenant_id == p.tenant.id,
     ).order_by(SessionRun.created_at.asc()).limit(80).all()
+    steps: list[WorkflowStepEvent] = []
+    checkpoints: list[WorkflowCheckpoint] = []
+    forks: list[WorkflowRunFork] = []
+    if wf:
+        steps = db.query(WorkflowStepEvent).filter(
+            WorkflowStepEvent.workflow_run_id == wf.id,
+            WorkflowStepEvent.tenant_id == p.tenant.id,
+        ).order_by(WorkflowStepEvent.created_at.asc()).limit(500).all()
+        checkpoints = db.query(WorkflowCheckpoint).filter(
+            WorkflowCheckpoint.workflow_run_id == wf.id,
+            WorkflowCheckpoint.tenant_id == p.tenant.id,
+        ).order_by(WorkflowCheckpoint.created_at.asc()).limit(200).all()
+        forks = db.query(WorkflowRunFork).filter(
+            WorkflowRunFork.session_id == sid,
+            WorkflowRunFork.tenant_id == p.tenant.id,
+        ).order_by(WorkflowRunFork.created_at.asc()).limit(50).all()
     artifacts = db.query(TaskArtifact).filter(
         TaskArtifact.session_id == sid,
         TaskArtifact.tenant_id == p.tenant.id,
     ).order_by(TaskArtifact.created_at.asc()).limit(80).all()
+    node_steps: dict[str, list[dict[str, Any]]] = {}
+    node_checkpoints: dict[str, list[dict[str, Any]]] = {}
+    for step in steps:
+        key = step.workflow_node_run_id or ""
+        node_steps.setdefault(key, []).append(_workflow_step_to_dict(step))
+    for checkpoint in checkpoints:
+        key = checkpoint.workflow_node_run_id or ""
+        node_checkpoints.setdefault(key, []).append(_workflow_checkpoint_to_dict(checkpoint))
+    workflow_payload = _workflow_run_to_dict(wf, nodes) if wf else None
+    if workflow_payload:
+        for node in workflow_payload.get("nodes") or []:
+            node_id = node.get("id") or ""
+            node["steps"] = node_steps.get(node_id, [])
+            node["checkpoints"] = node_checkpoints.get(node_id, [])
     return {
         "session": {
             "id": rec.id,
@@ -3832,11 +4455,14 @@ def get_session_replay(
             "task_status": rec.task_status,
             "task_summary": rec.task_summary,
         },
-        "workflow_run": _workflow_run_to_dict(wf, nodes) if wf else None,
+        "workflow_run": workflow_payload,
+        "steps": [_workflow_step_to_dict(s) for s in steps],
+        "checkpoints": [_workflow_checkpoint_to_dict(c) for c in checkpoints],
+        "forks": [_workflow_fork_to_dict(f) for f in forks],
         "runs": [_session_run_to_dict(r) for r in runs],
         "events": [_canvas_event_to_dict(e) for e in events],
         "artifacts": [_artifact_to_dict(a, db) for a in artifacts],
-        "total": len(events) + len(runs) + len(nodes),
+        "total": len(events) + len(runs) + len(nodes) + len(steps),
     }
 
 
@@ -3897,6 +4523,156 @@ def workflow_node_action(
         "task_status": rec.task_status,
         "node": _workflow_node_to_dict(node),
         "workflow_run": _workflow_run_to_dict(wf) if wf else None,
+        "continuation_message": prompt,
+    }
+
+
+@app.post("/api/sessions/{sid}/workflow-checkpoints/{checkpoint_id}/resume")
+async def resume_workflow_checkpoint(
+    sid: str,
+    checkpoint_id: str,
+    body: WorkflowCheckpointResumeIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    rec = db.get(SessionRecord, sid)
+    if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
+        raise HTTPException(404, "session not found")
+    checkpoint = db.get(WorkflowCheckpoint, checkpoint_id)
+    if not checkpoint or checkpoint.tenant_id != p.tenant.id or checkpoint.session_id != sid:
+        raise HTTPException(404, "workflow checkpoint not found")
+    parent_wf = db.get(WorkflowRun, checkpoint.workflow_run_id)
+    parent_node = db.get(WorkflowNodeRun, checkpoint.workflow_node_run_id) if checkpoint.workflow_node_run_id else None
+    if not parent_wf or parent_wf.tenant_id != p.tenant.id:
+        raise HTTPException(404, "workflow run not found")
+    if not parent_node or not parent_node.employee_id:
+        raise HTTPException(400, "checkpoint is not attached to an executable employee node")
+    snapshot = _json_loads_obj(checkpoint.context_snapshot_json, {})
+    prompt = body.message.strip() or (
+        "请从 OpenAtlas 协作工作流检查点继续执行。\n"
+        f"检查点类型: {checkpoint.checkpoint_type}\n"
+        f"检查点摘要: {checkpoint.summary or parent_node.output_summary or parent_node.input_summary}\n"
+        f"原节点: {parent_node.label or parent_node.node_id}\n"
+        f"原始用户任务: {rec.last_message or parent_node.input_summary}\n"
+        f"检查点上下文: {json.dumps(snapshot, ensure_ascii=False)[:1800]}\n"
+        "要求: 只继续该节点负责的部分；复用检查点前已完成的信息；如生成文件或报告，请说明交付物名称。"
+    )
+    if body.mode == "prompt_only":
+        return {
+            "ok": True,
+            "mode": "prompt_only",
+            "checkpoint": _workflow_checkpoint_to_dict(checkpoint),
+            "continuation_message": prompt,
+        }
+
+    now = datetime.now(timezone.utc)
+    child_wf = WorkflowRun(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=sid,
+        template_id=parent_wf.template_id,
+        status="queued",
+        strategy=parent_wf.strategy,
+        summary=f"从检查点恢复: {checkpoint.summary or checkpoint.checkpoint_type}",
+        payload=json.dumps({
+            "parent_workflow_run_id": parent_wf.id,
+            "forked_from_checkpoint_id": checkpoint.id,
+            "forked_from_node_run_id": parent_node.id,
+            "resume_prompt": prompt[:1000],
+        }, ensure_ascii=False),
+        started_at=now,
+        updated_at=now,
+    )
+    db.add(child_wf)
+    db.flush()
+    child_node = WorkflowNodeRun(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        workflow_run_id=child_wf.id,
+        session_id=sid,
+        employee_id=parent_node.employee_id,
+        node_id=parent_node.node_id,
+        label=parent_node.label,
+        status="queued",
+        input_summary=prompt[:4000],
+        payload=json.dumps({
+            "parent_node_run_id": parent_node.id,
+            "checkpoint_id": checkpoint.id,
+            "recovery": True,
+        }, ensure_ascii=False),
+    )
+    db.add(child_node)
+    db.flush()
+    fork = WorkflowRunFork(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=sid,
+        parent_workflow_run_id=parent_wf.id,
+        child_workflow_run_id=child_wf.id,
+        forked_from_node_run_id=parent_node.id,
+        forked_from_checkpoint_id=checkpoint.id,
+        reason="checkpoint_resume",
+        payload_json=json.dumps({"prompt": prompt[:1000], "mode": body.mode}, ensure_ascii=False),
+        created_by=p.user.id,
+    )
+    db.add(fork)
+    _record_workflow_step(
+        db,
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=sid,
+        workflow_run_id=child_wf.id,
+        workflow_node_run_id=child_node.id,
+        employee_id=child_node.employee_id,
+        event_type="replay.fork_created",
+        title="创建恢复分支",
+        summary=f"从检查点创建 Replay Fork: {checkpoint.summary or checkpoint.checkpoint_type}",
+        input_summary=prompt[:1000],
+        payload={
+            "parent_workflow_run_id": parent_wf.id,
+            "forked_from_node_run_id": parent_node.id,
+            "forked_from_checkpoint_id": checkpoint.id,
+        },
+        checkpoint_type="replay.fork_created",
+        hermes_session_id=rec.hermes_session_id,
+        hermes_run_id=checkpoint.hermes_run_id,
+    )
+    rec.task_status = "running"
+    rec.task_summary = "已创建恢复分支，正在从检查点继续执行。"
+    db.add(CanvasEvent(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=sid,
+        employee_id=child_node.employee_id,
+        event_type="replay.fork_created",
+        node_id=child_node.node_id,
+        payload=json.dumps({
+            "parent_workflow_run_id": parent_wf.id,
+            "child_workflow_run_id": child_wf.id,
+            "checkpoint_id": checkpoint.id,
+        }, ensure_ascii=False),
+    ))
+    audit(db, principal=p, action="workflow_checkpoint.resume", resource_type="workflow_checkpoint",
+          resource_id=checkpoint.id, request=request, extra={
+              "session_id": sid,
+              "parent_workflow_run_id": parent_wf.id,
+              "child_workflow_run_id": child_wf.id,
+          })
+    db.commit()
+    asyncio.create_task(_execute_checkpoint_resume(
+        workflow_run_id=child_wf.id,
+        workflow_node_run_id=child_node.id,
+        checkpoint_id=checkpoint.id,
+        prompt=prompt,
+    ))
+    return {
+        "ok": True,
+        "mode": "fork_resume",
+        "task_status": rec.task_status,
+        "checkpoint": _workflow_checkpoint_to_dict(checkpoint),
+        "fork": _workflow_fork_to_dict(fork),
+        "workflow_run": _workflow_run_to_dict(child_wf, [child_node]),
         "continuation_message": prompt,
     }
 
@@ -4626,6 +5402,7 @@ async def session_chat_stream(
             for turn_index, emp in enumerate(turn_employees):
                 session_run_id = ""
                 current_hermes_run_id = ""
+                current_node_run_id = ""
                 db_run = SessionLocal()
                 try:
                     wf = db_run.get(WorkflowRun, workflow_run_id)
@@ -4641,7 +5418,7 @@ async def session_chat_stream(
                         payload={"turn_index": turn_index, "query_excerpt": msg[:240]},
                     )
                     session_run_id = run_row.id
-                    _update_workflow_node_run(
+                    node_row = _update_workflow_node_run(
                         db_run,
                         workflow_run=wf,
                         tenant_id=p.tenant.id,
@@ -4654,6 +5431,23 @@ async def session_chat_stream(
                         session_run_id=session_run_id,
                         input_summary=msg[:1000],
                         payload_patch={"turn_index": turn_index},
+                    )
+                    current_node_run_id = node_row.id if node_row else ""
+                    _record_workflow_step(
+                        db_run,
+                        tenant_id=p.tenant.id,
+                        user_id=p.user.id,
+                        session_id=rec.id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_node_run_id=current_node_run_id or None,
+                        employee_id=emp.id,
+                        event_type="node.started",
+                        title=f"{emp.display_name} 开始执行",
+                        summary=f"{emp.display_name} 开始处理本轮任务",
+                        input_summary=msg[:1000],
+                        payload={"turn_index": turn_index, "employee_name": emp.display_name},
+                        checkpoint_type="node.started",
+                        hermes_session_id=rec.hermes_session_id,
                     )
                     session_row = db_run.get(SessionRecord, rec.id)
                     if session_row:
@@ -4714,6 +5508,42 @@ async def session_chat_stream(
                         db_progress.rollback()
                     finally:
                         db_progress.close()
+
+                def record_step_event(
+                    event_type: str,
+                    payload: dict[str, Any] | None = None,
+                    *,
+                    title: str = "",
+                    summary: str = "",
+                    input_summary: str = "",
+                    output_summary: str = "",
+                    risk_level: str = "low",
+                    tool_name: str = "",
+                    artifact_ids: list[str] | None = None,
+                    file_ids: list[str] | None = None,
+                    checkpoint_type: str | None = None,
+                ) -> None:
+                    _record_workflow_step_safely(
+                        tenant_id=p.tenant.id,
+                        user_id=p.user.id,
+                        session_id=rec.id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_node_run_id=current_node_run_id or None,
+                        employee_id=emp.id,
+                        event_type=event_type,
+                        payload=payload or {},
+                        title=title,
+                        summary=summary,
+                        input_summary=input_summary,
+                        output_summary=output_summary,
+                        risk_level=risk_level,
+                        tool_name=tool_name,
+                        artifact_ids=artifact_ids,
+                        file_ids=file_ids,
+                        checkpoint_type=checkpoint_type,
+                        hermes_session_id=rec.hermes_session_id,
+                        hermes_run_id=current_hermes_run_id,
+                    )
 
                 speaker = {
                     "openatlas_session_id": sess_marker,
@@ -4801,6 +5631,28 @@ async def session_chat_stream(
                             status=("used" if skill_item.get("status") == "injected" else str(skill_item.get("status") or "used")),
                             error="" if skill_item.get("status") == "injected" else str(skill_item.get("summary") or ""),
                         ))
+                    _record_workflow_step(
+                        db_ctx,
+                        tenant_id=p.tenant.id,
+                        user_id=p.user.id,
+                        session_id=rec.id,
+                        workflow_run_id=workflow_run_id,
+                        workflow_node_run_id=current_node_run_id or None,
+                        employee_id=emp.id,
+                        event_type="context.injected",
+                        title="注入本轮上下文",
+                        summary=f"Skill {len(skill_evidence)} 个，记忆 {len(eff)} 条，附件 {len(file_provenance)} 个",
+                        payload={
+                            "skills": skill_evidence,
+                            "memories": eff,
+                            "files": file_provenance,
+                            "turn_index": turn_index,
+                        },
+                        file_ids=[str(f.get("id")) for f in file_provenance if f.get("id")],
+                        checkpoint_type="context.injected",
+                        hermes_session_id=rec.hermes_session_id,
+                        hermes_run_id=current_hermes_run_id,
+                    )
                     db_ctx.commit()
                 finally:
                     db_ctx.close()
@@ -4938,6 +5790,13 @@ async def session_chat_stream(
                             event_type="run.started",
                             hermes_run_id=run_id,
                         )
+                        record_step_event(
+                            "run.started",
+                            {**run, "hermes_run_id": run_id},
+                            title="Hermes Run 启动",
+                            summary=f"Hermes run {run_id} 已启动",
+                            checkpoint_type="run.started",
+                        )
                         _remember_hermes_run(
                             run_id,
                             tenant_id=p.tenant.id,
@@ -4976,16 +5835,25 @@ async def session_chat_stream(
                             except asyncio.TimeoutError:
                                 if pending_dangerous_tool and not synthetic_approval_sent:
                                     synthetic_approval_sent = True
+                                    approval_payload = {
+                                        "command": pending_dangerous_tool.get("command") or "",
+                                        "description": "Hermes 工具已进入高风险等待态，需要人工确认",
+                                        "pattern_key": "openatlas synthetic dangerous terminal confirmation",
+                                        "choices": ["once", "session", "always", "deny"],
+                                        "hermes_run_id": run_id,
+                                        "source": "openatlas_timeout_guard",
+                                    }
+                                    record_step_event(
+                                        "approval.required",
+                                        approval_payload,
+                                        title="等待人工确认",
+                                        summary=approval_payload["description"],
+                                        risk_level="high",
+                                        checkpoint_type="approval.required",
+                                    )
                                     yield {
                                         "event": "openatlas.approval_required",
-                                        "data": {
-                                            "command": pending_dangerous_tool.get("command") or "",
-                                            "description": "Hermes 工具已进入高风险等待态，需要人工确认",
-                                            "pattern_key": "openatlas synthetic dangerous terminal confirmation",
-                                            "choices": ["once", "session", "always", "deny"],
-                                            "hermes_run_id": run_id,
-                                            "source": "openatlas_timeout_guard",
-                                        },
+                                        "data": approval_payload,
                                     }
                                     continue
                                 idle_for = (datetime.now(timezone.utc) - last_event_at).total_seconds()
@@ -5001,6 +5869,14 @@ async def session_chat_stream(
                                 }
                                 yield {"event": "openatlas.run_idle", "data": payload}
                                 if idle_for >= detach_after_seconds:
+                                    record_step_event(
+                                        "openatlas.run_detached",
+                                        payload,
+                                        title="长任务转后台",
+                                        summary="Hermes 长时间未推送新事件，OpenAtlas 转入后台补同步",
+                                        risk_level="medium",
+                                        checkpoint_type="stalled",
+                                    )
                                     yield {
                                         "event": "openatlas.run_detached",
                                         "data": {
@@ -5015,6 +5891,7 @@ async def session_chat_stream(
                             if _is_approval_event(ev_name, ev_data):
                                 pending_dangerous_tool = None
                                 synthetic_approval_sent = False
+                                approval_payload = _normalize_approval_payload(ev_name, ev_data, run_id, source="hermes")
                                 mark_run_progress(
                                     status="waiting_approval",
                                     node_status="waiting_approval",
@@ -5023,9 +5900,17 @@ async def session_chat_stream(
                                     event_type=ev_name,
                                     hermes_run_id=run_id,
                                 )
+                                record_step_event(
+                                    "approval.required",
+                                    approval_payload,
+                                    title="等待人工确认",
+                                    summary=str(approval_payload.get("description") or approval_payload.get("command") or "等待用户确认授权"),
+                                    risk_level="high",
+                                    checkpoint_type="approval.required",
+                                )
                                 yield {
                                     "event": "openatlas.approval_required",
-                                    "data": _normalize_approval_payload(ev_name, ev_data, run_id, source="hermes"),
+                                    "data": approval_payload,
                                 }
                                 continue
                             if ev_name == "message.delta":
@@ -5064,14 +5949,23 @@ async def session_chat_stream(
                                             event_type="openatlas.approval_required",
                                             hermes_run_id=run_id,
                                         )
+                                        approval_payload = _normalize_approval_payload(
+                                            "openatlas.synthetic_tool_approval",
+                                            tool_started_payload,
+                                            run_id,
+                                            source="openatlas_exec_tool_guard",
+                                        )
+                                        record_step_event(
+                                            "approval.required",
+                                            approval_payload,
+                                            title="等待工具授权",
+                                            summary=str(approval_payload.get("description") or approval_payload.get("command") or "等待用户确认工具调用"),
+                                            risk_level="high",
+                                            checkpoint_type="approval.required",
+                                        )
                                         yield {
                                             "event": "openatlas.approval_required",
-                                            "data": _normalize_approval_payload(
-                                                "openatlas.synthetic_tool_approval",
-                                                tool_started_payload,
-                                                run_id,
-                                                source="openatlas_exec_tool_guard",
-                                            ),
+                                            "data": approval_payload,
                                         }
                             elif ev_name == "tool.completed":
                                 pending_dangerous_tool = None
@@ -5111,12 +6005,20 @@ async def session_chat_stream(
                         if name == "openatlas.run_detached":
                             _schedule_detached_run_reconcile(detached_run_id or current_hermes_run_id)
                         mark_run_progress(
-                            status="stale",
-                            node_status="running",
+                            status="stalled",
+                            node_status="stalled",
                             stage="runtime",
                             reason="Hermes 长时间未推送新事件，等待后台补同步",
                             event_type=name,
                             hermes_run_id=detached_run_id or current_hermes_run_id,
+                        )
+                        record_step_event(
+                            name,
+                            data if isinstance(data, dict) else {"message": str(data)},
+                            title="长任务停滞",
+                            summary="Hermes 长时间未推送新事件，OpenAtlas 已保留检查点并等待补同步",
+                            risk_level="medium",
+                            checkpoint_type="stalled",
                         )
                     if name == "run.completed" and isinstance(data, dict):
                         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
@@ -5157,6 +6059,20 @@ async def session_chat_stream(
                         reasoning_text = str(data.get("text") or "").strip()
                         if reasoning_text:
                             reasoning_parts.append(reasoning_text)
+                            record_step_event(
+                                "reasoning.summary",
+                                data,
+                                title="思考摘要",
+                                summary=reasoning_text[:1000],
+                            )
+                    if name == "openatlas.approval_responded" and isinstance(data, dict):
+                        record_step_event(
+                            "approval.resolved",
+                            data,
+                            title="审批已处理",
+                            summary=str(data.get("choice") or data.get("status") or "用户已处理审批"),
+                            checkpoint_type="approval.resolved",
+                        )
                     if name.startswith("tool."):
                         tool_payload = data if isinstance(data, dict) else {}
                         raw_call_id = (
@@ -5232,6 +6148,7 @@ async def session_chat_stream(
                                 hermes_run_id=current_hermes_run_id or tool_payload.get("hermes_run_id"),
                             )
                             if live_artifacts:
+                                live_artifact_ids = [str(a.get("id")) for a in live_artifacts if a.get("id")]
                                 mark_run_progress(
                                     status="running",
                                     node_status="running",
@@ -5239,7 +6156,15 @@ async def session_chat_stream(
                                     reason=f"登记 {len(live_artifacts)} 个工具交付物",
                                     event_type="artifact.created",
                                     hermes_run_id=current_hermes_run_id or tool_payload.get("hermes_run_id"),
-                                    artifact_ids=[str(a.get("id")) for a in live_artifacts if a.get("id")],
+                                    artifact_ids=live_artifact_ids,
+                                )
+                                record_step_event(
+                                    "artifact.created",
+                                    {"count": len(live_artifacts), "items": live_artifacts, "turn_index": turn_index},
+                                    title="工具产物入库",
+                                    summary=f"从工具事件登记 {len(live_artifacts)} 个交付物",
+                                    artifact_ids=live_artifact_ids,
+                                    checkpoint_type="artifact.created",
                                 )
                                 yield trace_event(
                                     "artifact",
@@ -5289,6 +6214,15 @@ async def session_chat_stream(
                             hermes_run_id=current_hermes_run_id or tool_payload.get("hermes_run_id"),
                             error=str(tool_payload.get("error") or "") if name == "tool.failed" else None,
                         )
+                        record_step_event(
+                            name,
+                            tool_payload,
+                            title=f"工具: {tool_name}",
+                            summary=str(tool_payload.get("error") or tool_payload.get("label") or tool_payload.get("preview") or tool_payload.get("command") or tool_name),
+                            risk_level="high" if _is_approval_sensitive_tool(tool_name) else "low",
+                            tool_name=tool_name,
+                            checkpoint_type=("tool.completed" if name == "tool.completed" else "tool.failed" if name == "tool.failed" else None),
+                        )
                     if name in ("run.completed", "done"):
                         persist_assistant_once()
                         done_status = "completed" if final_task_status == "completed" else (
@@ -5303,6 +6237,15 @@ async def session_chat_stream(
                             hermes_run_id=current_hermes_run_id,
                             artifact_ids=persisted_artifact_ids,
                             output_summary="".join(assistant_text_parts)[:1000],
+                        )
+                        record_step_event(
+                            "node.completed" if done_status == "completed" else "node.waiting_input",
+                            {"runtime_event": name, "task_status": final_task_status, "reason": final_task_reason},
+                            title="节点完成" if done_status == "completed" else "节点等待补充",
+                            summary=final_task_reason or ("节点已完成" if done_status == "completed" else "节点需要补充信息"),
+                            output_summary="".join(assistant_text_parts)[:1000],
+                            artifact_ids=persisted_artifact_ids,
+                            checkpoint_type="node.completed" if done_status == "completed" else "node.waiting_input",
                         )
                     if isinstance(data, dict):
                         data = {**data, **speaker}

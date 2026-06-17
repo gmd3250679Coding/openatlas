@@ -254,13 +254,14 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     canvas_score += 8 if grep(app_py, r"WorkflowRun|WorkflowNodeRun|/sessions/\{sid\}/replay|_update_workflow_node_run") else 0
     canvas_score += 3 if grep(cmd, r"协作执行回放|节点执行|本次交付物") else 0
     canvas_score += 4 if grep(cmd, r"从此继续|重试节点|handleWorkflowNodeAction") and grep(app_py, r"workflow_node_action") else 0
+    canvas_score += 5 if grep(app_py, r"WorkflowStepEvent|WorkflowCheckpoint|WorkflowRunFork|resume_workflow_checkpoint") and grep(cmd, r"展开步骤|从这里恢复执行") else 0
     dimensions.append({
         "name": "协作画布",
         "weight": 10,
-        "score": cap(canvas_score, 84),
-        "judgement": "画布能配置、保存、复用，并已具备节点级执行回放和人工续跑入口；但并行/合流、变量映射和失败分支仍未成熟。",
-        "evidence": ["Canvas E2E 覆盖打开、配置节点、保存方案、复用方案", "WorkflowRun/WorkflowNodeRun 已记录节点执行证据"],
-        "gaps": ["缺少真实并行/合流语义、变量映射和输入输出契约", "节点重试/继续已起步，但还不是自动恢复执行器"],
+        "score": cap(canvas_score, 88),
+        "judgement": "画布能配置、保存、复用，已具备节点级 Step Timeline、Checkpoint 和 Replay Fork 雏形；但并行/合流、变量映射和工具级恢复仍未成熟。",
+        "evidence": ["Canvas E2E 覆盖打开、配置节点、保存方案、复用方案", "WorkflowRun/WorkflowNodeRun/WorkflowStepEvent 已记录节点执行证据"],
+        "gaps": ["缺少真实并行/合流语义、变量映射和输入输出契约", "Checkpoint 恢复已起步，但还需要更多真实长任务样本和工具级恢复策略"],
     })
 
     skill_score = 60
@@ -298,10 +299,11 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     stability_score += 4 if grep(app_py, r"_session_health_snapshot|_watch_detached_run|recover_session") else 0
     stability_score += 4 if grep("backend/scripts/api_smoke.py", r"/sessions/\{sid\}/runs|/sessions/\{sid\}/replay|session runs") else 0
     stability_score += 2 if grep("backend/scripts/api_smoke.py", r"workflow-nodes|node_action") else 0
+    stability_score += 3 if grep("backend/scripts/api_smoke.py", r"step_count|checkpoint_count|checkpoint_resume") and grep(app_py, r"status=\"stalled\"|checkpoint_type=\"stalled\"") else 0
     dimensions.append({
         "name": "稳定性/鲁棒性",
         "weight": 13,
-        "score": cap(stability_score, 86),
+        "score": cap(stability_score, 88),
         "judgement": "自动化、隔离、健康检查、补同步和运行状态落库已经是明显进步；但异常矩阵和高危审批回归仍不够厚。",
         "evidence": [f"product audit issues: {product_issues}", f"power audit issues: {power_issues}"],
         "gaps": ["缺少 chaos/fault injection", "缺少真实长任务多轮连续样本和高危工具授权回归夹具"],

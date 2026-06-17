@@ -523,3 +523,67 @@ class WorkflowNodeRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class WorkflowStepEvent(Base):
+    """Fine-grained replay event inside one workflow node."""
+    __tablename__ = "workflow_step_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
+    workflow_run_id: Mapped[str] = mapped_column(ForeignKey("workflow_runs.id", ondelete="CASCADE"), index=True)
+    workflow_node_run_id: Mapped[str | None] = mapped_column(ForeignKey("workflow_node_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    employee_id: Mapped[str | None] = mapped_column(ForeignKey("digital_employees.id"), nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="completed")
+    title: Mapped[str] = mapped_column(String(255), default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    input_summary: Mapped[str] = mapped_column(Text, default="")
+    output_summary: Mapped[str] = mapped_column(Text, default="")
+    raw_event_ref: Mapped[str] = mapped_column(String(128), default="")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    risk_level: Mapped[str] = mapped_column(String(24), default="low")
+    tool_name: Mapped[str] = mapped_column(String(128), default="")
+    artifact_ids: Mapped[str] = mapped_column(Text, default="[]")
+    file_ids: Mapped[str] = mapped_column(Text, default="[]")
+    is_checkpoint: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class WorkflowCheckpoint(Base):
+    """Stable restore point for replay/fork/resume."""
+    __tablename__ = "workflow_checkpoints"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
+    workflow_run_id: Mapped[str] = mapped_column(ForeignKey("workflow_runs.id", ondelete="CASCADE"), index=True)
+    workflow_node_run_id: Mapped[str | None] = mapped_column(ForeignKey("workflow_node_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    step_event_id: Mapped[str | None] = mapped_column(ForeignKey("workflow_step_events.id", ondelete="SET NULL"), nullable=True, index=True)
+    checkpoint_type: Mapped[str] = mapped_column(String(64), default="manual")
+    status: Mapped[str] = mapped_column(String(32), default="available")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    context_snapshot_json: Mapped[str] = mapped_column(Text, default="{}")
+    hermes_session_id: Mapped[str] = mapped_column(String(128), default="")
+    hermes_run_id: Mapped[str] = mapped_column(String(128), default="")
+    upstream_node_outputs_json: Mapped[str] = mapped_column(Text, default="{}")
+    artifact_policy_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class WorkflowRunFork(Base):
+    """Audit link between an original workflow run and a recovery branch."""
+    __tablename__ = "workflow_run_forks"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
+    parent_workflow_run_id: Mapped[str] = mapped_column(ForeignKey("workflow_runs.id", ondelete="CASCADE"), index=True)
+    child_workflow_run_id: Mapped[str] = mapped_column(ForeignKey("workflow_runs.id", ondelete="CASCADE"), index=True)
+    forked_from_node_run_id: Mapped[str | None] = mapped_column(ForeignKey("workflow_node_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    forked_from_checkpoint_id: Mapped[str | None] = mapped_column(ForeignKey("workflow_checkpoints.id", ondelete="SET NULL"), nullable=True, index=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
