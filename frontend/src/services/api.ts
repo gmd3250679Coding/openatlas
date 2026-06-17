@@ -730,6 +730,13 @@ export async function archiveArtifact(artifactId: string): Promise<any> {
   return apiFetch(`/artifacts/${artifactId}/archive`, { method: 'POST', body: '{}' });
 }
 
+export async function patchArtifact(artifactId: string, patch: { name?: string; status?: string }): Promise<any> {
+  return apiFetch(`/artifacts/${artifactId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+}
+
 
 /* ════════════════════════════════════════════════════════════════════════
  * Phase 3.5 — Job lifecycle, Skill Market publish/fork/disable, Memory fork/bind
@@ -1556,4 +1563,17 @@ export async function replaySessionEvents(sessionId: number | string): Promise<C
     artifacts: Array.isArray(r?.artifacts) ? r.artifacts : [],
     workflow_run: r?.workflow_run || null,
   };
+}
+
+export async function actionWorkflowNode(
+  sessionId: number | string,
+  nodeRunId: string,
+  action: 'retry' | 'continue',
+  message = '',
+): Promise<any> {
+  const realId = await resolveRealSessionId(sessionId);
+  return apiFetch(`/sessions/${realId}/workflow-nodes/${encodeURIComponent(nodeRunId)}/action`, {
+    method: 'POST',
+    body: JSON.stringify({ action, message }),
+  });
 }

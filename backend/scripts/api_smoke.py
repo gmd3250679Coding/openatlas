@@ -323,6 +323,15 @@ def run() -> dict:
         replay = request("GET", f"/sessions/{sid}/replay", token=token)
         if not replay.get("workflow_run") or not replay.get("runs"):
             raise SmokeError(f"session replay missing workflow/run evidence: {replay}")
+        replay_nodes = (replay.get("workflow_run") or {}).get("nodes") or []
+        employee_node = next((n for n in replay_nodes if n.get("employee_id")), None)
+        node_action = {}
+        if employee_node:
+            node_action = request("POST", f"/sessions/{sid}/workflow-nodes/{employee_node['id']}/action", {
+                "action": "continue",
+            }, token=token)
+            if not node_action.get("continuation_message") or node_action.get("task_status") != "needs_input":
+                raise SmokeError(f"workflow node action did not prepare continuation: {node_action}")
         messages = request("GET", f"/sessions/{sid}/messages", token=token)
         listed = request("GET", f"/files?session_id={sid}", token=token)
         file_detail = request("GET", f"/files/{uploaded['id']}", token=token)
@@ -351,6 +360,7 @@ def run() -> dict:
                 "workflow_status": (replay.get("workflow_run") or {}).get("status"),
                 "node_count": len((replay.get("workflow_run") or {}).get("nodes") or []),
                 "event_count": len(replay.get("events") or []),
+                "node_action": bool(node_action.get("continuation_message")),
             },
             "summary": detail.get("summary", {}),
             "file": {"listed": len(listed.get("items", [])), "summary": file_detail.get("summary"), "snippets": file_detail.get("snippets", [])[:1]},

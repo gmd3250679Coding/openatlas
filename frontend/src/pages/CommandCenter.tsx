@@ -23,10 +23,10 @@ import {
   patchSession,
   approveHermesRun, stopHermesRun,
   fetchCurrentUser, updateMyQuickPrompts,
-  refreshSessionSummary, patchSessionTaskStatus, archiveArtifact,
+  refreshSessionSummary, patchSessionTaskStatus, archiveArtifact, patchArtifact,
   fetchCollaborationTemplates, createSessionFromTemplate,
   fetchRunQueue, resumeSessionTask, recoverSessionTask,
-  replayEmployeeEvents, replaySessionEvents, type CanvasReplay,  // M5
+  replayEmployeeEvents, replaySessionEvents, actionWorkflowNode, type CanvasReplay,  // M5
   type Conversation, type Attachment, type Employee,
 } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
@@ -590,6 +590,28 @@ export default function CommandCenter() {
     }
   }, [activeSessionId]);
 
+  const updateActiveArtifact = useCallback(async (artifactId: string, patch: { name?: string; status?: string }) => {
+    if (!activeSessionId || !artifactId) return;
+    try {
+      const updated = await patchArtifact(artifactId, patch);
+      setSessionMetaById((prev) => {
+        const current = prev[activeSessionId] || {};
+        return {
+          ...prev,
+          [activeSessionId]: {
+            ...current,
+            artifacts: (current.artifacts || []).map((a: any) =>
+              a.id === artifactId ? { ...a, ...updated } : a
+            ),
+          },
+        };
+      });
+      message.success(patch.status === 'final' ? '已标记为终稿' : '交付物已更新');
+    } catch (e: any) {
+      message.error(`更新交付物失败: ${e?.message || e}`);
+    }
+  }, [activeSessionId]);
+
   const recoverActiveSession = useCallback(async () => {
     if (!activeSessionId) return;
     try {
@@ -957,6 +979,31 @@ export default function CommandCenter() {
       setReplayData(null);
     }
   }, [activeEmployee, activeSessionId]);
+
+  const handleWorkflowNodeAction = useCallback(async (nodeRunId: string, action: 'retry' | 'continue') => {
+    if (!activeSessionId || !nodeRunId) return;
+    try {
+      const res = await actionWorkflowNode(activeSessionId, nodeRunId, action);
+      const prompt = String(res?.continuation_message || '').trim();
+      if (prompt) {
+        setInput(prompt);
+        setTimeout(() => inputRef.current?.focus(), 30);
+      }
+      setSessionMetaById((prev) => ({
+        ...prev,
+        [activeSessionId]: {
+          ...(prev[activeSessionId] || {}),
+          task_status: res?.task_status || 'needs_input',
+          task_summary: `${action === 'retry' ? '重试' : '继续'}节点已准备，请确认输入框内容后发送。`,
+        },
+      }));
+      const replay = await replaySessionEvents(activeSessionId);
+      setReplayData(replay);
+      message.success(action === 'retry' ? '已生成节点重试提示' : '已生成节点继续提示');
+    } catch (e: any) {
+      message.error(`节点操作失败: ${e?.message || e}`);
+    }
+  }, [activeSessionId]);
 
   const handleCanvasHubPointerDown = useCallback((e: ReactPointerEvent<HTMLButtonElement>) => {
     if (e.button !== 0) return;
@@ -3123,6 +3170,7 @@ export default function CommandCenter() {
         onPatchTaskStatus={patchActiveTaskStatus}
         onRefreshSummary={refreshActiveSummary}
         onArchiveArtifact={archiveActiveArtifact}
+        onUpdateArtifact={updateActiveArtifact}
         refreshingSummary={refreshingSummary}
       />
 
@@ -3350,6 +3398,40 @@ export default function CommandCenter() {
                   {Array.isArray(node.artifact_ids) && node.artifact_ids.length > 0 && (
                     <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
                       交付物 {node.artifact_ids.length} 个
+                    </div>
+                  )}
+                  {activeSessionId && node.id && (
+                    <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+                      <button
+                        type="button"
+                        onClick={() => handleWorkflowNodeAction(node.id, 'continue')}
+                        style={{
+                          border: '1px solid var(--border-subtle)',
+                          background: 'var(--bg-primary)',
+                          color: 'var(--text-secondary)',
+                          borderRadius: 8,
+                          padding: '5px 9px',
+                          fontSize: 11,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        从此继续
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleWorkflowNodeAction(node.id, 'retry')}
+                        style={{
+                          border: '1px solid rgba(139,127,232,0.35)',
+                          background: 'var(--accent-soft)',
+                          color: 'var(--accent)',
+                          borderRadius: 8,
+                          padding: '5px 9px',
+                          fontSize: 11,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        重试节点
+                      </button>
                     </div>
                   )}
                 </div>

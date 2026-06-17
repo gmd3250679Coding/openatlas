@@ -200,6 +200,8 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         chat_score += 7
     if grep(app_py, r"class SessionRun|session_runs|/sessions/\{sid\}/runs|waiting_approval|waiting_input"):
         chat_score += 4
+    if grep(app_py, r"workflow_node_action|retry_requested|continue_requested"):
+        chat_score += 2
     if grep(cmd, r"approval_required|pendingApproval|仅本次允许"):
         chat_score += 5
     if grep(right, r"会话健康|补同步 / 恢复会话|输出物"):
@@ -207,7 +209,7 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     dimensions.append({
         "name": "主聊天链路",
         "weight": 15,
-        "score": cap(chat_score, 86),
+        "score": cap(chat_score, 87),
         "judgement": "单员工、文件、Skill、群聊接力和恢复入口已可用；已补会话运行状态机，但长任务续跑还需更多真实样本。",
         "evidence": ["main-chain E2E 覆盖登录、附件、历史、群聊、Skill、模板", "SessionRun 已记录 running/completed/waiting 等状态"],
         "gaps": ["缺少长任务分段续跑与明确任务检查点", "审批状态机已起步，但还缺高危工具固定回归夹具"],
@@ -234,11 +236,12 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     file_score += 5 if grep(app_py, r"_artifact_from_path|_tool_artifacts_from_payload|_wrap_html_artifact") else 0
     file_score += 5 if grep("backend/scripts/api_smoke.py", r"pptx|openatlas-api-smoke.md|extracted_chars") else 0
     file_score += 4 if grep(app_py, r"source_path|version|provenance_payload|_next_artifact_version") else 0
+    file_score += 3 if grep(app_py, r"patch_artifact|artifact.update|status.*final") and grep(right, r"标记为终稿|重命名交付物|v\\{f.version") else 0
     file_score += 3 if grep(right, r"归档交付物|artifactMeta|Query:") else 0
     dimensions.append({
         "name": "文件与交付物",
         "weight": 12,
-        "score": cap(file_score, 83),
+        "score": cap(file_score, 85),
         "judgement": "文件提取、HTML/Markdown 交付物、来源追踪、版本和运行归属已成型；预览和归档后的检索还没完全产品化。",
         "evidence": ["artifact provenance 已返回来源员工、Query、上下文计数", "交付物已记录 source_path/version/run_id/employee_id"],
         "gaps": ["PDF/Excel/TXT/Markdown/HTML 预览体验仍需要持续肉眼 QA", "交付物重新生成、归档后的检索和二次编辑还弱"],
@@ -250,13 +253,14 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     canvas_score += 4 if grep("frontend/src/components/CollaborationCanvas.tsx", r"failureStrategy|outputType|defaultPrompt|skills") else 0
     canvas_score += 8 if grep(app_py, r"WorkflowRun|WorkflowNodeRun|/sessions/\{sid\}/replay|_update_workflow_node_run") else 0
     canvas_score += 3 if grep(cmd, r"协作执行回放|节点执行|本次交付物") else 0
+    canvas_score += 4 if grep(cmd, r"从此继续|重试节点|handleWorkflowNodeAction") and grep(app_py, r"workflow_node_action") else 0
     dimensions.append({
         "name": "协作画布",
         "weight": 10,
-        "score": cap(canvas_score, 81),
-        "judgement": "画布能配置、保存、复用，并已具备节点级执行回放；但并行/合流、变量映射和失败分支仍未成熟。",
+        "score": cap(canvas_score, 84),
+        "judgement": "画布能配置、保存、复用，并已具备节点级执行回放和人工续跑入口；但并行/合流、变量映射和失败分支仍未成熟。",
         "evidence": ["Canvas E2E 覆盖打开、配置节点、保存方案、复用方案", "WorkflowRun/WorkflowNodeRun 已记录节点执行证据"],
-        "gaps": ["缺少真实并行/合流语义、变量映射和输入输出契约", "失败分支、节点重试和从节点继续还需要产品化"],
+        "gaps": ["缺少真实并行/合流语义、变量映射和输入输出契约", "节点重试/继续已起步，但还不是自动恢复执行器"],
     })
 
     skill_score = 60
@@ -293,10 +297,11 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     stability_score += 5 if product_issues["P0"] == 0 and power_issues["P0"] == 0 else -8
     stability_score += 4 if grep(app_py, r"_session_health_snapshot|_watch_detached_run|recover_session") else 0
     stability_score += 4 if grep("backend/scripts/api_smoke.py", r"/sessions/\{sid\}/runs|/sessions/\{sid\}/replay|session runs") else 0
+    stability_score += 2 if grep("backend/scripts/api_smoke.py", r"workflow-nodes|node_action") else 0
     dimensions.append({
         "name": "稳定性/鲁棒性",
         "weight": 13,
-        "score": cap(stability_score, 85),
+        "score": cap(stability_score, 86),
         "judgement": "自动化、隔离、健康检查、补同步和运行状态落库已经是明显进步；但异常矩阵和高危审批回归仍不够厚。",
         "evidence": [f"product audit issues: {product_issues}", f"power audit issues: {power_issues}"],
         "gaps": ["缺少 chaos/fault injection", "缺少真实长任务多轮连续样本和高危工具授权回归夹具"],
@@ -308,10 +313,11 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     ux_score += 4 if power_issues["P1"] == 0 else -5
     ux_score += 3 if grep(right, r"当前会话进展|本轮上下文|输出物|员工详情") else 0
     ux_score += 2 if grep(cmd, r"协作执行回放|节点执行|任务运行状态") else 0
+    ux_score += 2 if grep(cmd, r"从此继续|重试节点") and grep(right, r"标记为终稿|重命名交付物") else 0
     dimensions.append({
         "name": "产品体验",
         "weight": 5,
-        "score": cap(ux_score, 77),
+        "score": cap(ux_score, 79),
         "judgement": "首页、右侧栏、画布、宠物和 Dock 有记忆点；协作回放增强了任务可解释性，但高级用户效率还没完全收敛。",
         "evidence": ["产品巡检和重度用户巡检未发现规则内 P0/P1"],
         "gaps": ["需要更多真实用户任务走查", "首页、历史、工作区、任务队列的心智还需持续统一"],

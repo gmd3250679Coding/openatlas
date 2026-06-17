@@ -78,6 +78,7 @@ interface Props {
   onPatchTaskStatus?: (status: string) => Promise<void> | void;
   onRefreshSummary?: () => Promise<void> | void;
   onArchiveArtifact?: (artifactId: string) => Promise<void> | void;
+  onUpdateArtifact?: (artifactId: string, patch: { name?: string; status?: string }) => Promise<void> | void;
   refreshingSummary?: boolean;
 }
 
@@ -88,6 +89,8 @@ interface GeneratedOutput {
   content: string;
   mime: string;
   kind: string;
+  status?: string;
+  version?: number;
 }
 
 export default function RightAside({
@@ -106,6 +109,7 @@ export default function RightAside({
   onPatchTaskStatus,
   onRefreshSummary,
   onArchiveArtifact,
+  onUpdateArtifact,
   refreshingSummary = false,
 }: Props) {
   const [tab, setTab] = useState<'progress' | 'summary' | 'context' | 'employee'>('progress');
@@ -147,6 +151,8 @@ export default function RightAside({
         content: a.kind === 'html' ? wrapHtml(String(a.content || '')) : String(a.content || ''),
         mime: a.mime_type || mimeForKind(a.kind),
         kind: inferKindFromName(a.name || a.kind || 'FILE'),
+        status: a.status,
+        version: a.version,
       }));
     return dedupeOutputs([
       ...backendOutputs,
@@ -577,17 +583,11 @@ export default function RightAside({
             输出物
           </div>
           {generatedOutputs.map((f, i) => (
-            <button key={i} type="button" onClick={() => downloadOutput(f.name, f.content, f.mime)} style={{
+            <div key={i} style={{
               display: 'flex', alignItems: 'center', gap: 8,
               padding: '8px 0',
               width: '100%',
               borderBottom: i < generatedOutputs.length - 1 ? '1px solid var(--border-subtle)' : 'none',
-              borderTop: 'none',
-              borderLeft: 'none',
-              borderRight: 'none',
-              background: 'transparent',
-              textAlign: 'left',
-              cursor: 'pointer',
             }}>
               <div style={{
                 width: 28, height: 28, borderRadius: 4,
@@ -605,42 +605,49 @@ export default function RightAside({
                 <div style={{
                   fontSize: 12, fontWeight: 500, color: 'var(--text-primary)',
                   overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                }}>{f.name}</div>
+                }}>
+                  {f.name}
+                  {f.version && f.version > 1 ? <span style={{ color: 'var(--accent)', marginLeft: 6 }}>v{f.version}</span> : null}
+                  {f.status === 'final' ? <span style={{ color: 'var(--color-success)', marginLeft: 6 }}>终稿</span> : null}
+                </div>
                 <div style={{
                   fontSize: 10, color: 'var(--text-tertiary)',
                 }}>{f.meta}</div>
               </div>
-              <span
-                title="下载到本地"
-                aria-label="下载到本地"
-                style={{
-                  marginLeft: 'auto',
-                  width: 28,
-                  height: 28,
-                  borderRadius: 6,
-                  color: 'var(--text-tertiary)',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                }}
-              >
-                <DownloadOutlined />
-              </span>
-              {f.artifactId && onArchiveArtifact && (
-                <span
-                  role="button"
-                  tabIndex={0}
-                  title="归档交付物"
-                  aria-label="归档交付物"
+              {f.artifactId && onUpdateArtifact && f.status !== 'final' && (
+                <button
+                  type="button"
+                  title="标记为终稿"
+                  aria-label="标记为终稿"
                   onClick={(e) => {
                     e.stopPropagation();
-                    onArchiveArtifact(f.artifactId!);
+                    onUpdateArtifact(f.artifactId!, { status: 'final' });
                   }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      onArchiveArtifact(f.artifactId!);
+                  style={{
+                    marginLeft: 'auto',
+                    padding: '4px 7px',
+                    borderRadius: 6,
+                    border: 'none',
+                    color: 'var(--color-success)',
+                    background: 'rgba(16,185,129,0.08)',
+                    fontSize: 10,
+                    whiteSpace: 'nowrap',
+                    cursor: 'pointer',
+                  }}
+                >
+                  终稿
+                </button>
+              )}
+              {f.artifactId && onUpdateArtifact && (
+                <button
+                  type="button"
+                  title="重命名交付物"
+                  aria-label="重命名交付物"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const next = window.prompt('交付物名称', f.name);
+                    if (next && next.trim() && next.trim() !== f.name) {
+                      onUpdateArtifact(f.artifactId!, { name: next.trim() });
                     }
                   }}
                   style={{
@@ -648,15 +655,65 @@ export default function RightAside({
                     height: 28,
                     borderRadius: 6,
                     color: 'var(--text-tertiary)',
+                    background: 'transparent',
                     display: 'inline-flex',
                     alignItems: 'center',
                     justifyContent: 'center',
+                    fontSize: 10,
+                    border: '1px solid var(--border-subtle)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  改
+                </button>
+              )}
+              <button
+                type="button"
+                title="下载到本地"
+                aria-label="下载到本地"
+                onClick={() => downloadOutput(f.name, f.content, f.mime)}
+                style={{
+                  marginLeft: f.artifactId && onUpdateArtifact ? 0 : 'auto',
+                  width: 28,
+                  height: 28,
+                  borderRadius: 6,
+                  color: 'var(--text-tertiary)',
+                  background: 'transparent',
+                  border: 'none',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: 'pointer',
+                }}
+              >
+                <DownloadOutlined />
+              </button>
+              {f.artifactId && onArchiveArtifact && (
+                <button
+                  type="button"
+                  title="归档交付物"
+                  aria-label="归档交付物"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onArchiveArtifact(f.artifactId!);
+                  }}
+                  style={{
+                    width: 28,
+                    height: 28,
+                    borderRadius: 6,
+                    color: 'var(--text-tertiary)',
+                    background: 'transparent',
+                    border: 'none',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    cursor: 'pointer',
                   }}
                 >
                   <InboxOutlined />
-                </span>
+                </button>
               )}
-            </button>
+            </div>
           ))}
         </div>
       )}
@@ -864,6 +921,13 @@ function outputKindTone(kind: string) {
 
 function artifactMeta(a: any) {
   const bits = [`${a.kind || 'artifact'}`, `${String(a.content || '').length} 字`];
+  if (a.version) bits.push(`v${a.version}`);
+  if (a.status && a.status !== 'active') bits.push(String(a.status));
+  if (a.source) bits.push(String(a.source));
+  if (a.source_path) {
+    const path = String(a.source_path);
+    bits.push(path.split('/').slice(-2).join('/'));
+  }
   const prov = a.provenance || {};
   if (prov.employee_name) bits.push(prov.employee_name);
   const counts = prov.context_counts || {};

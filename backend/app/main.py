@@ -345,6 +345,16 @@ class RunStopIn(BaseModel):
     reason: str = Field(default="user_requested", max_length=256)
 
 
+class WorkflowNodeActionIn(BaseModel):
+    action: str = Field(default="continue", pattern="^(retry|continue)$")
+    message: str = Field(default="", max_length=4000)
+
+
+class ArtifactPatchIn(BaseModel):
+    name: str | None = Field(default=None, max_length=255)
+    status: str | None = Field(default=None, max_length=24)
+
+
 class SessionForkIn(BaseModel):
     title: str = Field(default="", max_length=255)
 
@@ -2674,13 +2684,16 @@ def _tool_artifacts_from_payload(payload: Any, *, source: str = "hermes_tool") -
     return artifacts[:12]
 
 
-def _next_artifact_version(db: Session, *, session_id: str, name: str) -> int:
+def _next_artifact_version(db: Session, *, session_id: str, name: str, exclude_id: str | None = None) -> int:
+    q = db.query(TaskArtifact).filter(
+        TaskArtifact.session_id == session_id,
+        TaskArtifact.name == name,
+    )
+    if exclude_id:
+        q = q.filter(TaskArtifact.id != exclude_id)
     versions = [
         int(getattr(row, "version", 1) or 1)
-        for row in db.query(TaskArtifact).filter(
-            TaskArtifact.session_id == session_id,
-            TaskArtifact.name == name,
-        ).all()
+        for row in q.all()
     ]
     return (max(versions) + 1) if versions else 1
 
@@ -3827,6 +3840,67 @@ def get_session_replay(
     }
 
 
+@app.post("/api/sessions/{sid}/workflow-nodes/{node_run_id}/action")
+def workflow_node_action(
+    sid: str,
+    node_run_id: str,
+    body: WorkflowNodeActionIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    rec = db.get(SessionRecord, sid)
+    if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
+        raise HTTPException(404, "session not found")
+    node = db.get(WorkflowNodeRun, node_run_id)
+    if not node or node.tenant_id != p.tenant.id or node.session_id != sid:
+        raise HTTPException(404, "workflow node run not found")
+    wf = db.get(WorkflowRun, node.workflow_run_id)
+    action = body.action or "continue"
+    node.status = "retry_requested" if action == "retry" else "continue_requested"
+    node.updated_at = datetime.now(timezone.utc)
+    if wf:
+        wf.status = "waiting_input"
+        wf.summary = f"节点 {node.label or node.node_id} 已请求{'重试' if action == 'retry' else '继续'}，等待用户确认发送。"
+        wf.updated_at = datetime.now(timezone.utc)
+    rec.task_status = "needs_input"
+    rec.task_summary = f"协作节点「{node.label or node.node_id}」等待用户确认{'重试' if action == 'retry' else '继续'}。"
+    rec.updated_at = datetime.now(timezone.utc)
+    prompt = body.message.strip() or (
+        f"请从协作节点「{node.label or node.node_id}」{'重新执行' if action == 'retry' else '继续执行'}。"
+        f"\n节点输入摘要: {(node.input_summary or rec.last_message or '')[:800]}"
+        f"\n上次输出/错误: {(node.error or node.output_summary or '')[:800]}"
+        "\n请只处理该节点负责的部分，并在完成后说明生成了哪些交付物。"
+    )
+    ev = CanvasEvent(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=rec.id,
+        employee_id=node.employee_id,
+        event_type=f"node.{action}_requested",
+        node_id=node.node_id,
+        payload=json.dumps({
+            "node_run_id": node.id,
+            "workflow_run_id": node.workflow_run_id,
+            "continuation_message": prompt,
+        }, ensure_ascii=False),
+    )
+    db.add(ev)
+    audit(db, principal=p, action=f"workflow_node.{action}", resource_type="workflow_node_run",
+          resource_id=node.id, request=request, extra={"session_id": sid, "node_id": node.node_id})
+    db.commit()
+    db.refresh(node)
+    return {
+        "ok": True,
+        "action": action,
+        "session_id": sid,
+        "task_status": rec.task_status,
+        "node": _workflow_node_to_dict(node),
+        "workflow_run": _workflow_run_to_dict(wf) if wf else None,
+        "continuation_message": prompt,
+    }
+
+
 @app.post("/api/sessions/{sid}/recover")
 async def recover_session(
     sid: str,
@@ -4271,6 +4345,44 @@ def list_session_artifacts(
         TaskArtifact.tenant_id == p.tenant.id,
     ).order_by(TaskArtifact.created_at.desc()).all()
     return {"items": [_artifact_to_dict(r, db) for r in rows]}
+
+
+@app.patch("/api/artifacts/{artifact_id}")
+def patch_artifact(
+    artifact_id: str,
+    body: ArtifactPatchIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    art = db.get(TaskArtifact, artifact_id)
+    if not art or art.tenant_id != p.tenant.id or art.user_id != p.user.id:
+        raise HTTPException(404, "artifact not found")
+    changes: dict[str, Any] = {}
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(400, "name cannot be empty")
+        art.name = name[:255]
+        art.version = _next_artifact_version(db, session_id=art.session_id, name=art.name, exclude_id=art.id)
+        changes["name"] = art.name
+        changes["version"] = art.version
+    if body.status is not None:
+        status = body.status.strip()
+        allowed = {"active", "draft", "final", "archived"}
+        if status not in allowed:
+            raise HTTPException(400, f"status must be one of {sorted(allowed)}")
+        art.status = status
+        art.archived = status == "archived"
+        changes["status"] = art.status
+        changes["archived"] = art.archived
+    if not changes:
+        raise HTTPException(400, "no fields to update")
+    audit(db, principal=p, action="artifact.update", resource_type="artifact",
+          resource_id=art.id, request=request, extra={"session_id": art.session_id, **changes})
+    db.commit()
+    db.refresh(art)
+    return _artifact_to_dict(art, db)
 
 
 @app.post("/api/artifacts/{artifact_id}/archive")
