@@ -269,13 +269,15 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     skill_score += 5 if grep(skill_page, r"风险等级|risk|version|binding_count|health") else 0
     skill_score += 5 if grep(app_py, r"input_example|output_example|risk_level|suitable_employees") else 0
     skill_score += 5 if grep(app_py, r"missing_in_hermes|skill_failure_rate|_find_hermes_skill_md") else 0
+    skill_score += 4 if grep(skill_page, r"SkillGovernanceDrawer|治理建议|绑定影响|详情/治理") else 0
+    skill_score += 4 if grep("frontend/src/pages/EmployeeDetail.tsx", r"selectedBindingSkill|能力说明|输入示例|输出示例|失败率") else 0
     dimensions.append({
         "name": "Skill 管理",
         "weight": 10,
-        "score": cap(skill_score, 78),
-        "judgement": "Skill Market、Hub 筛选、绑定和健康检查已具备；能力说明、版本治理和风险提示还要继续产品化。",
+        "score": cap(skill_score, 82),
+        "judgement": "Skill Market、Hub 筛选、绑定、健康检查和治理详情已具备；版本升级/回滚和风险策略还要继续产品化。",
         "evidence": [f"Skill Market 当前 {evidence['skill_market_count']} 条"],
-        "gaps": ["缺少版本升级/回滚策略", "Skill 输入输出示例和适用员工还不够强运营化"],
+        "gaps": ["缺少版本升级/回滚策略", "Skill 风险策略、灰度发布和批量治理还需补齐"],
     })
 
     enterprise_score = 56

@@ -28,6 +28,14 @@ const SKILL_INPUT_TEMPLATE: Record<string, string> = {
   contract_review: '{\n  "text": "请粘贴合同条款文本,系统将识别潜在风险并给出修改建议。"\n}',
 };
 
+function skillRiskColor(risk?: string) {
+  const r = String(risk || '').toLowerCase();
+  if (r === 'high') return 'red';
+  if (r === 'medium') return 'orange';
+  if (r === 'low') return 'green';
+  return 'default';
+}
+
 export default function EmployeeDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -110,6 +118,10 @@ export default function EmployeeDetail() {
         return ah - bh || a.scope.localeCompare(b.scope) || a.name.localeCompare(b.name);
       }),
     [marketSkills, boundSkillIds],
+  );
+  const selectedBindingSkill = useMemo(
+    () => bindableSkills.find((s: any) => ((s as any).__id || String(s.id)) === bindingSkillId),
+    [bindableSkills, bindingSkillId],
   );
 
   const openBindModal = useCallback(() => {
@@ -507,6 +519,50 @@ export default function EmployeeDetail() {
           <div style={{ color: 'var(--text-tertiary)', fontSize: 12, lineHeight: 1.6 }}>
             绑定后，该 Skill 会进入员工对话链路的能力上下文；全局不可变 Skill 仍由系统统一维护，员工侧只建立引用关系。
           </div>
+          {selectedBindingSkill && (
+            <div style={{
+              display: 'grid',
+              gap: 10,
+              padding: 12,
+              borderRadius: 10,
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border-subtle)',
+            }}>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <strong style={{ fontSize: 14 }}>{selectedBindingSkill.name}</strong>
+                <Tag color={selectedBindingSkill.scope === 'global' ? 'geekblue' : selectedBindingSkill.scope === 'tenant' ? 'blue' : 'purple'}>
+                  {selectedBindingSkill.scope}
+                </Tag>
+                <Tag color={String(selectedBindingSkill.source_ref || '').startsWith('hermes:') ? 'cyan' : 'default'}>
+                  {String(selectedBindingSkill.source_ref || '').startsWith('hermes:') ? 'Hermes' : 'OpenAtlas'}
+                </Tag>
+                <Tag color={skillRiskColor(selectedBindingSkill.risk_level)}>风险 {selectedBindingSkill.risk_level || 'low'}</Tag>
+              </div>
+              <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                {selectedBindingSkill.ability_description || selectedBindingSkill.description || '暂无能力说明'}
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <div style={{ padding: 8, borderRadius: 8, background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 4 }}>输入示例</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.45 }}>
+                    {selectedBindingSkill.input_example || '输入业务目标、文件或上下文说明。'}
+                  </div>
+                </div>
+                <div style={{ padding: 8, borderRadius: 8, background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 4 }}>输出示例</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.45 }}>
+                    {selectedBindingSkill.output_example || '结构化结论、报告、表格或交付物。'}
+                  </div>
+                </div>
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', lineHeight: 1.6 }}>
+                适用员工：{(selectedBindingSkill.suitable_employees || []).join(' / ') || '通用数智员工'} ·
+                已绑定员工 {selectedBindingSkill.bound_employee_count || 0} ·
+                失败率 {Math.round(Number(selectedBindingSkill.health?.failure_rate || 0) * 100)}%
+                {selectedBindingSkill.health?.last_error ? ` · 最近错误：${String(selectedBindingSkill.health.last_error).slice(0, 80)}` : ''}
+              </div>
+            </div>
+          )}
         </div>
       </Modal>
 
