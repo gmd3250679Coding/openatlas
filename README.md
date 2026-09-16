@@ -45,7 +45,7 @@ Hermes-compatible Gateway / 模型与工具运行时
 要求：Python 3.11+、Node.js 20+、npm，以及一份独立的 Hermes-compatible runtime。
 
 ```bash
-git clone <your-repository-url>
+git clone https://github.com/gmd3250679Coding/openatlas.git
 cd openatlas
 
 python3 -m venv backend/.venv
