@@ -1,6 +1,6 @@
 /**
  * katex-override.css — Override KaTeX's default font sizing and color so that
- * math blocks inside Streamdown blend with Atlas's prose typography (M3.3).
+ * math blocks inside Streamdown blend with InsightLab's prose typography (M3.3).
  *
  * KaTeX ships with its own CSS that hard-codes fonts and sizes; we keep the
  * layout/positioning rules and just retune scale + color to match

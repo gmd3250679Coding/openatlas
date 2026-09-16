@@ -4,18 +4,29 @@
 # 8-LAYER ISOLATION (all fail-closed, refuse to start on any violation):
 #  1. HERMES_HOME is an absolute path under OPENATLAS_HOME.
 #  2. HERMES_HOME is NOT a subpath of the user's live ~/.hermes directory.
-#  3. The Hermes runtime we exec is OPENATLAS_HOME/hermes-runtime
-#     — an isolated copy. We NEVER read or exec anything from the live ~/.hermes/hermes-agent/.
+#  3. The Hermes runtime we exec is the project-bundled runtime/hermes source.
+#     We NEVER read or exec anything from the live ~/.hermes/hermes-agent/.
 #  4. API_SERVER_PORT is not in {8642, 9119, ...}.
 #  5. We do NOT import / link / read any file from the live ~/.hermes into HERMES_HOME.
 #  6. Pre-start mtime snapshot of ~/.hermes/config.yaml + ~/.hermes/state.db. Post-start re-check:
 #     mtimes unchanged (proves no accidental write back into the local Hermes state).
 #  7. We never kill anything that is not our own PID file. We never pkill 'hermes' by name.
 #  8. After launch, verify the new Hermes gateway PID's executable path is under
-#     OPENATLAS_HOME/hermes-runtime, NOT under the live ~/.hermes.
+#     the project-bundled runtime, NOT under the live ~/.hermes.
 #     Refuse to declare "ready" if this check fails.
 
 set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Local delivery configuration lives beside the project source. Values are
+# exported so both Hermes and the backend inherit the same model credential.
+if [[ -f "$PROJECT_ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$PROJECT_ROOT/.env"
+  set +a
+fi
 
 # ── Layer 1/2/3: isolated absolute paths ──────────────────────────────────
 : "${OPENATLAS_HOME:=${HOME:?HOME is required}/.openatlas}"
@@ -31,17 +42,16 @@ API_SERVER_KEY="${API_SERVER_KEY:-openatlas-demo-dev-key}"
 OPENATLAS_FRONTEND_PORT="${OPENATLAS_FRONTEND_PORT:-3381}"
 OPENATLAS_BACKEND_PORT="${OPENATLAS_BACKEND_PORT:-58003}"
 
-# Our OWN hermes-agent copy. NEVER reference the live ~/.hermes/hermes-agent.
-HERMES_RUNTIME="$OPENATLAS_HOME/hermes-runtime"
+# Project-bundled Hermes source. NEVER reference the live ~/.hermes/hermes-agent.
+HERMES_RUNTIME="${OPENATLAS_HERMES_AGENT_ROOT:-$PROJECT_ROOT/runtime/hermes}"
 HERMES_PY="$HERMES_RUNTIME/.venv/bin/python3"
 LOCAL_HERMES_HOME="${LOCAL_HERMES_HOME:-${HOME:?HOME is required}/.hermes}"   # READ-ONLY reference
 
 # Export for child processes
 export OPENATLAS_HOME OPENATLAS_TENANT HERMES_HOME
+export OPENATLAS_HERMES_AGENT_ROOT="$HERMES_RUNTIME"
 export API_SERVER_HOST API_SERVER_PORT API_SERVER_KEY
 export OPENATLAS_FRONTEND_PORT OPENATLAS_BACKEND_PORT
-
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ── Layer 2: refuse if HERMES_HOME sits inside ~/.hermes ───────────────────
 case "$HERMES_HOME" in
@@ -53,7 +63,7 @@ esac
 
 # ── Layer 3: refuse if our hermes runtime is missing or still under ~/.hermes
 if [[ ! -d "$HERMES_RUNTIME" ]]; then
-  echo "[start.sh][FATAL] HERMES_RUNTIME=$HERMES_RUNTIME not found.  Run: rsync -a --exclude 'tests' --exclude 'docs' --exclude 'website' ~/.hermes/hermes-agent/ ~/.openatlas/hermes-runtime/" >&2
+  echo "[start.sh][FATAL] bundled HERMES_RUNTIME=$HERMES_RUNTIME not found" >&2
   exit 1
 fi
 case "$HERMES_RUNTIME" in
@@ -63,8 +73,9 @@ case "$HERMES_RUNTIME" in
     ;;
 esac
 if [[ ! -x "$HERMES_PY" ]]; then
-  echo "[start.sh][FATAL] hermes-runtime venv not at $HERMES_PY" >&2
-  exit 1
+  echo "[start.sh] Hermes environment missing; preparing bundled runtime ..."
+  OPENATLAS_HERMES_AGENT_ROOT="$HERMES_RUNTIME" \
+    bash "$PROJECT_ROOT/scripts/setup-hermes-runtime.sh"
 fi
 
 # ── Layer 4: refuse collision ports ────────────────────────────────────────
@@ -133,6 +144,7 @@ echo "[start.sh] launching Hermes API server on :$API_SERVER_PORT from isolated 
 nohup env -u HOME \
   PYTHONPATH="$HERMES_RUNTIME" \
   OPENATLAS_HOME="$OPENATLAS_HOME" \
+  OPENATLAS_HERMES_AGENT_ROOT="$HERMES_RUNTIME" \
   HERMES_HOME="$HERMES_HOME" \
   API_SERVER_HOST="$API_SERVER_HOST" \
   API_SERVER_PORT="$API_SERVER_PORT" \

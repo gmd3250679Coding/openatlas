@@ -1,7 +1,7 @@
 """Hermes gateway client (httpx-based) — Phase 2 tenant-aware factory.
 
 All chat/session/capability traffic to Hermes goes through here. Every public
-function takes a RuntimeTarget (base_url + api_key) so the OpenAtlas backend
+function takes a RuntimeTarget (base_url + api_key) so the InsightLab backend
 can route per tenant.
 
 Phase 1 hardcoded TENANT_HERMES_BASE_URL is preserved as a fallback when no

@@ -70,7 +70,7 @@ def _schema(data: dict | list) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-WHITEBOARD_OFFICIAL_LIBRARY_CONTEXT = """Atlas 已预装官方 Excalidraw 素材库（来源 libraries.excalidraw.com / excalidraw-libraries，MIT）：
+WHITEBOARD_OFFICIAL_LIBRARY_CONTEXT = """InsightLab 已预装官方 Excalidraw 素材库（来源 libraries.excalidraw.com / excalidraw-libraries，MIT）：
 - Software Architecture: 微服务、数据库、缓存、事件总线等软件架构组件
 - System Design Template / Components / Icons: 系统设计模板、服务、存储、流量、估算等组件
 - Flow Chart Symbols: 标准流程图符号
@@ -89,7 +89,7 @@ WHITEBOARD_SKILL_SEEDS = [
         "slug": "creative-whiteboard-draft",
         "description": "根据自然语言目标生成流程图、PPT 草稿、网络架构图或原型线框的白板初稿。",
         "category": "whiteboard",
-        "system_prompt": f"""你是 Atlas 创意白板生成 Skill。你的任务是把用户的业务目标转成可编辑的 Excalidraw 画布初稿。
+        "system_prompt": f"""你是 InsightLab 创意白板生成 Skill。你的任务是把用户的业务目标转成可编辑的 Excalidraw 画布初稿。
 必须遵守：
 1. 优先生成结构清晰、可继续编辑的图，而不是装饰图。
 2. 根据 kind 选择图形：flowchart=流程节点与箭头；ppt=多页 16:9 幻灯片故事板；architecture=分层架构；wireframe=产品线框。
@@ -141,7 +141,7 @@ WHITEBOARD_SKILL_SEEDS = [
                 "output": "asset_plan 选择 flow-chart-symbols#14/#13/#12/#8/#11，把这些官方符号作为 5 个主流程节点，并用用户业务文字替换节点标签。"
             },
             {
-                "input": {"kind": "ppt", "prompt": "Atlas 路演：问题、方案、能力、场景、价值、路线"},
+                "input": {"kind": "ppt", "prompt": "InsightLab 路演：问题、方案、能力、场景、价值、路线"},
                 "output": "生成 6 页 16:9 幻灯片卡片；每页内嵌 system-design-template、flow-chart-symbols、system-design-components 等官方素材，而不是单独放素材参考区。"
             }
         ]),
@@ -151,7 +151,7 @@ WHITEBOARD_SKILL_SEEDS = [
         "slug": "canvas-to-prompt",
         "description": "读取 Excalidraw 白板元素、文字和关系，转换成可交给数智员工继续执行的结构化提示词。",
         "category": "whiteboard",
-        "system_prompt": f"""你是 Atlas 画布理解 Skill。你的任务是读取白板中的文字、Frame、节点和关系，把视觉结构转换成数智员工可执行的提示词。
+        "system_prompt": f"""你是 InsightLab 画布理解 Skill。你的任务是读取白板中的文字、Frame、节点和关系，把视觉结构转换成数智员工可执行的提示词。
 必须遵守：
 1. 先总结画布意图，再提取结构化要点。
 2. 不输出内部元素 ID，除非它是用户显式命名的业务对象。
@@ -206,7 +206,7 @@ WHITEBOARD_SKILL_SEEDS = [
         "slug": "diagram-refiner",
         "description": "按用户要求对当前白板进行局部扩写、重排和补充说明。",
         "category": "whiteboard",
-        "system_prompt": f"""你是 Atlas 图表精修 Skill。你的任务是在已有白板基础上做二次修改。
+        "system_prompt": f"""你是 InsightLab 图表精修 Skill。你的任务是在已有白板基础上做二次修改。
 必须遵守：
 1. 默认非破坏式编辑：保留原有内容，在旁边新增修改建议、补充节点或重排草案。
 2. 只有用户明确要求替换/删除时，才输出 destructive patch。
@@ -266,7 +266,7 @@ WHITEBOARD_SKILL_SEEDS = [
         "slug": "slide-storyboard",
         "description": "把白板 Frame 或画布结构转换为 PPT 故事线、页面标题和导出材料。",
         "category": "whiteboard",
-        "system_prompt": f"""你是 Atlas 幻灯片故事板 Skill。你的任务是根据用户需求在同一个 Excalidraw 画布中生成多张 16:9 PPT 页面。
+        "system_prompt": f"""你是 InsightLab 幻灯片故事板 Skill。你的任务是根据用户需求在同一个 Excalidraw 画布中生成多张 16:9 PPT 页面。
 必须遵守：
 1. 默认 16:9 比例，每页必须有边框线、页码和标题。
 2. 一次生成多张页面，排列在同一个画布文件中。
@@ -322,7 +322,7 @@ WHITEBOARD_SKILL_SEEDS = [
         }),
         "few_shot_examples": _schema([
             {
-                "input": {"prompt": "Atlas 产品发布会：定位、痛点、能力、场景、价值、路线", "slide_count": 6},
+                "input": {"prompt": "InsightLab 产品发布会：定位、痛点、能力、场景、价值、路线", "slide_count": 6},
                 "output": "同一画布中生成 6 张 16:9 页面，每页包含边框线、页码、标题、三条要点，并在页面内部嵌入官方素材组件作为视觉表达。"
             }
         ]),
@@ -337,7 +337,7 @@ CONTRACT_REVIEW_SKILL_SEEDS = [
         "description": "面向合同智能审核的 DOCX 解析、结构化审查、在线审查报告与 Word 批注修订建议稿生成能力。支持按合同类型、审查视角和重点关注项动态调整审查清单。",
         "category": "contract",
         "source_ref": "openatlas-contract:docx-contract-review",
-        "system_prompt": """你是 Atlas 合同 DOCX 审核与修订 Skill。你的任务是帮助法务、销售、采购和项目团队审查合同文件，并输出可追踪、可复核、可下载的交付物。
+        "system_prompt": """你是 InsightLab 合同 DOCX 审核与修订 Skill。你的任务是帮助法务、销售、采购和项目团队审查合同文件，并输出可追踪、可复核、可下载的交付物。
 必须遵守：
 1. 优先保留原合同结构和原文，不擅自删除原文。
 2. 审核建议必须结构化，包含风险等级、问题分类、条款定位、原文摘录、风险说明、修改建议和拟修订文本。
@@ -406,7 +406,7 @@ AI2UI_SKILL_SEEDS = [
         "description": "把 Agent 的下一步动作转换为可渲染、可确认、可编辑的 UI patch，适用于表单、卡片、审阅区、画布节点、进度状态和动作按钮。",
         "category": "ai2ui",
         "source_ref": "openatlas:ai2ui:surface-planner",
-        "system_prompt": """你是 Atlas AI2UI Surface Planner Skill。你的任务不是回答用户问题，而是把 Agent 的下一步交互转换成可执行 UI patch。
+        "system_prompt": """你是 InsightLab AI2UI Surface Planner Skill。你的任务不是回答用户问题，而是把 Agent 的下一步交互转换成可执行 UI patch。
 必须遵守：
 1. 保持领域中立，不为 PPT、公文、合同、白板等具体场景硬编码规则。
 2. 当缺少结构化信息时，优先生成表单、选择卡、确认卡或画布节点，而不是只用自然语言追问。
@@ -466,7 +466,7 @@ AI2UI_SKILL_SEEDS = [
         "description": "基于任务上下文、当前内容和候选来源生成检索计划、资料摘要、引用证据和可回写的内容补丁。",
         "category": "ai2ui",
         "source_ref": "openatlas:ai2ui:evidence-research-synthesizer",
-        "system_prompt": """你是 Atlas Evidence Research Synthesizer Skill。你的任务是把资料缺口转成可执行研究任务，并把搜索、文件或知识库结果归纳为可信证据包。
+        "system_prompt": """你是 InsightLab Evidence Research Synthesizer Skill。你的任务是把资料缺口转成可执行研究任务，并把搜索、文件或知识库结果归纳为可信证据包。
 必须遵守：
 1. 保持通用，适用于报告、PPT、文章、公文、合同、方案、培训材料等任意交付物。
 2. 先理解当前内容要证明什么，再决定需要什么资料；不要把用户原话直接当搜索词。
@@ -520,7 +520,7 @@ AI2UI_SKILL_SEEDS = [
         "description": "把用户目标规划为文档、演示、报告、页面、流程等交付物的章节/页面/模块结构、依赖资料和生成顺序。",
         "category": "ai2ui",
         "source_ref": "openatlas:ai2ui:artifact-structure-planner",
-        "system_prompt": """你是 Atlas Artifact Structure Planner Skill。你的任务是为任意复杂交付物建立可编辑结构，而不是直接写最终稿。
+        "system_prompt": """你是 InsightLab Artifact Structure Planner Skill。你的任务是为任意复杂交付物建立可编辑结构，而不是直接写最终稿。
 必须遵守：
 1. 交付物类型可以是 document、deck、report、article、web_page、workflow、review_package 等，不能只为 PPT 设计。
 2. 结构必须包含叙事逻辑、受众目标、章节/页面/模块、每个节点的核心观点、资料依赖和完成状态。
@@ -565,7 +565,7 @@ AI2UI_SKILL_SEEDS = [
         "description": "把结构化交付物规格和设计 Token 渲染为安全、可预览、可下载的 HTML，适用于演示、报告、长文、看板和审阅页。",
         "category": "ai2ui",
         "source_ref": "openatlas:ai2ui:tokenized-html-renderer",
-        "system_prompt": """你是 Atlas Tokenized HTML Renderer Skill。你的任务是把结构化 artifact spec 渲染为高质量 HTML，而不是重新规划内容。
+        "system_prompt": """你是 InsightLab Tokenized HTML Renderer Skill。你的任务是把结构化 artifact spec 渲染为高质量 HTML，而不是重新规划内容。
 必须遵守：
 1. 保持渲染器通用，支持 deck、document、report、article、dashboard、review_package 等 artifact_type。
 2. 严格使用输入中的 design_tokens、layout_intent 和 render_hints；不要发明不受控的品牌色、字体、装饰元素。
@@ -607,7 +607,7 @@ AI2UI_SKILL_SEEDS = [
         "description": "对结构化计划、UI patch、HTML 预览或最终交付物做质量审阅，并输出可执行修复补丁。",
         "category": "ai2ui",
         "source_ref": "openatlas:ai2ui:artifact-critic-repair",
-        "system_prompt": """你是 Atlas Artifact Critic & Repair Skill。你的任务是审阅交付物质量，并给出可执行修复补丁，而不是泛泛评价。
+        "system_prompt": """你是 InsightLab Artifact Critic & Repair Skill。你的任务是审阅交付物质量，并给出可执行修复补丁，而不是泛泛评价。
 必须遵守：
 1. 通用评审维度包括：用户目标匹配、结构完整性、事实可信度、引用来源、版式可读性、组件可执行性、可访问性、状态流转和下载/预览可用性。
 2. 发现问题要输出 severity、location、reason、repair_patch；不要只写建议。
@@ -941,6 +941,21 @@ def init_db() -> None:
                 admin_user = db.query(User).filter_by(tenant_id=demo.id, email=DEFAULT_ADMIN_EMAIL).first()
                 demo_user = _ensure_demo_user(db, demo, root.id if root else None)
                 seed_user_id = (admin_user.id if admin_user else demo_user.id)
+                default_employee = db.query(DigitalEmployee).filter_by(
+                    tenant_id=demo.id,
+                    profile_name=f"tenant_{demo.slug}__employee_atlas_helper",
+                ).first()
+                if default_employee and default_employee.display_name in {
+                    "Atlas 助手",
+                    "Atlas助手",
+                    "统一演示环境InsightLab 助手",
+                    "统一演示环境InsightLab助手",
+                }:
+                    default_employee.display_name = "InsightLab助手"
+                    default_employee.avatar = "I"
+                    default_employee.system_prompt = (
+                        "你是一名高效、耐心的企业数字员工，名字叫 InsightLab助手。"
+                    )
                 _ensure_whiteboard_skills(db, demo, seed_user_id)
                 _ensure_ai2ui_skills(db, demo, seed_user_id)
                 _ensure_contract_review_skills(db, demo, seed_user_id)
@@ -1012,14 +1027,14 @@ def init_db() -> None:
         # Seed a demo digital employee so the list is non-empty
         emp = DigitalEmployee(
             tenant_id=tenant.id,
-            display_name="Atlas 助手",
+            display_name="InsightLab助手",
             profile_name=f"tenant_{tenant.slug}__employee_atlas_helper",
             description="默认演示员工，擅长通用问答与文件操作。",
-            avatar="A",
+            avatar="I",
             status=EmployeeStatus.active,
             model="hermes-agent",
             provider="hermes",
-            system_prompt="你是一名高效、耐心的企业数字员工，名字叫 Atlas 助手。",
+            system_prompt="你是一名高效、耐心的企业数字员工，名字叫 InsightLab助手。",
             created_by=admin.id,
         )
         db.add(emp)

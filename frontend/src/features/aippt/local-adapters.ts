@@ -169,7 +169,7 @@ export function createLocalAipptStorageAdapter(options: {
 }
 
 function chooseFixture(query: string) {
-  if (/融资|路演|投资|OpenAtlas/u.test(query)) return buildOpenAtlasInvestorDemo();
+  if (/融资|路演|投资|InsightLab/u.test(query)) return buildOpenAtlasInvestorDemo();
   return buildGenericOperationsDemo();
 }
 

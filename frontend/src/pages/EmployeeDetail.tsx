@@ -68,7 +68,7 @@ function skillSourceLabel(sourceRef?: string) {
   const source = String(sourceRef || '');
   if (source.startsWith('hermes:')) return 'Hermes 运行时';
   if (source.startsWith('zip:') || source.startsWith('openatlas:')) return '本地导入包';
-  return 'OpenAtlas 元数据';
+  return 'InsightLab 元数据';
 }
 
 export default function EmployeeDetail() {
@@ -76,7 +76,7 @@ export default function EmployeeDetail() {
   const navigate = useNavigate();
   const [employee, setEmployee] = useState<EmployeeDetailType | null>(null);
   const [loading, setLoading] = useState(true);
-  // Phase 3.9: OpenAtlas SkillBinding 表里绑定的市场技能
+  // Phase 3.9: InsightLab SkillBinding 表里绑定的市场技能
   const [skillBindings, setSkillBindings] = useState<SkillBindingRow[]>([]);
   const [bindingsLoading, setBindingsLoading] = useState(false);
   const [marketSkills, setMarketSkills] = useState<SkillPackage[]>([]);
@@ -104,7 +104,7 @@ export default function EmployeeDetail() {
       .finally(() => setLoading(false));
   }, [id]);
 
-  // Phase 3.9: load OpenAtlas SkillBindings for this employee
+  // Phase 3.9: load InsightLab SkillBindings for this employee
   const reloadSkillBindings = useCallback(async () => {
     const targetId = (employee as any)?.__id || id;
     if (!targetId) return;
@@ -339,7 +339,7 @@ export default function EmployeeDetail() {
                     <span className="atlas-chip atlas-chip--neutral" style={{ padding: '4px 10px' }}>未配置</span>
                   )}
                 </div>
-                {/* Phase 3.9: OpenAtlas SkillBinding — 来自技能市场的可绑定技能 */}
+                {/* Phase 3.9: InsightLab SkillBinding — 来自技能市场的可绑定技能 */}
                 <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-tertiary)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
                   <span>已绑定市场技能</span>
                   {bindingsLoading && <Spin size="small" style={{ marginLeft: 8 }} />}

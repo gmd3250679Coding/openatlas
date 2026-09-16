@@ -16,12 +16,12 @@
  *   Sandpack's <Preview> already uses `sandbox="allow-scripts
  *   allow-same-origin allow-popups allow-forms"` on its inner iframe.
  *   We trust Sandpack's hardening; we only wrap the result in our
- *   Atlas-themed chrome.
+ *   InsightLab-themed chrome.
  *
  * Theme sync:
  *   We read the current `data-theme` attribute on the document root and
  *   switch Sandpack's `theme` prop accordingly, so the editor matches
- *   Atlas's light/dark mode.
+ *   InsightLab's light/dark mode.
  */
 import { useEffect, useState } from 'react';
 import { Sandpack } from '@codesandbox/sandpack-react';

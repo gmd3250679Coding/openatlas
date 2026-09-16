@@ -50,7 +50,7 @@ export default function DispatchPanel({ tunnels, visible }: DispatchPanelProps) 
           letterSpacing: 'var(--ls-caption)',
           textTransform: 'uppercase',
         }}>
-          Atlas 正在调度同事为你工作
+          InsightLab 正在调度同事为你工作
         </span>
         <span style={{
           fontSize: 'var(--fs-caption)', color: 'var(--text-tertiary)',

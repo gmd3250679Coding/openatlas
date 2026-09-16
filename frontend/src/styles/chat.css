@@ -77,7 +77,7 @@
 }
 
 .markdown-body a {
-  /* 链接色用品牌色 (--accent), Phase A 显式硬编码以保留"用户主动点 → Atlas 紫"的语义 */
+  /* 链接色用品牌色 (--accent), Phase A 显式硬编码以保留"用户主动点 → InsightLab 紫"的语义 */
   color: var(--accent);
   text-decoration: none;
 }

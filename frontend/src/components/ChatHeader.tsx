@@ -430,7 +430,7 @@ function MarmotSvgPet({ state, hovered, jumping, awakeSignal }: { state: OrbStat
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 2, lineHeight: 1.2 }}>
-        <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.01em' }}>Atlas</div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.01em' }}>InsightLab</div>
         <div style={{ fontSize: 10, color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)', letterSpacing: '0.06em', textTransform: 'uppercase' }}>
           {statusText}
         </div>
@@ -734,7 +734,7 @@ function PixelPet({ state, pet, hovered, jumping }: { state: OrbState; pet: Pet;
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 2, lineHeight: 1.2 }}>
-        <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.01em' }}>Atlas</div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.01em' }}>InsightLab</div>
         <div style={{ fontSize: 10, color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)', letterSpacing: '0.06em', textTransform: 'uppercase' }}>
           {state === 'idle' ? '待命' : state === 'thinking' ? '思考中' : state === 'dispatch' ? '调度中' : '回复中'}
         </div>
@@ -1163,7 +1163,7 @@ function AuraHeader({ state }: { state: OrbState }) {
       )}
       <AtlasOrb state={state} size={32} showLabel={false} />
       <div style={{ position: 'relative', zIndex: 1 }}>
-        <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.02em' }}>Atlas</div>
+        <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.02em' }}>InsightLab</div>
         <div style={{ fontSize: 9.5, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)', letterSpacing: '0.06em' }}>
           {state === 'idle' ? 'ONLINE' : state === 'thinking' ? 'THINK' : state === 'dispatch' ? 'DISPATCH' : 'REPLY'}
         </div>

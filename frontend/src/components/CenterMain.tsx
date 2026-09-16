@@ -259,8 +259,8 @@ export default function CenterMain({
         {latestAssistantIndex < 0 && artifacts.length > 0 && (
           <ChatMessage
             role="assistant"
-            sender="Atlas"
-            avatar="A"
+            sender="InsightLab"
+            avatar="I"
             color="var(--accent)"
             text=""
             artifacts={artifacts}

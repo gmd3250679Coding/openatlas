@@ -666,7 +666,7 @@ export default function ContractReview() {
           <div className="contract-empty-state">
             <FileDoneOutlined />
             <h2>上传一份合同开始审核</h2>
-            <p>Atlas 会解析合同正文，生成结构化风险建议、审查报告和 Word 修订建议版。</p>
+            <p>InsightLab 会解析合同正文，生成结构化风险建议、审查报告和 Word 修订建议版。</p>
           </div>
         ) : (
           <>

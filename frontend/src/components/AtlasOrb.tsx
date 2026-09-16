@@ -5,7 +5,7 @@ import { useMemo, useId } from 'react';
 //
 // Design philosophy:
 //   It's not 5 pets, not a logo, not an icon.
-//   It IS Atlas. The same entity, in different sizes,
+//   It IS InsightLab. The same entity, in different sizes,
 //   in different cognitive states.
 //
 // Composition (back to front):
@@ -369,7 +369,7 @@ export default function AtlasOrb({ state, size = 160, showLabel = true, classNam
               fontFamily: 'var(--font-family)',
             }}
           >
-            Atlas
+            InsightLab
           </div>
           <div
             style={{

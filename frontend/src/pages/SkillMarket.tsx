@@ -39,7 +39,7 @@ function skillSourceTag(skill: any) {
   const kind = skillSourceKind(skill);
   if (kind === 'hermes') return { label: 'Hermes 运行时', color: 'cyan' };
   if (kind === 'local') return { label: '本地导入包', color: 'purple' };
-  return { label: 'OpenAtlas 元数据', color: 'default' };
+  return { label: 'InsightLab 元数据', color: 'default' };
 }
 
 function skillSort(a: any, b: any) {
@@ -440,7 +440,7 @@ export default function SkillMarket() {
               <Button onClick={openReconcile}>Hermes 对账</Button>
               <Button onClick={() => setLifecycleOpen(true)}>生命周期</Button>
               <Button icon={<FileZipOutlined />} onClick={() => setShowImport(true)}>导入私有 Skill ZIP</Button>
-              <Button type="primary" onClick={() => setShowCreate(true)}>登记 OpenAtlas 技能</Button>
+              <Button type="primary" onClick={() => setShowCreate(true)}>登记 InsightLab 技能</Button>
             </>
           )}
         </div>
@@ -498,7 +498,7 @@ export default function SkillMarket() {
             { value: 'all', label: '全部来源' },
             { value: 'hermes', label: 'Hermes 运行时' },
             { value: 'local', label: '本地导入包' },
-            { value: 'openatlas', label: 'OpenAtlas 元数据' },
+            { value: 'openatlas', label: 'InsightLab 元数据' },
           ]}
         />
         <Select
@@ -612,7 +612,7 @@ export default function SkillMarket() {
           emptyText="暂无运行记录。完成几轮真实对话后，这里会出现 Skill 调用健康数据。"
         />
       </Modal>
-      <Modal open={reconcileOpen} onCancel={() => setReconcileOpen(false)} footer={null} width={900} title="OpenAtlas / Hermes Skills 对账">
+      <Modal open={reconcileOpen} onCancel={() => setReconcileOpen(false)} footer={null} width={900} title="InsightLab / Hermes Skills 对账">
         <DiagnosticTable
           loading={diagnosticLoading}
           rows={reconcileRows}
@@ -778,10 +778,10 @@ function SkillGovernanceDrawer({
     boundEmployees > 0 ? `已影响 ${boundEmployees} 个员工，禁用前建议通知负责人并查看最近会话。` : '暂无员工绑定，适合先做灰度验证。',
     failureRate > 0 ? `最近失败率 ${failureRate}%，建议先运行健康检查或 Hermes 对账。` : '最近暂无失败记录。',
     isHermesSkill(skill)
-      ? '该 Skill 来源于 Hermes，OpenAtlas 负责绑定、可见性、健康和审计。'
+      ? '该 Skill 来源于 Hermes，InsightLab 负责绑定、可见性、健康和审计。'
       : isLocalPackageSkill(skill)
         ? '该 Skill 是企业本地导入的 Hermes 兼容 SKILL.md 包，会作为员工能力上下文注入。'
-        : '该 Skill 来源于 OpenAtlas，可按 scope 做企业内部治理。',
+        : '该 Skill 来源于 InsightLab，可按 scope 做企业内部治理。',
   ];
 
   return (

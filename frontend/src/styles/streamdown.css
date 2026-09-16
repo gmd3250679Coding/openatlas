@@ -3,7 +3,7 @@
  *
  * Streamdown 2.5.0 内嵌 Shiki(无需外部 shiki dep) + Mermaid,但默认输出
  * Tailwind utility class(如 `bg-[var(--sdm-bg)]`、`text-[var(--sdm-c,inherit)]`),
- * Atlas 项目未引入 Tailwind,因此下面用纯 CSS + Atlas design token 覆写
+ * InsightLab 项目未引入 Tailwind,因此下面用纯 CSS + InsightLab design token 覆写
  * 基础排版、代码块高亮、表格、引用、列表,保证肉眼质感与 Phase A 9 套 token
  * 保持一致。
  *
@@ -505,7 +505,7 @@
  * Bug 1b (2026-06-06): Tailwind utility class fallback
  * Streamdown 2.5 输出 Tailwind 风格的 utility class (text-sm / px-4 / py-2
  * / font-semibold / whitespace-nowrap / divide-y / border / rounded-md /
- * bg-background / text-muted-foreground / bg-muted 等), 但 Atlas 项目
+ * bg-background / text-muted-foreground / bg-muted 等), 但 InsightLab 项目
  * 没装 Tailwind, 这些 class 静默失效, 表格/code block 样式退化.
  * 修法: 在 .streamdown-host 作用域下手动 fallback 这 12 个最常用的 class.
  * 不引入 tailwind dep (会爆体积), 只补最关键的可视化差异.

@@ -1,6 +1,6 @@
 # Excalidraw Examples
 
-These `.excalidraw` files are bundled as editable best-practice examples for the OpenAtlas whiteboard.
+These `.excalidraw` files are bundled as editable best-practice examples for the InsightLab whiteboard.
 
 - Source: https://github.com/github/awesome-copilot/tree/main/skills/excalidraw-diagram-generator/templates
 - License: MIT

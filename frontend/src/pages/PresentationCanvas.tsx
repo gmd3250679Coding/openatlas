@@ -202,7 +202,7 @@ const STYLE_ICON: Record<AipptStylePreset['key'], React.ReactNode> = {
 };
 
 const EXAMPLES = [
-  '帮我做一份 OpenAtlas 数智员工产品汇报，面向企业 CIO，20 分钟，突出落地价值和下一步计划',
+  '帮我做一份 InsightLab 数智员工产品汇报，面向企业 CIO，20 分钟，突出落地价值和下一步计划',
   '做一份 AI2UI 平台路演稿，面向生态伙伴，强调市场机会、产品差异和商业化路径',
   '生成一套面向内部顾问的 A2UI 使用培训课件，包含案例、流程和练习',
   OPENATLAS_INVESTOR_DEMO_PROMPT,
@@ -210,7 +210,7 @@ const EXAMPLES = [
 ];
 
 const DEFAULT_CONFIG: DeckConfig = {
-  topic: 'OpenAtlas 数智员工产品汇报',
+  topic: 'InsightLab 数智员工产品汇报',
   useCase: 'report',
   aspectRatio: '16:9',
   styleKey: 'executive_blue',
@@ -856,13 +856,13 @@ export default function PresentationCanvas() {
     setDeckStage('deck_ready');
     setGenerating(false);
     setGenerationStage('rich_demo_ready');
-    setStreamMessage('已载入 OpenAtlas 融资汇报富图表样例，可直接预览 PPT 初稿或继续编辑画布节点。');
+    setStreamMessage('已载入 InsightLab 融资汇报富图表样例，可直接预览 PPT 初稿或继续编辑画布节点。');
     setOutlineConfirmed(true);
     setDeckBuildProgress(100);
     setDeckBuildMessage('富图表 PPT 初稿样例已生成：12 页，包含折线、柱状、指标卡、架构图和对比矩阵。');
     setSelectedSlideId(firstSlideId);
     setSelectedNodeId(firstNodeIdOfPlan(demo.plan));
-    messageApi.success('已载入 OpenAtlas 融资汇报富图表样例');
+    messageApi.success('已载入 InsightLab 融资汇报富图表样例');
   };
 
   const loadGenericOperationsDemo = () => {

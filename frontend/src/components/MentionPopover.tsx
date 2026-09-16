@@ -7,7 +7,7 @@
  *   - 点选 → 调 onPick(emp) → 上层在 input 末尾追加 @员工名 文本
  *   - 同时通知上层把 employee_id 加入 relayEmployeeIds
  *
- * 王六硬规则:零 emoji / 跟 Atlas token 体系一致
+ * 王六硬规则:零 emoji / 跟 InsightLab token 体系一致
  */
 import type { Employee } from '../services/api';
 import { IconUsers } from './Icons';

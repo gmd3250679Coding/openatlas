@@ -357,7 +357,7 @@ function SkillPickerModal({
               options={[
                 { value: 'hermes', label: 'Hermes 优先' },
                 { value: 'all', label: '全部来源' },
-                { value: 'openatlas', label: 'OpenAtlas' },
+                { value: 'openatlas', label: 'InsightLab' },
               ]}
             />
             <Select

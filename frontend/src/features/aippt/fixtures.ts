@@ -1,10 +1,10 @@
 import type { DeckConfig, DeckPlan, DeckSection, DeckSlide, KnowledgeCard } from './schema';
 
-export const OPENATLAS_INVESTOR_DEMO_PROMPT = 'OpenAtlas 数智员工融资汇报，面向投资人，18 分钟，数据图表丰富，突出市场机会、产品飞轮、商业模式和融资用途';
+export const OPENATLAS_INVESTOR_DEMO_PROMPT = 'InsightLab 数智员工融资汇报，面向投资人，18 分钟，数据图表丰富，突出市场机会、产品飞轮、商业模式和融资用途';
 
 export function buildOpenAtlasInvestorDemo(): { config: DeckConfig; plan: DeckPlan } {
   const demoConfig: DeckConfig = {
-    topic: 'OpenAtlas 数智员工融资汇报',
+    topic: 'InsightLab 数智员工融资汇报',
     useCase: 'roadshow',
     aspectRatio: '16:9',
     styleKey: 'tech_launch',
@@ -17,7 +17,7 @@ export function buildOpenAtlasInvestorDemo(): { config: DeckConfig; plan: DeckPl
   };
   const sections: DeckSection[] = [
     { id: 's-open', title: '机会', purpose: '用宏观转折和客户痛点建立融资叙事。' },
-    { id: 's-product', title: '产品', purpose: '说明 OpenAtlas 如何把 Agent 从问答变成交付岗位。' },
+    { id: 's-product', title: '产品', purpose: '说明 InsightLab 如何把 Agent 从问答变成交付岗位。' },
     { id: 's-business', title: '商业', purpose: '展示增长模型、收入假设和投资回报。' },
     { id: 's-close', title: '融资', purpose: '明确资金用途、里程碑和行动请求。' },
   ];
@@ -38,7 +38,7 @@ export function buildOpenAtlasInvestorDemo(): { config: DeckConfig; plan: DeckPl
     },
     {
       id: 'k-product',
-      title: 'OpenAtlas 产品能力',
+      title: 'InsightLab 产品能力',
       source: '产品路线图',
       detail: '覆盖数智员工、A2UI、AIPPT、公文写作、合同审核、创意白板和知识检索等场景能力。',
       status: 'ready',
@@ -56,14 +56,14 @@ export function buildOpenAtlasInvestorDemo(): { config: DeckConfig; plan: DeckPl
       id: 'demo-slide-1',
       sectionId: 's-open',
       index: 1,
-      title: 'OpenAtlas 数智员工平台',
+      title: 'InsightLab 数智员工平台',
       headline: '让 AI 从工具走向岗位，从对话走向可交付业务结果',
       bullets: ['A2UI 把 Agent 判断变成卡片、表单和画布节点。', '数智员工沉淀技能、知识、流程和审计链路。', '融资用于产品化、行业验证和渠道增长。'],
       visual: '深色科技封面 + 机会宣言',
       layout: 'cover',
       knowledgeIds: ['k-demo-note', 'k-product'],
       status: 'confirmed',
-      speakerNotes: '先用一句话定义 OpenAtlas：不是聊天机器人，而是企业可管理、可交付、可审计的数智员工平台。',
+      speakerNotes: '先用一句话定义 InsightLab：不是聊天机器人，而是企业可管理、可交付、可审计的数智员工平台。',
       designIntent: '大标题建立品类心智，右侧 Topic 卡强调投资人路演属性。',
       renderHints: ['emphasis=AI 从工具走向岗位', 'callout=融资路演样例数据'],
       evidenceRole: '正式路演需补充真实公司介绍、融资轮次和核心团队信息。',
@@ -74,7 +74,7 @@ export function buildOpenAtlasInvestorDemo(): { config: DeckConfig; plan: DeckPl
       index: 2,
       title: '为什么是现在',
       headline: '企业 AI 预算进入落地期，Agent 正从试点转向岗位化部署',
-      bullets: ['AI 应用试点从 Copilot 走向可交付流程。', '企业更关注合规、审计、知识沉淀和 ROI。', 'OpenAtlas 切入“人机协同交付”这一中间层。'],
+      bullets: ['AI 应用试点从 Copilot 走向可交付流程。', '企业更关注合规、审计、知识沉淀和 ROI。', 'InsightLab 切入“人机协同交付”这一中间层。'],
       visual: '左侧采用 Agent 落地成熟度折线，右侧三张窗口期指标卡',
       layout: 'metrics',
       knowledgeIds: ['k-market', 'k-demo-note'],
@@ -129,14 +129,14 @@ export function buildOpenAtlasInvestorDemo(): { config: DeckConfig; plan: DeckPl
       id: 'demo-slide-4',
       sectionId: 's-product',
       index: 4,
-      title: 'OpenAtlas 产品架构',
+      title: 'InsightLab 产品架构',
       headline: '用感知、记忆、规划、执行四层，把 Agent 变成可运营的岗位',
       bullets: ['感知层接入对话、文件、网页和业务系统。', '记忆层沉淀企业知识、技能和员工画像。', '规划与执行层生成 UI、调用工具并形成交付物。'],
       visual: '四层垂直架构图：感知 → 记忆 → 规划 → 执行',
       layout: 'diagram',
       knowledgeIds: ['k-product'],
       status: 'confirmed',
-      speakerNotes: '突出 OpenAtlas 不是单一模型封装，而是面向企业交付闭环的平台层。',
+      speakerNotes: '突出 InsightLab 不是单一模型封装，而是面向企业交付闭环的平台层。',
       designIntent: '分层架构帮助投资人理解产品边界和可扩展性。',
       renderHints: ['flow=layered', 'callout=可审计闭环'],
       visualSpec: {
@@ -173,21 +173,21 @@ export function buildOpenAtlasInvestorDemo(): { config: DeckConfig; plan: DeckPl
       sectionId: 's-product',
       index: 6,
       title: '三类产品能力对比',
-      headline: 'OpenAtlas 的差异在于“可交付、可审计、可运营”',
-      bullets: ['通用 Agent 强在回答，但缺少组织级记忆与交付流程。', 'RPA 强在固定流程，但难以处理开放语义任务。', 'OpenAtlas 把模型、流程、UI 和知识连成闭环。'],
-      visual: '三列对比矩阵：OpenAtlas vs 通用 Agent 平台 vs RPA 工具',
+      headline: 'InsightLab 的差异在于“可交付、可审计、可运营”',
+      bullets: ['通用 Agent 强在回答，但缺少组织级记忆与交付流程。', 'RPA 强在固定流程，但难以处理开放语义任务。', 'InsightLab 把模型、流程、UI 和知识连成闭环。'],
+      visual: '三列对比矩阵：InsightLab vs 通用 Agent 平台 vs RPA 工具',
       layout: 'compare',
       knowledgeIds: ['k-product', 'k-market'],
       status: 'confirmed',
       speakerNotes: '把竞品对比放在能力维度，而不是品牌名攻击。',
       designIntent: '用矩阵一眼呈现能力等级和护城河来源。',
-      renderHints: ['matrixTitle=能力差异矩阵', 'emphasis=OpenAtlas 全链路闭环'],
+      renderHints: ['matrixTitle=能力差异矩阵', 'emphasis=InsightLab 全链路闭环'],
       visualSpec: {
         type: 'matrix',
         title: '能力差异矩阵',
         description: '色块深浅表示能力完整度。',
         columns: [
-          { label: 'OpenAtlas', score: 'high', items: ['企业级记忆', '多 Agent 协同', 'A2UI 确认流', '交付物生成', '审计日志'] },
+          { label: 'InsightLab', score: 'high', items: ['企业级记忆', '多 Agent 协同', 'A2UI 确认流', '交付物生成', '审计日志'] },
           { label: '通用 Agent 平台', score: 'medium', items: ['模型能力强', '插件生态', '企业记忆弱', '交付流程弱', '审计链路不足'] },
           { label: 'RPA / 低代码', score: 'low', items: ['固定流程稳定', '开放语义弱', '知识沉淀弱', '多模态弱', '变更成本高'] },
         ],
@@ -262,7 +262,7 @@ export function buildOpenAtlasInvestorDemo(): { config: DeckConfig; plan: DeckPl
       layout: 'metrics',
       knowledgeIds: ['k-finance', 'k-demo-note'],
       status: 'confirmed',
-      speakerNotes: '强调 OpenAtlas 不是项目制外包，而是可复用、可规模化的软件平台。',
+      speakerNotes: '强调 InsightLab 不是项目制外包，而是可复用、可规模化的软件平台。',
       designIntent: '数字卡片突出经营杠杆。',
       renderHints: ['chart=scorecard', 'emphasis=经营杠杆'],
       visualSpec: {
@@ -323,7 +323,7 @@ export function buildOpenAtlasInvestorDemo(): { config: DeckConfig; plan: DeckPl
       sectionId: 's-close',
       index: 12,
       title: '本轮希望验证的三件事',
-      headline: '把 OpenAtlas 做成企业数智员工的操作系统',
+      headline: '把 InsightLab 做成企业数智员工的操作系统',
       bullets: ['完成核心融资，与产业资源共建标杆客户。', '优先验证 A2UI + 数智员工在高频交付物场景的留存。', '形成可复制的行业技能包和客户成功方法论。'],
       visual: '行动清单 + 结尾金句',
       layout: 'quote',
@@ -338,7 +338,7 @@ export function buildOpenAtlasInvestorDemo(): { config: DeckConfig; plan: DeckPl
   return {
     config: demoConfig,
     plan: {
-      title: 'OpenAtlas 数智员工融资汇报｜富图表样例',
+      title: 'InsightLab 数智员工融资汇报｜富图表样例',
       sections,
       slides,
       knowledge,

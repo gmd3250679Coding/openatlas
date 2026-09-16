@@ -25,7 +25,9 @@ Local:
 
 - Node/npm for frontend build
 - rsync
-- access to local isolated Hermes runtime at `~/.openatlas/hermes-runtime`
+- the bundled Hermes runtime source under `runtime/hermes/`
+- project-root `.env` is for local delivery only and is excluded from rsync;
+  production secrets remain in `/etc/openatlas/openatlas.env`
 
 ## Deploy
 
@@ -51,12 +53,13 @@ set real values for:
 
 - `OPENATLAS_SECRET`
 - `API_SERVER_KEY`
+- `TOKENHUB_API_KEY`
+- `TOKENHUB_BASE_URL`
 - `OPENATLAS_DEFAULT_PROVIDER`
 - `OPENATLAS_DEFAULT_PROVIDER_BASE_URL`
-- `OPENATLAS_DEFAULT_PROVIDER_API_KEY`
-- `OPENATLAS_FALLBACK_PROVIDER`
-- `OPENATLAS_FALLBACK_PROVIDER_BASE_URL`
-- `OPENATLAS_FALLBACK_PROVIDER_API_KEY`
+- `OPENATLAS_DEFAULT_PROVIDER_KEY_ENV`
+- `OPENATLAS_DEFAULT_MODEL`
+- `OPENATLAS_FALLBACK_MODEL`
 - `OPENATLAS_MAX_ACTIVE_RUNS_PER_TENANT`
 - `OPENATLAS_MAX_ACTIVE_RUNS_PER_USER`
 

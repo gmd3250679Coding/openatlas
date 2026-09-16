@@ -67,7 +67,7 @@ export default function MemoryCenter() {
             </div>
             <h2 style={{ margin: 0, fontSize: 44, letterSpacing: 0 }}>记忆中心</h2>
             <p style={{ color: 'var(--text-secondary)', maxWidth: 760, margin: '12px 0 0', lineHeight: 1.8 }}>
-              Hermes 负责真实运行时记忆能力，OpenAtlas 负责企业侧的作用域、权限、版本和注入可见性。全局/租户记忆只读共享，个人与自建员工记忆可定制，避免跨用户串记忆。
+              Hermes 负责真实运行时记忆能力，InsightLab 负责企业侧的作用域、权限、版本和注入可见性。全局/租户记忆只读共享，个人与自建员工记忆可定制，避免跨用户串记忆。
             </p>
           </div>
           <Button type="primary" onClick={() => setShowCreate(true)}>
@@ -76,8 +76,8 @@ export default function MemoryCenter() {
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12, marginTop: 24 }}>
           {[
-            ['Hermes 原生记忆', '保留底层 profiles / sessions / memory 注入能力，不在 OpenAtlas 中复制运行时。'],
-            ['OpenAtlas 治理层', '按 global / tenant / user / employee 管控可读、可改、可 Fork 和可绑定范围。'],
+            ['Hermes 原生记忆', '保留底层 profiles / sessions / memory 注入能力，不在 InsightLab 中复制运行时。'],
+            ['InsightLab 治理层', '按 global / tenant / user / employee 管控可读、可改、可 Fork 和可绑定范围。'],
             ['本轮输入来源', '聊天右侧会展示本轮实际注入的 Skill、文件片段和记忆，便于追溯。'],
           ].map(([title, detail]) => (
             <div key={title} style={{

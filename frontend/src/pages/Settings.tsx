@@ -9,7 +9,7 @@ import {
 /* ── Data ── */
 const apiKeys = [
   { name: '企业模型网关 Key', prefix: '由 Hermes Gateway 托管', lastUsed: '运行时代理' },
-  { name: 'OpenAtlas API Token', prefix: '按租户签发', lastUsed: '当前会话' },
+  { name: 'InsightLab API Token', prefix: '按租户签发', lastUsed: '当前会话' },
 ];
 
 const securityItems = [
@@ -283,8 +283,10 @@ export default function Settings() {
               {!modelsLoading && !modelsError && models.map((m) => (
                 <div className="setting-row" key={m.id || m.name}>
                   <div className="setting-row-left">
-                    <div className="setting-row-label">{m.id || m.name}</div>
-                    <div className="setting-row-desc">{m.owned_by || 'hermes'} · {m.object || 'model'}</div>
+                    <div className="setting-row-label">{m.name || m.id}</div>
+                    <div className="setting-row-desc">
+                      {m.id}{m.owned_by ? ` · ${m.owned_by}` : ''}{m.is_default ? ' · 默认' : ''}
+                    </div>
                   </div>
                   <div className="setting-row-right">
                     <span style={{ color: 'var(--text-tertiary)', fontSize: 12, fontFamily: 'var(--font-mono)' }}>

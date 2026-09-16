@@ -1,7 +1,7 @@
 /**
  * ToolCallPanel — collapsible panel showing the agent's tool activity.
  * Renders the Hermes `hermes.tool.progress` events surfaced through the
- * Atlas SSE stream (M2.3). Each tool shows name, label, and live status.
+ * InsightLab SSE stream (M2.3). Each tool shows name, label, and live status.
  */
 import { useState } from 'react';
 
@@ -26,7 +26,7 @@ export interface ToolCallItem {
 
 // Tool icon glyphs — single-character symbols, not decorative emoji.
 // Kept as code points (not <IconXxx />) so the row stays compact and
-// aligns with the dim mono text beside it. Per Atlas "calm console"
+// aligns with the dim mono text beside it. Per InsightLab "calm console"
 // guideline (DESIGN.md §3) we don't use full emoji in product UI.
 const TOOL_ICON: Record<string, string> = {
   terminal: '⌘',

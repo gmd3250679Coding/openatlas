@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BACKEND = ROOT / "backend"
 FRONTEND = ROOT / "frontend"
 SCRIPTS = ROOT / "scripts"
+BUNDLED_HERMES_RUNTIME = ROOT / "runtime" / "hermes"
 
 DEFAULT_OPENATLAS_HOME = Path.home() / ".openatlas"
 DEFAULT_TENANT = "demo"
@@ -135,6 +136,60 @@ def stop_process(label: str, proc: subprocess.Popen) -> None:
 
 def gateway_headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"}
+
+
+def ensure_hermes_runtime(args, env: dict[str, str]) -> Path:
+    runtime = args.hermes_runtime
+    source_markers = [
+        runtime / "pyproject.toml",
+        runtime / "gateway" / "platforms" / "api_server.py",
+    ]
+    missing = [str(path) for path in source_markers if not path.is_file()]
+    if missing:
+        raise DevStackError(
+            "bundled Hermes runtime source is incomplete: " + ", ".join(missing)
+        )
+
+    python = runtime / ".venv" / "bin" / "python"
+    check_env = env.copy()
+    check_env["PYTHONPATH"] = str(runtime)
+    healthy = False
+    if python.is_file() and os.access(python, os.X_OK):
+        probe = subprocess.run(
+            [
+                str(python),
+                "-c",
+                "import aiohttp; from gateway.config import PlatformConfig; "
+                "from gateway.platforms.api_server import APIServerAdapter",
+            ],
+            cwd=str(runtime),
+            env=check_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+        healthy = probe.returncode == 0
+    if healthy:
+        log(f"Hermes runtime ready at {runtime}")
+        return runtime
+
+    setup_script = SCRIPTS / "setup-hermes-runtime.sh"
+    if not setup_script.is_file():
+        raise DevStackError(f"missing Hermes runtime setup script: {setup_script}")
+    log(f"preparing bundled Hermes runtime at {runtime}")
+    setup_env = env.copy()
+    setup_env["OPENATLAS_HERMES_AGENT_ROOT"] = str(runtime)
+    proc = subprocess.run(
+        ["bash", str(setup_script)],
+        cwd=str(ROOT),
+        env=setup_env,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise DevStackError(
+            f"Hermes runtime setup failed with exit code {proc.returncode}"
+        )
+    return runtime
 
 
 def ensure_gateway(args, env: dict[str, str], owned: list[tuple[str, subprocess.Popen]]) -> str:
@@ -267,7 +322,7 @@ def build_env(args) -> dict[str, str]:
             "API_SERVER_KEY": args.api_key,
             "OPENATLAS_FRONTEND_PORT": str(args.frontend_port),
             "OPENATLAS_BACKEND_PORT": str(args.backend_port),
-            "OPENATLAS_HERMES_AGENT_ROOT": str(args.openatlas_home / "hermes-runtime"),
+            "OPENATLAS_HERMES_AGENT_ROOT": str(args.hermes_runtime),
             "OPENATLAS_API_BASE": f"http://127.0.0.1:{args.backend_port}/api",
             "OPENATLAS_E2E_BASE_URL": f"http://127.0.0.1:{args.frontend_port}",
             "OPENATLAS_E2E_API_BASE": f"http://127.0.0.1:{args.backend_port}/api",
@@ -281,6 +336,12 @@ def build_env(args) -> dict[str, str]:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Start OpenAtlas local stack and run quality checks.")
     parser.add_argument("--openatlas-home", type=Path, default=DEFAULT_OPENATLAS_HOME)
+    parser.add_argument(
+        "--hermes-runtime",
+        type=Path,
+        default=BUNDLED_HERMES_RUNTIME,
+        help="Hermes Agent source root (defaults to runtime/hermes in this checkout).",
+    )
     parser.add_argument("--tenant", default=DEFAULT_TENANT)
     parser.add_argument("--gateway-port", type=int, default=DEFAULT_GATEWAY_PORT)
     parser.add_argument("--backend-port", type=int, default=DEFAULT_BACKEND_PORT)
@@ -298,10 +359,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     args.openatlas_home = args.openatlas_home.resolve()
+    args.hermes_runtime = args.hermes_runtime.resolve()
     env = build_env(args)
     owned: list[tuple[str, subprocess.Popen]] = []
 
     try:
+        ensure_hermes_runtime(args, env)
         gateway = ensure_gateway(args, env, owned)
         backend = ensure_backend(args, env, owned)
         frontend = ensure_frontend(args, env, owned)
@@ -309,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             "gateway": gateway,
             "backend": backend,
             "frontend": frontend,
+            "hermes_runtime": str(args.hermes_runtime),
             "owned_processes": [{"label": label, "pid": proc.pid} for label, proc in owned],
         }
         log(json.dumps(summary, ensure_ascii=False, indent=2))

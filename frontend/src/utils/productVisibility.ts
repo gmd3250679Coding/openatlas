@@ -73,6 +73,6 @@ export function sanitizedSourceLabel(sourceRef?: string | null) {
   if (sourceRef.startsWith('hermes:')) return 'Hermes';
   if (sourceRef.startsWith('zip:')) return 'Private ZIP';
   if (sourceRef.startsWith('/Users/') || sourceRef.startsWith('file:')) return 'Private Source';
-  if (/^[0-9a-f-]{16,}$/i.test(sourceRef)) return 'OpenAtlas';
+  if (/^[0-9a-f-]{16,}$/i.test(sourceRef)) return 'InsightLab';
   return sourceRef.length > 18 ? `${sourceRef.slice(0, 18)}...` : sourceRef;
 }

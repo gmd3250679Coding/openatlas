@@ -1,4 +1,4 @@
-"""OpenAtlas backend settings.
+"""InsightLab backend settings.
 
 Always absolute paths. Never $HOME dependent. Reads OPENATLAS_HOME/HERMES_HOME
 from env (set by start.sh).
@@ -36,9 +36,12 @@ OPENATLAS_PROJECT_ROOT = Path(
 ).resolve()
 TENANT_HOME = OPENATLAS_HOME / "hermes-tenants" / os.environ.get("OPENATLAS_TENANT", "demo")
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(TENANT_HOME / ".hermes"))).resolve()
-# Phase 2: path to the OpenAtlas-owned hermes-agent source tree (NEVER ~/.hermes/hermes-agent)
+# Phase 2: path to the InsightLab-owned hermes-agent source tree (NEVER ~/.hermes/hermes-agent)
 OPENATLAS_HERMES_AGENT_ROOT = Path(
-    os.environ.get("OPENATLAS_HERMES_AGENT_ROOT", str(OPENATLAS_HOME / "hermes-runtime"))
+    os.environ.get(
+        "OPENATLAS_HERMES_AGENT_ROOT",
+        str(OPENATLAS_PROJECT_ROOT / "runtime" / "hermes"),
+    )
 ).resolve()
 
 DATA_DIR = OPENATLAS_HOME / "backend-data"

@@ -89,7 +89,7 @@ export default function Skills() {
           <div className="admin-kicker">Capability Control</div>
           <h1 className="admin-title">技能中心 Skills</h1>
           <p className="admin-subtitle">
-            浏览当前租户可用技能，并把 Hermes / OpenAtlas 技能绑定到具体数智员工。
+            浏览当前租户可用技能，并把 Hermes / InsightLab 技能绑定到具体数智员工。
           </p>
         </div>
         <div className="admin-actions">

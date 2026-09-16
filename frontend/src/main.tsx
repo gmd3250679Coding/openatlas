@@ -7,7 +7,7 @@ import App from './App';
 import './index.css';
 
 // ============================================================
-// Theme — Atlas Design System
+// Theme — InsightLab Design System
 // Single source of truth: CSS variables in styles/atlas-design.css
 // AntD tokens here are aliased to those CSS variables so the two
 // systems never drift apart.
@@ -60,7 +60,7 @@ function Root() {
         theme={{
           algorithm: isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm,
           token: {
-            // Brand — Atlas Indigo-Violet, matches --accent in CSS
+            // Brand — InsightLab Indigo-Violet, matches --accent in CSS
             colorPrimary: isDark ? '#8B7FE8' : '#4F46E5',
             colorSuccess: isDark ? '#34D399' : '#10B981',
             colorWarning: isDark ? '#FBBF24' : '#F59E0B',

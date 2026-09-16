@@ -1,4 +1,4 @@
-"""OpenAtlas SQLAlchemy models.
+"""InsightLab SQLAlchemy models.
 
 Strict four-scope model: global / tenant / user / employee.
 IDs are UUID strings (not integers).
@@ -188,7 +188,7 @@ class HermesRuntime(Base):
 
 
 class DigitalEmployee(Base):
-    """OpenAtlas-side metadata for a digital employee. Profile name maps to Hermes session metadata."""
+    """InsightLab-side metadata for a digital employee. Profile name maps to Hermes session metadata."""
     __tablename__ = "digital_employees"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
@@ -211,7 +211,7 @@ class DigitalEmployee(Base):
 
 
 class SessionRecord(Base):
-    """OpenAtlas-side session metadata.  Hermes session_id is the real session reference."""
+    """InsightLab-side session metadata.  Hermes session_id is the real session reference."""
     __tablename__ = "sessions"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
@@ -259,7 +259,7 @@ class SessionRun(Base):
 
 
 class SessionRunEvent(Base):
-    """Append-only runtime event log for replaying a Hermes/OpenAtlas task turn."""
+    """Append-only runtime event log for replaying a Hermes/InsightLab task turn."""
     __tablename__ = "session_run_events"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
@@ -277,7 +277,7 @@ class SessionRunEvent(Base):
 class CollaborationTemplate(Base):
     """Reusable group/session orchestration template.
 
-    This stores the OpenAtlas-side orchestration shape so a proven group chat
+    This stores the InsightLab-side orchestration shape so a proven group chat
     can be reused without turning it into a Hermes Skill file.
     """
     __tablename__ = "collaboration_templates"
@@ -455,7 +455,7 @@ class JobStatus(str, enum.Enum):
 
 
 class Job(Base):
-    """Phase 3.5 — OpenAtlas-side cron job metadata. Hermes has only a
+    """Phase 3.5 — InsightLab-side cron job metadata. Hermes has only a
     read-only `/api/jobs` endpoint, so we own the schedule + state here.
     `run()` proxies to the tenant Hermes via `hermes_client.stream_chat`
     with a synthetic message built from the job prompt."""
@@ -482,7 +482,7 @@ class Job(Base):
 
 
 class SkillPackage(Base):
-    """OpenAtlas-side skill metadata (not the actual Hermes skill file)."""
+    """InsightLab-side skill metadata (not the actual Hermes skill file)."""
     __tablename__ = "skill_packages"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     scope: Mapped[Scope] = mapped_column(SqlEnum(Scope), index=True)
@@ -588,7 +588,7 @@ class FileAsset(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
-# P3.12 (2026-06-07): MessageRecord 表 — OpenAtlas 侧 sanitized messages
+# P3.12 (2026-06-07): MessageRecord 表 — InsightLab 侧 sanitized messages
 # 用于切历史会话时不暴露 system_prompt / context / file_context 注入
 class MessageRecord(Base):
     __tablename__ = "messages"
@@ -638,7 +638,7 @@ class TaskArtifact(Base):
 
 
 class ContextInjection(Base):
-    """What OpenAtlas injected into a model turn: skills, files, memories."""
+    """What InsightLab injected into a model turn: skills, files, memories."""
     __tablename__ = "context_injections"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)

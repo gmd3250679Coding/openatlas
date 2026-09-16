@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 
@@ -64,30 +65,37 @@ def isolation_guard() -> None:
     print(f"  API_SERVER_KEY    = {os.environ['API_SERVER_KEY'][:8]}***")
 
 
+def _tencent_model_catalog() -> dict:
+    catalog_path = Path(__file__).resolve().parents[1] / "config" / "tencent-models.json"
+    payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    if not isinstance(payload.get("models"), list) or not payload["models"]:
+        raise RuntimeError(f"Tencent model catalog is empty: {catalog_path}")
+    return payload
+
+
 def _openatlas_config_text() -> str:
-    model = os.environ.get("OPENATLAS_DEFAULT_MODEL", "mimo-v2.5-pro")
-    provider = os.environ.get(
-        "OPENATLAS_DEFAULT_PROVIDER",
-        "custom:xiaomimimo",
+    catalog = _tencent_model_catalog()
+    model = os.environ.get("OPENATLAS_DEFAULT_MODEL", str(catalog["defaultModel"]))
+    provider = os.environ.get("OPENATLAS_DEFAULT_PROVIDER", str(catalog["providerId"]))
+    provider_name = str(catalog["vendor"])
+    provider_base_url = (
+        os.environ.get("TOKENHUB_BASE_URL")
+        or os.environ.get("OPENATLAS_DEFAULT_PROVIDER_BASE_URL")
+        or str(catalog["baseUrl"])
     )
-    provider_name = provider.removeprefix("custom:")
-    provider_base_url = os.environ.get(
-        "OPENATLAS_DEFAULT_PROVIDER_BASE_URL",
-        "https://api.xiaomimimo.com/v1",
+    provider_key_env = os.environ.get(
+        "OPENATLAS_DEFAULT_PROVIDER_KEY_ENV",
+        str(catalog["apiKeyEnv"]),
     )
-    provider_api_key = os.environ.get(
-        "OPENATLAS_DEFAULT_PROVIDER_API_KEY",
-        "__SET_OPENATLAS_DEFAULT_PROVIDER_API_KEY__",
+    fallback_model = os.environ.get("OPENATLAS_FALLBACK_MODEL", str(catalog["fallbackModel"]))
+    model_rows = "\n".join(
+        f"      {json.dumps(str(item['id']))}: {{}}" for item in catalog["models"]
     )
-    fallback_model = os.environ.get("OPENATLAS_FALLBACK_MODEL", "deepseek-v4-flash")
-    fallback_provider = os.environ.get("OPENATLAS_FALLBACK_PROVIDER", "custom:deepseek")
-    fallback_provider_name = fallback_provider.removeprefix("custom:")
-    fallback_base_url = os.environ.get("OPENATLAS_FALLBACK_PROVIDER_BASE_URL", "https://api.deepseek.com")
-    fallback_api_key = os.environ.get("OPENATLAS_FALLBACK_PROVIDER_API_KEY", "")
-    return f"""# OpenAtlas tenant Hermes config
+    return f"""# InsightLab-managed tenant Hermes config v2
 model:
   default: {json.dumps(model)}
   provider: {json.dumps(provider)}
+  base_url: {json.dumps(provider_base_url)}
 toolsets:
   - hermes-cli
 agent:
@@ -98,29 +106,30 @@ terminal:
   backend: local
   cwd: .
   timeout: 60
-custom_providers:
-  - name: {json.dumps(provider_name)}
-    base_url: {json.dumps(provider_base_url)}
-    api_key: {json.dumps(provider_api_key)}
-    model: {json.dumps(model)}
-  - name: {json.dumps(fallback_provider_name)}
-    base_url: {json.dumps(fallback_base_url)}
-    api_key: {json.dumps(fallback_api_key)}
-    model: {json.dumps(fallback_model)}
+providers:
+  {json.dumps(provider)}:
+    name: {json.dumps(provider_name, ensure_ascii=False)}
+    api: {json.dumps(provider_base_url)}
+    key_env: {json.dumps(provider_key_env)}
+    transport: openai_chat
+    default_model: {json.dumps(model)}
+    discover_models: false
+    models:
+{model_rows}
 fallback_providers:
-  - provider: {json.dumps(fallback_provider)}
+  - provider: {json.dumps(provider)}
     model: {json.dumps(fallback_model)}
-    base_url: {json.dumps(fallback_base_url)}
-    api_key: {json.dumps(fallback_api_key)}
+    base_url: {json.dumps(provider_base_url)}
+    key_env: {json.dumps(provider_key_env)}
 """
 
 
 def _config_needs_openatlas_migration(text: str) -> bool:
     """Detect old or incomplete tenant config that Hermes cannot route.
 
-    Earlier OpenAtlas releases wrote a legacy Hermes shape like
+    Earlier InsightLab releases wrote a legacy Hermes shape like
     `model: mimo-v2.5-pro` plus `providers.custom`. Newer Hermes expects a
-    provider-aware model block and named custom/fallback providers. Preserving
+    provider-aware model block and named/fallback providers. Preserving
     the legacy file makes `/models` look healthy while chat fails with
     "No inference provider configured", so we migrate only that stale shape.
     """
@@ -129,19 +138,36 @@ def _config_needs_openatlas_migration(text: str) -> bool:
     has_model_block = bool(re.search(r"(?m)^model:\s*$", text))
     has_provider_field = bool(re.search(r"(?m)^\s+provider:\s*", text))
     has_default_field = bool(re.search(r"(?m)^\s+default:\s*", text))
+    has_named_providers = bool(re.search(r"(?m)^providers:\s*$", text))
     has_custom_providers = bool(re.search(r"(?m)^custom_providers:\s*$", text))
     has_fallback_providers = bool(re.search(r"(?m)^fallback_providers:\s*$", text))
     has_legacy_custom = bool(re.search(r"(?m)^providers:\s*$", text) and re.search(r"(?m)^\s+custom:\s*$", text))
     has_legacy_fallbacks = bool(re.search(r"(?m)^fallbacks:\s*$", text))
     has_scalar_model = bool(re.search(r"(?m)^model:\s*\S+", text))
-    provider_key = os.environ.get("OPENATLAS_DEFAULT_PROVIDER_API_KEY", "").strip()
-    has_provider_key_placeholder = "__SET_OPENATLAS_DEFAULT_PROVIDER_API_KEY__" in text
+    managed_config = text.startswith("# OpenAtlas tenant Hermes config") or text.startswith(
+        "# InsightLab-managed tenant Hermes config"
+    )
+    catalog = _tencent_model_catalog()
+    expected_provider = os.environ.get("OPENATLAS_DEFAULT_PROVIDER", str(catalog["providerId"]))
+    expected_model = os.environ.get("OPENATLAS_DEFAULT_MODEL", str(catalog["defaultModel"]))
+    managed_config_is_current = (
+        "# InsightLab-managed tenant Hermes config v2" in text
+        and f"provider: {json.dumps(expected_provider)}" in text
+        and f"default: {json.dumps(expected_model)}" in text
+        and all(json.dumps(str(item["id"])) + ":" in text for item in catalog["models"])
+    )
     return (
         has_scalar_model
         or has_legacy_custom
         or has_legacy_fallbacks
-        or (has_provider_key_placeholder and bool(provider_key) and provider_key != "__SET_OPENATLAS_DEFAULT_PROVIDER_API_KEY__")
-        or not (has_model_block and has_provider_field and has_default_field and has_custom_providers and has_fallback_providers)
+        or (managed_config and not managed_config_is_current)
+        or not (
+            has_model_block
+            and has_provider_field
+            and has_default_field
+            and (has_named_providers or has_custom_providers)
+            and has_fallback_providers
+        )
     )
 
 
@@ -172,14 +198,13 @@ def setup_hermes_home() -> None:
             config_state = f"migrated legacy config; backup={backup_path.name}"
         else:
             config_state = "preserved"
-    if not (hermes_home / ".env").exists():
-        (hermes_home / ".env").write_text(
-            f"""# OpenAtlas demo tenant env
-API_SERVER_HOST={os.environ.get('API_SERVER_HOST', '127.0.0.1')}
-API_SERVER_PORT={os.environ.get('API_SERVER_PORT', '58642')}
-API_SERVER_KEY={os.environ.get('API_SERVER_KEY', '')}
-HERMES_AGENT_NAME=openatlas-demo
-"""
+    project_env = Path(__file__).resolve().parents[2] / ".env"
+    provider_key_env = str(_tencent_model_catalog()["apiKeyEnv"])
+    if not os.environ.get(provider_key_env, "").strip():
+        print(
+            f"[hermes-home] WARNING: {provider_key_env} is empty; "
+            f"set it in {project_env} before making model calls",
+            file=sys.stderr,
         )
     print(f"[hermes-home] ready {hermes_home} (config {config_state})")
 
@@ -188,14 +213,15 @@ def _isolated_hermes_agent_root() -> str:
     """Return the path to the OpenAtlas-owned hermes-agent source tree.
 
     Hard rule: OpenAtlas must NOT import from ~/.hermes/hermes-agent/.
-    Falls back to OPENATLAS_RUNTIME/hermes-runtime/ if .openatlas/hermes-agent
-    doesn't exist (legacy path).
+    Prefer the source bundled in this OpenAtlas checkout. Legacy data-root
+    paths remain as fallbacks for older deployments.
     """
     explicit = os.environ.get("OPENATLAS_HERMES_AGENT_ROOT")
-    if explicit and Path(explicit).is_dir():
+    if explicit and (Path(explicit) / "gateway" / "platforms" / "api_server.py").is_file():
         return explicit
     openatlas_home = os.environ.get("OPENATLAS_HOME", "")
     candidates = [
+        Path(__file__).resolve().parents[1] / "hermes",
         Path(openatlas_home) / "hermes-agent",
         Path(openatlas_home) / "hermes-runtime",
     ]
@@ -220,6 +246,44 @@ async def main_async() -> None:
 
     from gateway.platforms.api_server import APIServerAdapter
     from gateway.config import PlatformConfig
+    from aiohttp import web
+
+    class InsightLabAPIServerAdapter(APIServerAdapter):
+        async def _handle_models(self, request):
+            """Advertise the configured Tencent Cloud Token Plan catalog."""
+            auth_err = self._check_auth(request)
+            if auth_err:
+                return auth_err
+            catalog = _tencent_model_catalog()
+            created = int(time.time())
+            vendor = str(catalog["vendor"])
+            provider = str(catalog["providerId"])
+            default_model = str(catalog["defaultModel"])
+            return web.json_response({
+                "object": "list",
+                "provider": {
+                    "id": provider,
+                    "name": vendor,
+                    "base_url": str(catalog["baseUrl"]),
+                    "api_key_env": str(catalog["apiKeyEnv"]),
+                    "default_model": default_model,
+                },
+                "data": [
+                    {
+                        "id": str(item["id"]),
+                        "name": str(item["name"]),
+                        "object": "model",
+                        "created": created,
+                        "owned_by": vendor,
+                        "provider": provider,
+                        "root": str(item["id"]),
+                        "parent": None,
+                        "permission": [],
+                        "is_default": str(item["id"]) == default_model,
+                    }
+                    for item in catalog["models"]
+                ],
+            })
 
     host = os.environ["API_SERVER_HOST"]
     port = int(os.environ["API_SERVER_PORT"])
@@ -232,9 +296,10 @@ async def main_async() -> None:
             "port": port,
             "key": key,
             "cors_origins": "*",
+            "model_name": str(_tencent_model_catalog()["defaultModel"]),
         },
     )
-    adapter = APIServerAdapter(cfg)
+    adapter = InsightLabAPIServerAdapter(cfg)
     print(f"[launcher] starting Hermes API server on http://{host}:{port}")
     ok = await adapter.connect()
     if not ok:

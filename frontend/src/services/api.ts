@@ -1,5 +1,5 @@
 /**
- * OpenAtlas API service — all data from backend, no mock.
+ * InsightLab API service — all data from backend, no mock.
  *
  * ID model: per spec §3.3, all entity IDs are UUID strings.  To minimize
  * touching the existing component code that uses `number | null` for
@@ -832,8 +832,8 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
     const raw = String(err?.message || err || '');
     const hint = typeof window !== 'undefined' && /wangsix-atlas\.cloud/i.test(window.location.hostname)
       ? '当前域名可能被云厂商备案/拦截页接管，请先使用公网 IP 入口访问。'
-      : '请确认 OpenAtlas 后端服务已启动，并且当前访问入口可以连到 /api。';
-    throw new Error(`OpenAtlas API 暂时不可达。${hint}${raw ? ` 原始错误：${raw}` : ''}`);
+      : '请确认 InsightLab 后端服务已启动，并且当前访问入口可以连到 /api。';
+    throw new Error(`InsightLab API 暂时不可达。${hint}${raw ? ` 原始错误：${raw}` : ''}`);
   }
   if (response.status === 401) {
     localStorage.removeItem(TOKEN_KEY);

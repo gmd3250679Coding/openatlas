@@ -12,7 +12,7 @@ APP_ROOT="${APP_ROOT:-/opt/openatlas}"
 DATA_ROOT="${DATA_ROOT:-/var/lib/openatlas}"
 RELEASE_ID="${RELEASE_ID:-$(date +%Y%m%d%H%M%S)}"
 REMOTE_RELEASE="$APP_ROOT/releases/$RELEASE_ID"
-HERMES_RUNTIME_SRC="${HERMES_RUNTIME_SRC:-$HOME/.openatlas/hermes-runtime}"
+HERMES_RUNTIME_SRC="${HERMES_RUNTIME_SRC:-$PROJECT_ROOT/runtime/hermes}"
 ENABLE_HTTPS="${ENABLE_HTTPS:-0}"
 INSTALL_OFFICE_QA_DEPS="${INSTALL_OFFICE_QA_DEPS:-1}"
 SSH_OPTS="${SSH_OPTS:-}"
@@ -49,6 +49,7 @@ log "syncing OpenAtlas release"
 rsync -az --delete -e "$RSYNC_RSH" \
   --exclude '.git/' \
   --exclude '.DS_Store' \
+  --exclude '.env' \
   --exclude 'backend/.venv/' \
   --exclude 'backend/__pycache__/' \
   --exclude 'backend/.local/' \

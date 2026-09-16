@@ -117,7 +117,7 @@ const DRAFT_KINDS: Array<{ value: DraftKind; label: string }> = [
 const TEMPLATE_CARDS: Array<{ kind: DraftKind; title: string; prompt: string }> = [
   { kind: 'flowchart', title: '业务流程', prompt: '需求收集，方案设计，评审确认，执行交付，复盘优化' },
   { kind: 'ppt', title: '路演故事线', prompt: '问题背景，市场机会，解决方案，产品能力，商业价值，下一步计划' },
-  { kind: 'architecture', title: '企业 AI 架构', prompt: '用户入口，API 网关，Atlas 服务，Agent Runtime，文件存储，审计日志' },
+  { kind: 'architecture', title: '企业 AI 架构', prompt: '用户入口，API 网关，InsightLab 服务，Agent Runtime，文件存储，审计日志' },
   { kind: 'wireframe', title: 'SaaS 工作台', prompt: '侧边导航，顶部状态，核心工作区，右侧属性，结果列表，生成按钮' },
 ];
 
@@ -618,10 +618,10 @@ export default function Whiteboard() {
     }
     const pptx = new PptxGenJS();
     pptx.layout = 'LAYOUT_WIDE';
-    pptx.author = 'OpenAtlas';
-    pptx.subject = 'Atlas creative whiteboard export';
+    pptx.author = 'InsightLab';
+    pptx.subject = 'InsightLab creative whiteboard export';
     pptx.title = title;
-    pptx.company = 'OpenAtlas';
+    pptx.company = 'InsightLab';
     const slideFrames = findPptSlideFrames(elements);
     if (slideFrames.length > 1) {
       for (const frame of slideFrames) {
@@ -654,7 +654,7 @@ export default function Whiteboard() {
     const slide = pptx.addSlide();
     slide.background = { color: 'FFFFFF' };
     slide.addImage({ data, x: 0.25, y: 0.2, w: 12.83, h: 7.1, sizing: { type: 'contain', x: 0.25, y: 0.2, w: 12.83, h: 7.1 } });
-    slide.addNotes(`Exported from Atlas 创意白板: ${title}`);
+    slide.addNotes(`Exported from InsightLab 创意白板: ${title}`);
     await pptx.writeFile({ fileName: `${safeFileTitle(title)}.pptx` });
   }, [currentScene, messageApi, title]);
 
@@ -858,7 +858,7 @@ export default function Whiteboard() {
         <section className="whiteboard-panel">
           <div className="whiteboard-panel-title">
             <BulbOutlined />
-            Atlas Skills
+            InsightLab Skills
           </div>
           <Select
             value={draftKind}

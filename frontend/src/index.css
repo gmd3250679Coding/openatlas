@@ -620,7 +620,7 @@
   }
 }
 
-/* Auth refinement - Atlas One pet parade */
+/* Auth refinement - InsightLab One pet parade */
 .atlas-auth-page {
   grid-template-columns: minmax(520px, 1fr) minmax(360px, 520px);
   gap: clamp(28px, 6vw, 96px);
@@ -1398,7 +1398,7 @@
 }
 
 /* ============================================================
-   Workforce — Atlas ID Badge (vertical, employee badge style)
+   Workforce — InsightLab ID Badge (vertical, employee badge style)
    ============================================================ */
 
 .workforce-page {

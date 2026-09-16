@@ -1,5 +1,5 @@
 /* ============================================================
-   Atlas Design Language v2 — CSS Variables & Foundation
+   InsightLab Design Language v2 — CSS Variables & Foundation
    Brand: 靛紫灰 Indigo-Violet (#4F46E5 light / #8B7FE8 dark)
    Apple WWDC-inspired enterprise AI design system
    ============================================================ */
@@ -21,7 +21,7 @@
   --text-inverse: #F5F5F7;
   --text-placeholder: #C7C7CC;
 
-  /* Accent — Atlas Indigo-Violet, used ≤5% of page */
+  /* Accent — InsightLab Indigo-Violet, used ≤5% of page */
   --accent: #4F46E5;
   --accent-soft: rgba(79, 70, 229, 0.07);
   --accent-hover: #4338CA;
@@ -99,7 +99,7 @@ html[data-theme="dark"] {
 }
 
 /* ============================================================
-   Atlas Phase A Tokens (added 2026-06-03, see docs/DESIGN.md)
+   InsightLab Phase A Tokens (added 2026-06-03, see docs/DESIGN.md)
    5 套 token: --font-prose / --shadow-popover / --sider-* /
                 --workspace-* / --composer-* / --activity-* /
                 --tool-card / --thinking-card / --profile-*
@@ -652,7 +652,7 @@ button {
 }
 
 /* ============================================================
-   Atlas M3.5 — UI 升级层 (2026-06-04)
+   InsightLab M3.5 — UI 升级层 (2026-06-04)
    原则:Calm Console / 玻璃态增强 / 微动效 / 角色色带 / AI 原生
    依赖 token,不改 9 套基础;新增 5 套 motion 派生 token
    ============================================================ */

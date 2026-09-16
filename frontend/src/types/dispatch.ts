@@ -1,7 +1,7 @@
 /**
  * types/dispatch.ts — Phase B 拆分 (2026-06-04)
  *
- * 统一 Atlas CommandCenter 三栏的 dispatch 数据模型,把 CommandCenter 内部
+ * 统一 InsightLab CommandCenter 三栏的 dispatch 数据模型,把 CommandCenter 内部
  * Tunnel(用 lines / done 字段)和 DispatchPanel 的 TunnelSpec(用 outputLines /
  * isComplete 字段)的命名差异收敛到单一真相,后续 RightAside 直接渲染
  * DispatchPanel,不再做手搓的 <aside>。

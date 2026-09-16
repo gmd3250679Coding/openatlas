@@ -92,8 +92,8 @@ export default function BasicLayout() {
       {/* Sidebar */}
       <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
         <div className="sidebar-header">
-          <div className="sidebar-logo">A</div>
-          <div className="sidebar-brand">Atlas</div>
+          <div className="sidebar-logo">I</div>
+          <div className="sidebar-brand">InsightLab</div>
         </div>
         <nav className="sidebar-nav">
           <div className="nav-section">
@@ -138,7 +138,7 @@ export default function BasicLayout() {
               {collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
             </button>
             <div className="topbar-breadcrumb">
-              Atlas / <span>{pageLabel}</span>
+              InsightLab / <span>{pageLabel}</span>
             </div>
           </div>
           <div className="topbar-right">

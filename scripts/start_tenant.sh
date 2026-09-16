@@ -18,14 +18,11 @@ fi
 
 # ── All env vars are injected by the backend caller; we just guard. ─────
 : "${OPENATLAS_HOME:=${HOME:-/tmp}/.openatlas}"
-: "${OPENATLAS_HERMES_AGENT_ROOT:=$OPENATLAS_HOME/hermes-runtime}"
 : "${API_SERVER_HOST:=127.0.0.1}"
 : "${API_SERVER_PORT:?API_SERVER_PORT not set}"
 : "${API_SERVER_KEY:?API_SERVER_KEY not set}"
 
 LOCAL_HERMES_HOME="${HOME:-/tmp}/.hermes"
-HERMES_RUNTIME="$OPENATLAS_HERMES_AGENT_ROOT"
-HERMES_PY="$HERMES_RUNTIME/.venv/bin/python3"
 # Project root is the parent of the scripts/ dir, NOT of OPENATLAS_HOME.
 # We locate it by finding a directory that contains runtime/launchers/hermes_api_server.py.
 PROJECT_ROOT=""
@@ -48,6 +45,18 @@ if [[ -z "$PROJECT_ROOT" ]]; then
   echo "[start_tenant.sh][FATAL] cannot locate project root (no runtime/launchers/hermes_api_server.py found)" >&2
   exit 1
 fi
+
+# Use the project-level delivery configuration for provider credentials. The
+# tenant home contains runtime state only and must not be the key source.
+if [[ -f "$PROJECT_ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$PROJECT_ROOT/.env"
+  set +a
+fi
+: "${OPENATLAS_HERMES_AGENT_ROOT:=$PROJECT_ROOT/runtime/hermes}"
+HERMES_RUNTIME="$OPENATLAS_HERMES_AGENT_ROOT"
+HERMES_PY="$HERMES_RUNTIME/.venv/bin/python3"
 LAUNCHER="$PROJECT_ROOT/runtime/launchers/hermes_api_server.py"
 
 # Resolve to absolute
@@ -73,7 +82,9 @@ if [[ ! -d "$HERMES_RUNTIME" ]]; then
   echo "[start_tenant.sh][FATAL] hermes-runtime not found at $HERMES_RUNTIME" >&2; exit 1
 fi
 if [[ ! -x "$HERMES_PY" ]]; then
-  echo "[start_tenant.sh][FATAL] hermes-runtime venv not at $HERMES_PY" >&2; exit 1
+  echo "[start_tenant.sh][FATAL] Hermes environment not found at $HERMES_PY" >&2
+  echo "Run: bash $PROJECT_ROOT/scripts/setup-hermes-runtime.sh" >&2
+  exit 1
 fi
 
 # ── Layer 4: refuse collision ports ───────────────────────────────────────

@@ -202,7 +202,7 @@ export default function AipptOfflineDemo() {
         <div>
           <Tag color="blue">AIPPT Offline Demo</Tag>
           <h1>Schema 驱动 AI PPT 离线演示</h1>
-          <p>使用 Mock Agent、Local Storage 和 HTML Renderer，不连接 OpenAtlas 后端也能跑通生成、编辑、保存、回退和预览。</p>
+          <p>使用 Mock Agent、Local Storage 和 HTML Renderer，不连接 InsightLab 后端也能跑通生成、编辑、保存、回退和预览。</p>
         </div>
         <div className="aippt-offline-hero__meta">
           <span><FilePptOutlined /> {plan.slides.length} 页</span>

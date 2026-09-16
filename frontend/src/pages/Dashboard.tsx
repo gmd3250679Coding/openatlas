@@ -262,7 +262,7 @@ function PriorityActions({
       ? { tone: 'danger', title: 'Runtime 需要检查', detail: 'Gateway 或 Hermes Runtime 状态异常，优先确认模型与 Skill 是否可用。' }
       : null,
     num(signals.stale_sessions) > 0
-      ? { tone: 'warning', title: `${num(signals.stale_sessions)} 个任务正在后台处理`, detail: 'Atlas 会继续自动同步结果；必要时可查看回放和检查点。', action: '查看后台任务' }
+      ? { tone: 'warning', title: `${num(signals.stale_sessions)} 个任务正在后台处理`, detail: 'InsightLab 会继续自动同步结果；必要时可查看回放和检查点。', action: '查看后台任务' }
       : null,
     num(data.failure_rate) > 0.08
       ? { tone: 'danger', title: '会话失败率偏高', detail: `当前失败率 ${Math.round(num(data.failure_rate) * 1000) / 10}%，建议查看审计日志和最近工具错误。` }

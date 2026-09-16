@@ -32,7 +32,7 @@ export default function Solutions() {
         letterSpacing: '-0.02em', margin: 0, lineHeight: 1.2,
       }}>行业方案</h1>
       <p style={{ fontSize: 13, color: 'var(--text-secondary)', margin: '6px 0 28px' }}>
-        面向不同行业的数智员工解决方案 · 一键部署 Atlas 子集
+        面向不同行业的数智员工解决方案 · 一键部署 InsightLab 子集
       </p>
 
       <div style={{

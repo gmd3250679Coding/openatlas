@@ -1,5 +1,5 @@
 /* ============================================================
-   Atlas Layout Styles — Glassmorphism Sidebar + Topbar
+   InsightLab Layout Styles — Glassmorphism Sidebar + Topbar
    ============================================================ */
 
 /* --- Layout Shell --- */
@@ -71,10 +71,10 @@
 }
 
 .sidebar-brand {
-  font-size: 16px;
+  font-size: 13px;
   font-weight: var(--fw-bold);
   color: var(--text-primary);
-  letter-spacing: var(--ls-page);
+  letter-spacing: -0.02em;
   white-space: nowrap;
   overflow: hidden;
 }

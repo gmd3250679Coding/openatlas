@@ -1,5 +1,5 @@
 // ============================================================
-// Atlas SVG Icon System
+// InsightLab SVG Icon System
 // All icons: stroke-width 1.5, round caps, currentColor
 // Zero emoji. Every icon is an inline SVG component.
 // ============================================================

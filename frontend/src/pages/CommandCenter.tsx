@@ -166,7 +166,7 @@ function taskDisplayCopy(status?: string, fallback?: string) {
     quota_waiting: { label: '限流等待', detail: '模型服务触发额度或频率限制，本轮任务已保留，可稍后继续或换员工接力。' },
     needs_input: { label: '需要补充信息', detail: '任务暂缺上下文，请补充资料后继续。' },
     waiting_input: { label: '需要补充信息', detail: '任务暂缺上下文，请补充资料后继续。' },
-    stalled: { label: '后台处理中 · 自动同步中', detail: 'Hermes 暂时没有新事件，Atlas 会继续监听并自动同步结果；这不等于失败。' },
+    stalled: { label: '后台处理中 · 自动同步中', detail: 'Hermes 暂时没有新事件，InsightLab 会继续监听并自动同步结果；这不等于失败。' },
     failed: { label: '失败 · 可重试', detail: '任务已进入失败态，可从检查点回放或重新执行。' },
     completed: { label: '已完成', detail: '任务已完成，可以查看交付物、总结和输入来源。' },
     done: { label: '已完成', detail: '任务已完成，可以查看交付物、总结和输入来源。' },
@@ -392,7 +392,7 @@ function waitStage(ms: number, detached = false): ProgressStage {
       kind: 'wait',
       status: 'waiting',
       title: '后台处理中',
-      detail: 'Hermes 可能仍在继续执行，Atlas 会自动同步最新结果，也可以打开回放查看检查点。',
+      detail: 'Hermes 可能仍在继续执行，InsightLab 会自动同步最新结果，也可以打开回放查看检查点。',
       meta: '自动同步',
       action: 'replay',
       actionLabel: '回放',
@@ -414,7 +414,7 @@ function waitStage(ms: number, detached = false): ProgressStage {
       kind: 'wait',
       status: 'running',
       title: '等待工具返回',
-      detail: 'Hermes 暂时没有新事件，Atlas 仍在前台监听。',
+      detail: 'Hermes 暂时没有新事件，InsightLab 仍在前台监听。',
       meta: '20s+',
     };
   }
@@ -953,7 +953,7 @@ async function selectEmployee(input: string): Promise<{ id: number; uuid?: strin
       toolsets: receptionist.toolsets,
       allowedToolsets: receptionist.allowedToolsets,
     }
-    : { id: 1, name: 'Atlas', avatar_char: 'A', department: { name: '总调度', color: '#4F46E5' } };
+    : { id: 1, name: 'InsightLab', avatar_char: 'I', department: { name: '总调度', color: '#4F46E5' } };
   try {
     const route = await routeToEmployee(input);
     const matched = availableEmployees.find(e => e.id === route.employee_id);
@@ -1969,7 +1969,7 @@ export default function CommandCenter() {
             if (!isActionableHermesApproval(approval)) {
               appendProgressStage(sid, {
                 role: activeEmployee ? String(activeEmployee.id) : 'atlas',
-                sender: activeEmployee?.name || 'Atlas',
+                sender: activeEmployee?.name || 'InsightLab',
                 avatar: activeEmployee?.avatar || 'A',
                 color: activeEmployee?.color || '#4F46E5',
               }, {
@@ -2002,7 +2002,7 @@ export default function CommandCenter() {
             });
             const speaker = {
               role: activeEmployee ? String(activeEmployee.id) : 'atlas',
-              sender: activeEmployee?.name || 'Atlas',
+              sender: activeEmployee?.name || 'InsightLab',
               avatar: activeEmployee?.avatar || 'A',
               color: activeEmployee?.color || '#4F46E5',
             };
@@ -2056,7 +2056,7 @@ export default function CommandCenter() {
             const reason = evt.reason || evt.blocked_reason || '该工具不在当前员工授权范围内。';
             appendProgressStage(sid, {
               role: activeEmployee ? String(activeEmployee.id) : 'atlas',
-              sender: activeEmployee?.name || 'Atlas',
+              sender: activeEmployee?.name || 'InsightLab',
               avatar: activeEmployee?.avatar || 'A',
               color: activeEmployee?.color || '#4F46E5',
             }, {
@@ -2263,7 +2263,7 @@ export default function CommandCenter() {
         text: `已载入协作方案「${tpl.name}」。你可以直接在本会话中继续发起任务。`,
       }] : [{
         role: 'atlas',
-        sender: 'Atlas',
+        sender: 'InsightLab',
         avatar: 'A',
         color: '#4F46E5',
         text: `已载入协作方案「${tpl.name}」。画布已打开，你可以检查员工节点、保存/另存方案，或直接发起作战室任务。`,
@@ -2927,7 +2927,7 @@ export default function CommandCenter() {
       }
       const emp = empId != null ? await fetchEmployeeDetail(empId).catch(() => null) : null;
       if (!isLatestSwitch()) return;
-      const name = emp?.name || (empId != null ? `员工 #${empId}` : 'Atlas');
+      const name = emp?.name || (empId != null ? `员工 #${empId}` : 'InsightLab');
       const avatar = emp?.avatar_char || 'A';
       const color = emp?.department?.color || '#4F46E5';
       if (empId != null) {
@@ -2950,7 +2950,7 @@ export default function CommandCenter() {
         if (!Array.isArray(detail.messages) || detail.messages.length === 0) {
           setMessages([{
             role: 'atlas',
-            sender: 'Atlas',
+            sender: 'InsightLab',
             avatar: 'A',
             color: '#4F46E5',
             text: '这是一个新的作战室。你可以在输入框中用 @ 选择一位或多位数智员工，例如：@行政小六 帮我分诊，或 @项目交付经理 @法务合规顾问 一起处理任务。',
@@ -3044,7 +3044,7 @@ export default function CommandCenter() {
     }
   }, []);
 
-  // M4.2 (Group Chat): 新建空群聊,由 Atlas 引导用户用 @ 召唤员工接力。
+  // M4.2 (Group Chat): 新建空群聊,由 InsightLab 引导用户用 @ 召唤员工接力。
   const handleNewGroupConversation = useCallback(async () => {
     try {
       setWarRoomMenuOpen(false);
@@ -3057,10 +3057,10 @@ export default function CommandCenter() {
       setDispatchCid(sid);
       setMessages([{
         role: 'atlas',
-        sender: 'Atlas',
+        sender: 'InsightLab',
         avatar: 'A',
         color: '#4F46E5',
-        text: '已创建多员工群聊。请在输入框中用 @ 选择一位或多位数智员工，例如：@翻书人 PageTurner 帮我分析这份 PDF。Atlas 会按你选择的员工组织接力。',
+        text: '已创建多员工群聊。请在输入框中用 @ 选择一位或多位数智员工，例如：@翻书人 PageTurner 帮我分析这份 PDF。InsightLab 会按你选择的员工组织接力。',
       }], sid);
       setConversations(prev => [group, ...prev.filter((c) => realSessionId(c) !== sid)]);
     } catch (e) {
@@ -3259,7 +3259,7 @@ export default function CommandCenter() {
       }));
       appendProgressStage(sid, {
         role: activeEmployee ? String(activeEmployee.id) : 'atlas',
-        sender: activeEmployee?.name || 'Atlas',
+        sender: activeEmployee?.name || 'InsightLab',
         avatar: activeEmployee?.avatar || 'A',
         color: activeEmployee?.color || '#4F46E5',
       }, {
@@ -3477,7 +3477,7 @@ export default function CommandCenter() {
           continue;
         }
         if (chunk.event_type === 'openatlas.run_idle' || chunk.event_type === 'openatlas.run_detached') {
-          const line = chunk.message || (chunk.detached ? 'Hermes 后台继续运行，Atlas 会自动同步' : 'Hermes 暂无新事件，继续等待');
+          const line = chunk.message || (chunk.detached ? 'Hermes 后台继续运行，InsightLab 会自动同步' : 'Hermes 暂无新事件，继续等待');
           const idleMs = Number(chunk.idle_seconds || 0) > 0 ? Number(chunk.idle_seconds) * 1000 : Date.now() - lastStreamEventAt;
           markSessionBackgroundSync(targetSessionId);
           setSessionRunState(targetSessionId, {
@@ -3846,7 +3846,7 @@ export default function CommandCenter() {
         const errorMessage = error instanceof Error ? error.message : '未知错误';
         setMessages((prev: Msg[]) => [...prev, {
           role: 'atlas',
-          sender: 'Atlas',
+          sender: 'InsightLab',
           avatar: 'A',
           color: '#EF4444',
           text: `抱歉，处理您的请求时出现错误：${errorMessage}`
@@ -4067,7 +4067,7 @@ export default function CommandCenter() {
           if (idleSpeakerId) activeAgentId = idleSpeakerId;
           activeSpeakerName = chunk.speaker_name || activeSpeakerName;
           const idleEmp = employeeForSpeaker(idleSpeakerId, chunk.speaker_name || activeSpeakerName);
-          const line = chunk.message || (chunk.detached ? 'Hermes 后台继续运行，Atlas 会自动同步' : 'Hermes 暂无新事件，继续等待');
+          const line = chunk.message || (chunk.detached ? 'Hermes 后台继续运行，InsightLab 会自动同步' : 'Hermes 暂无新事件，继续等待');
           const idleMs = Number(chunk.idle_seconds || 0) > 0 ? Number(chunk.idle_seconds) * 1000 : Date.now() - lastStreamEventAt;
           markSessionBackgroundSync(convId);
           setSessionRunState(convId, {
@@ -4703,7 +4703,7 @@ export default function CommandCenter() {
     }));
     setMessages((prev: Msg[]) => [...prev, {
       role: 'atlas',
-      sender: 'Atlas',
+      sender: 'InsightLab',
       avatar: 'A',
       color: '#4F46E5',
       text: '已加入当前会话队列。当前任务完成后会自动继续处理这条输入。',
@@ -5245,7 +5245,7 @@ export default function CommandCenter() {
         <section className="atlas-home-hero">
           <AtlasOrb state={orbState} size={172} showLabel={false} staticMode />
           <div className="atlas-home-hero-copy">
-            <h1>Atlas</h1>
+            <h1>InsightLab</h1>
           </div>
         </section>
 

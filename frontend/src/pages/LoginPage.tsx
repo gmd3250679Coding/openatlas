@@ -67,7 +67,7 @@ function friendlyAuthError(err: unknown, mode: AuthMode) {
     : String(err || '');
   const lower = raw.toLowerCase();
   if (/api 暂时不可达|failed to fetch|load failed|networkerror|network request failed/.test(lower)) {
-    return '暂时连接不上 OpenAtlas 服务。请确认后端已启动，并使用可访问入口访问；如果当前是腾讯云域名被拦截，请先用公网 IP。';
+    return '暂时连接不上 InsightLab 服务。请确认后端已启动，并使用可访问入口访问；如果当前是腾讯云域名被拦截，请先用公网 IP。';
   }
   if (/api 401|unauthorized|invalid credentials/.test(lower)) {
     return '账号或密码不正确，请检查后重试。';
@@ -127,7 +127,7 @@ export default function LoginPage() {
       <a
         className="atlas-auth-guide-link"
         href={TRIAL_GUIDE_PATH}
-        aria-label="打开 OpenAtlas 试用文档"
+        aria-label="打开 InsightLab 试用文档"
       >
         试用文档
       </a>
@@ -192,7 +192,7 @@ export default function LoginPage() {
             </div>
           </div>
           <div className="atlas-auth-orb" />
-          <section className="atlas-auth-hero atlas-auth-hero-hidden" aria-label="Atlas 登录">
+          <section className="atlas-auth-hero atlas-auth-hero-hidden" aria-label="InsightLab 登录">
             <div className="atlas-auth-copy">
               <h2>编排、协作、交付</h2>
               <p>高效管理数智团队，精准交付业务结果</p>
@@ -278,7 +278,7 @@ export default function LoginPage() {
                   loading={loading}
                   className="atlas-auth-submit"
                 >
-                  {loading ? (isRegister ? '注册中...' : '登录中...') : (isRegister ? '注册并进入 Atlas' : '进入 Atlas')}
+                  {loading ? (isRegister ? '注册中...' : '登录中...') : (isRegister ? '注册并进入 InsightLab' : '进入 InsightLab')}
                 </Button>
               </Form>
 

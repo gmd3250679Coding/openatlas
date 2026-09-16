@@ -637,7 +637,7 @@ export default function RightAside({
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
                 }}>
-                  {item.employee_name || (item.is_group ? '群聊协作' : '数字员工')} · {item.is_stale ? '长时间无新事件，Atlas 正在后台监听并自动同步；也可打开回放查看检查点' : cleanTaskText(item.last_message || item.task_summary, '等待下一步')}
+                  {item.employee_name || (item.is_group ? '群聊协作' : '数字员工')} · {item.is_stale ? '长时间无新事件，InsightLab 正在后台监听并自动同步；也可打开回放查看检查点' : cleanTaskText(item.last_message || item.task_summary, '等待下一步')}
                 </div>
               </button>
             ))}
@@ -1613,7 +1613,7 @@ function dedupeOutputs(outputs: GeneratedOutput[]) {
 
 function extractMessageDeliverables(message: AsideMessage, messageIndex: number): GeneratedOutput[] {
   const text = String(message.text || '');
-  const sender = sanitizeFilename(message.sender || 'Atlas') || 'Atlas';
+  const sender = sanitizeFilename(message.sender || 'InsightLab') || 'InsightLab';
   const outputs: GeneratedOutput[] = [];
   let blockIndex = 1;
 
@@ -1721,7 +1721,7 @@ function wrapHtml(html: string) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OpenAtlas Artifact</title>
+<title>InsightLab Artifact</title>
 </head>
 <body>
 ${trimmed}
@@ -1870,7 +1870,7 @@ function taskProgressCopy(status: string, fallback?: string) {
     quota_waiting: { label: '限流等待', detail: '模型服务触发额度或频率限制，本轮任务已保留，可稍后继续或换员工接力。' },
     needs_input: { label: '需要补充信息', detail: '任务暂缺上下文，请补充资料后继续。' },
     waiting_input: { label: '需要补充信息', detail: '任务暂缺上下文，请补充资料后继续。' },
-    stalled: { label: '后台处理中 · 自动同步中', detail: 'Hermes 暂时没有新事件，Atlas 正在继续监听并会自动更新结果；这不等于失败。' },
+    stalled: { label: '后台处理中 · 自动同步中', detail: 'Hermes 暂时没有新事件，InsightLab 正在继续监听并会自动更新结果；这不等于失败。' },
     failed: { label: '失败 · 可重试', detail: '任务已进入失败态，可从检查点回放或重新执行。' },
     completed: { label: '已完成', detail: '任务已完成，可以查看交付物、总结和输入来源。' },
     done: { label: '已完成', detail: '任务已完成，可以查看交付物、总结和输入来源。' },

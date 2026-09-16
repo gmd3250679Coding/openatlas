@@ -3,7 +3,7 @@
  *
  * Sandboxed live HTML preview. Renders raw HTML inside a same-origin
  * `<iframe sandbox="allow-scripts">` so that the artifact code cannot
- * reach Atlas's React tree, cookies, or localStorage.
+ * reach InsightLab's React tree, cookies, or localStorage.
  *
  * Bug 1 (2026-06-06, 王六原话: "既支持看代码, 也支持前端渲染预览, 也提供
  * 下载/复制按钮"):
