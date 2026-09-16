@@ -2,11 +2,13 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Button, Empty, Form, Input, Modal, Select, Space, Spin, Tag, message } from 'antd';
 import { fetchSkillMarket, hireEmployee, type SkillPackage } from '../services/api';
+import { EMPLOYEE_PHOTO_OPTIONS } from '../utils/employeeVisuals';
 
 const { TextArea } = Input;
 
 interface RecruitForm {
   name: string;
+  avatarChar?: string;
   systemPrompt?: string;
 }
 
@@ -58,6 +60,7 @@ export default function Recruit() {
   const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillPickerOpen, setSkillPickerOpen] = useState(false);
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const [selectedPhotoUrl, setSelectedPhotoUrl] = useState(EMPLOYEE_PHOTO_OPTIONS[0]?.url || '');
 
   const enabledSkills = useMemo(
     () => skills.filter((s) => s.status === 'enabled'),
@@ -101,7 +104,9 @@ export default function Recruit() {
     try {
       const hired = await hireEmployee({
         display_name: values.name,
-        avatar: values.name.charAt(0),
+        avatar: (values.avatarChar || values.name.charAt(0) || '?').slice(0, 1),
+        avatar_image_url: selectedPhotoUrl,
+        card_image_url: selectedPhotoUrl,
         system_prompt: values.systemPrompt?.trim() || '',
         initial_skill_ids: selectedSkillIds,
       });
@@ -133,12 +138,16 @@ export default function Recruit() {
       <section className="recruit-form">
         <div className="recruit-avatar-section">
           <div className="recruit-avatar-preview">
-            {name ? name.charAt(0) : '?'}
+            {selectedPhotoUrl ? (
+              <img src={selectedPhotoUrl} alt="员工头像预览" />
+            ) : (
+              name ? name.charAt(0) : '?'
+            )}
           </div>
           <div style={{ flex: 1 }}>
             <p className="recruit-avatar-title">员工头像</p>
             <p className="recruit-avatar-hint">
-              系统自动生成首字头像；员工能力来自启用技能、记忆和系统提示词
+              从企业形象照素材中选择；首字头像作为图片兜底，员工能力来自启用技能、记忆和系统提示词
             </p>
           </div>
         </div>
@@ -147,7 +156,7 @@ export default function Recruit() {
           form={form}
           layout="vertical"
           onFinish={onFinish}
-          initialValues={{ name: '', systemPrompt: '' }}
+          initialValues={{ name: '', avatarChar: '', systemPrompt: '' }}
         >
           <Form.Item
             name="name"
@@ -157,8 +166,46 @@ export default function Recruit() {
             <Input
               placeholder="例如：供应链风控助手"
               className="recruit-input"
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => {
+                const nextName = e.target.value;
+                setName(nextName);
+                if (!form.getFieldValue('avatarChar')) {
+                  form.setFieldValue('avatarChar', nextName.charAt(0));
+                }
+              }}
             />
+          </Form.Item>
+
+          <Form.Item label="头像与卡片图片">
+            <div className="recruit-visual-picker">
+              <div className="recruit-visual-preview">
+                <img src={selectedPhotoUrl} alt="卡片形象照预览" />
+                <span>卡片形象照</span>
+              </div>
+              <div className="recruit-visual-options">
+                {EMPLOYEE_PHOTO_OPTIONS.map((option) => (
+                  <button
+                    type="button"
+                    key={option.id}
+                    className={`recruit-visual-option ${selectedPhotoUrl === option.url ? 'active' : ''}`}
+                    onClick={() => setSelectedPhotoUrl(option.url)}
+                    title={option.label}
+                  >
+                    <img src={option.url} alt={option.label} />
+                    <span>{option.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </Form.Item>
+
+          <Form.Item
+            name="avatarChar"
+            label="首字头像兜底"
+            extra="图片不可用时展示这个字符。"
+            rules={[{ max: 1, message: '只保留 1 个字符' }]}
+          >
+            <Input maxLength={1} placeholder={name ? name.charAt(0) : 'A'} className="recruit-input" style={{ maxWidth: 120 }} />
           </Form.Item>
 
           <Form.Item

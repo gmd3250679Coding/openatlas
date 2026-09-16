@@ -7,30 +7,30 @@
 1. 启动服务:
 
 ```bash
-cd /Users/macbook/Desktop/Atlasagent/openatlas
+cd /path/to/openatlas
 ./scripts/start.sh
 ```
 
 2. 打开前端:
 
 ```text
-http://127.0.0.1:4381
+http://127.0.0.1:3381
 admin@demo.openatlas / openatlas
 ```
 
 3. 初始化演示内容:
 
 ```bash
-cd /Users/macbook/Desktop/Atlasagent/openatlas
-OPENATLAS_API_BASE=http://127.0.0.1:58103/api \
+cd /path/to/openatlas
+OPENATLAS_API_BASE=http://127.0.0.1:58003/api \
 python3 backend/scripts/seed_product_demo.py
 ```
 
 如果演示环境里有历史测试数据, 先执行整理模式:
 
 ```bash
-cd /Users/macbook/Desktop/Atlasagent/openatlas
-OPENATLAS_API_BASE=http://127.0.0.1:58103/api \
+cd /path/to/openatlas
+OPENATLAS_API_BASE=http://127.0.0.1:58003/api \
 OPENATLAS_DEMO_CLEANUP=1 \
 python3 backend/scripts/seed_product_demo.py
 ```
@@ -38,10 +38,40 @@ python3 backend/scripts/seed_product_demo.py
 4. 演示材料目录:
 
 ```text
-/Users/macbook/Desktop/Atlasagent/openatlas/demo-pack/materials
+/path/to/openatlas/demo-pack/materials
 ```
 
-## Demo 1: 经营分析闭环
+## Demo 1: A 股投资尽调 HTML 交付物
+
+### 上传材料
+
+- 任意包含标的公司、收入、净利润、毛利率、机会和风险的 Markdown/TXT/DOCX 文件。
+
+### 选择员工
+
+- 快速演示: 投资研究分析师
+- 协作演示: 模板库选择“A股投资尽调作战室”
+
+### 推荐提示词
+
+```text
+请基于我上传的尽调材料，补充必要的行业和财务分析，生成一份适合投委会快速阅读的 HTML 投资尽调摘要。报告需要包含关键指标卡、投资亮点、风险矩阵、后续尽调清单，并输出完整 html 代码块。
+```
+
+协作模板短接力:
+
+```text
+请基于上传材料和必要补充信息做三员工接力：投资研究分析师给出投资框架，财务经营分析师判断财务质量和估值风险，市场竞品研究员补充行业竞争和机会。最终形成投委会摘要和 HTML 报告。
+```
+
+### 验收点
+
+- 投资研究分析师能直接返回 HTML 代码块。
+- 右侧输入来源能看到上传文件和投资研究相关 Skill。
+- 输出物能登记 HTML 文件并支持在线预览/下载。
+- “A股投资尽调作战室”能看到三位员工顺序发言；如果触发高风险工具审批，前端应出现明确确认入口，确认后可继续执行。
+
+## Demo 2: 经营分析闭环
 
 ### 上传材料
 
@@ -75,7 +105,7 @@ python3 backend/scripts/seed_product_demo.py
 - 总结页能生成会话级总结。
 - 输出物包含 Markdown/HTML, 可下载, 可归档。
 
-## Demo 2: 合同审查闭环
+## Demo 3: 合同审查闭环
 
 ### 上传材料
 
@@ -103,7 +133,7 @@ python3 backend/scripts/seed_product_demo.py
 - 多员工分工清楚。
 - 输出物可归档。
 
-## Demo 3: 销售方案闭环
+## Demo 4: 销售方案闭环
 
 ### 上传材料
 
@@ -131,7 +161,7 @@ python3 backend/scripts/seed_product_demo.py
 - CSV 内容能被注入。
 - 输出能直接给业务团队使用。
 
-## Demo 4: HR 招聘闭环
+## Demo 5: HR 招聘闭环
 
 ### 上传材料
 
@@ -153,7 +183,7 @@ python3 backend/scripts/seed_product_demo.py
 请输出候选人排序表、面试问题和用工合规提醒。
 ```
 
-## Demo 5: 会议纪要闭环
+## Demo 6: 会议纪要闭环
 
 ### 上传材料
 

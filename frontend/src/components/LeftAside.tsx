@@ -17,7 +17,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import type { Conversation } from '../services/api';
-import { IconPlus, IconTrash, IconUsers } from './Icons';
+import { IconPaperclip, IconPlus, IconTrash, IconUsers } from './Icons';
 
 interface Props {
   conversations: Conversation[];
@@ -27,7 +27,7 @@ interface Props {
   /** M4.2 (Group Chat): 新建群聊回调 */
   onNewGroup?: () => void;
   onSelect: (conv: Conversation) => void;
-  onDelete: (id: number, e: ReactMouseEvent) => void;
+  onDelete: (id: number | string, e: ReactMouseEvent) => void;
   onPatch?: (conv: Conversation, patch: Partial<Pick<Conversation, 'title' | 'pinned' | 'workspace' | 'model_override'>>) => Promise<void> | void;
 }
 
@@ -172,7 +172,7 @@ export default function LeftAside({
         </div>
       </div>
 
-      {loading ? (
+      {loading && conversations.length === 0 ? (
         <div style={{
           padding: '24px 12px', fontSize: 12,
           color: 'var(--text-tertiary)', textAlign: 'center',
@@ -190,11 +190,23 @@ export default function LeftAside({
           const isActive = String(conv.id) === activeKey || String(conv.__id) === activeKey;
           const groupParticipantCount = conv.is_group ? 1 + (conv.participant_ids?.length ?? 0) : 1;
           const displayTitle = conversationDisplayTitle(conv);
+          const progressStatus = String(conv.progress?.status || '');
+          const status = progressStatus === 'stalled' || conv.is_stale ? 'stalled' : (progressStatus || conv.task_status || conv.status || 'draft');
+          const hasDeliverable = conversationHasDeliverable(conv);
           return (
             <div
               key={conv.id}
               className="atlas-session-row"
+              data-session-id={conv.__id || conv.id}
+              role="button"
+              tabIndex={0}
               onClick={() => onSelect(conv)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onSelect(conv);
+                }
+              }}
               onContextMenu={(e) => openContextMenu(conv, e)}
               style={{
                 padding: '12px',
@@ -229,6 +241,47 @@ export default function LeftAside({
                     <IconUsers size={10} /> 群聊 · {groupParticipantCount}
                   </span>
                 )}
+                <span
+                  title={`任务状态: ${taskStatusLabel(status)}`}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 4,
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: taskStatusText(status),
+                    background: taskStatusBg(status),
+                    padding: '1px 6px',
+                    borderRadius: 999,
+                    flexShrink: 0,
+                  }}
+                >
+                  <span style={{
+                    width: 5,
+                    height: 5,
+                    borderRadius: 999,
+                    background: taskStatusDot(status),
+                  }} />
+                  {taskStatusLabel(status)}
+                </span>
+                {hasDeliverable && (
+                  <span
+                    title="检测到交付物线索"
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      width: 18,
+                      height: 18,
+                      borderRadius: 6,
+                      color: 'var(--accent)',
+                      background: 'var(--accent-soft)',
+                      flexShrink: 0,
+                    }}
+                  >
+                    <IconPaperclip size={11} />
+                  </span>
+                )}
                 <button onClick={(e) => openContextMenu(conv, e)} title="更多操作"
                   style={{
                     background: 'none', border: 'none',
@@ -239,7 +292,7 @@ export default function LeftAside({
                   onMouseEnter={e => e.currentTarget.style.color = 'var(--accent)'}
                   onMouseLeave={e => e.currentTarget.style.color = 'var(--text-tertiary)'}
                 >⋯</button>
-                <button onClick={(e) => onDelete(conv.id, e)} title="删除"
+                <button onClick={(e) => onDelete(conv.__id || conv.id, e)} title="删除"
                   style={{
                     background: 'none', border: 'none',
                     color: 'var(--text-tertiary)', cursor: 'pointer',
@@ -392,4 +445,55 @@ function conversationDisplayTitle(conv: Conversation) {
   const last = String(conv.last_message || '').replace(/\s+/g, ' ').trim();
   if (last) return last.length > 28 ? `${last.slice(0, 28)}...` : last;
   return '未命名任务';
+}
+
+function conversationHasDeliverable(conv: Conversation) {
+  const text = `${conv.title || ''} ${conv.last_message || ''}`.toLowerCase();
+  return /(\.html|\.pdf|\.md|\.docx|\.xlsx|\.pptx|交付物|报告已生成|文件路径|保存到|已入库)/i.test(text);
+}
+
+function taskStatusLabel(status?: string) {
+  const s = String(status || 'draft');
+  const map: Record<string, string> = {
+    draft: '草稿',
+    active: '可用',
+    running: '进行中',
+    queued: '排队中',
+    needs_input: '需补充',
+    waiting_input: '需补充',
+    waiting_approval: '待审批',
+    stalled: '处理中',
+    completed: '已完成',
+    done: '已完成',
+    failed: '失败',
+    archived: '已归档',
+  };
+  return map[s] || s;
+}
+
+function taskStatusDot(status?: string) {
+  const s = String(status || '');
+  if (s === 'failed') return '#ef4444';
+  if (s === 'needs_input' || s === 'waiting_input' || s === 'waiting_approval' || s === 'stalled') return '#f59e0b';
+  if (s === 'running' || s === 'queued') return '#3b82f6';
+  if (s === 'completed' || s === 'done') return '#10b981';
+  return '#8b8fa3';
+}
+
+function taskStatusBg(status?: string) {
+  const s = String(status || '');
+  if (s === 'failed') return 'color-mix(in srgb, #ef4444 11%, var(--bg-primary))';
+  if (s === 'needs_input' || s === 'waiting_input' || s === 'waiting_approval' || s === 'stalled') return 'color-mix(in srgb, #f59e0b 14%, var(--bg-primary))';
+  if (s === 'running' || s === 'queued') return 'color-mix(in srgb, #3b82f6 12%, var(--bg-primary))';
+  if (s === 'completed' || s === 'done') return 'color-mix(in srgb, #10b981 12%, var(--bg-primary))';
+  return 'var(--bg-primary)';
+}
+
+function taskStatusText(status?: string) {
+  const s = String(status || '');
+  if (s === 'failed') return '#b91c1c';
+  if (s === 'needs_input' || s === 'waiting_input' || s === 'waiting_approval' || s === 'stalled') return '#92400e';
+  if (s === 'running' || s === 'queued') return '#1d4ed8';
+  if (s === 'completed' || s === 'done') return '#047857';
+  return 'var(--text-tertiary)';
 }

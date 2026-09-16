@@ -476,7 +476,29 @@
   background: var(--bg-secondary, #161b22);
 }
 [data-theme="dark"] .streamdown-host .artifact-iframe {
-  background: #0d1117;
+  background: #ffffff;
+}
+[data-theme="dark"] .streamdown-host .artifact-html-stage,
+[data-theme="dark"] .artifact-preview-body .artifact-html-stage {
+  background:
+    linear-gradient(45deg, rgba(148,163,184,0.08) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(148,163,184,0.08) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(148,163,184,0.08) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(148,163,184,0.08) 75%),
+    #07070a;
+  background-size: 18px 18px;
+  background-position: 0 0, 0 9px, 9px -9px, -9px 0;
+}
+[data-theme="dark"] .artifact-card {
+  background: rgba(24, 24, 30, 0.92);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+[data-theme="dark"] .artifact-card-header,
+[data-theme="dark"] .artifact-card-body {
+  background: rgba(18, 18, 24, 0.96);
+}
+[data-theme="dark"] .artifact-card-title {
+  color: var(--text-secondary);
 }
 
 /* ════════════════════════════════════════════════════════════════════════

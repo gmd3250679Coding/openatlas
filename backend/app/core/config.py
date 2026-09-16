@@ -9,16 +9,31 @@ import os
 from pathlib import Path
 
 
+def _default_openatlas_home() -> Path:
+    return (Path.home() / ".openatlas").resolve()
+
+
 def _abs_openatlas_home() -> Path:
     """Refuse to fall back to a relative path. The launcher guarantees this is set."""
     val = os.environ.get("OPENATLAS_HOME", "")
     if not val or not Path(val).is_absolute():
-        # Hard fallback for dev running outside start.sh: use absolute home.
-        return Path("/Users/macbook/.openatlas").resolve()
+        # Dev fallback for local runs outside start.sh. Production should set OPENATLAS_HOME.
+        return _default_openatlas_home()
     return Path(val).resolve()
 
 
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
 OPENATLAS_HOME = _abs_openatlas_home()
+OPENATLAS_PROJECT_ROOT = Path(
+    os.environ.get("OPENATLAS_PROJECT_ROOT", Path(__file__).resolve().parents[3])
+).resolve()
 TENANT_HOME = OPENATLAS_HOME / "hermes-tenants" / os.environ.get("OPENATLAS_TENANT", "demo")
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(TENANT_HOME / ".hermes"))).resolve()
 # Phase 2: path to the OpenAtlas-owned hermes-agent source tree (NEVER ~/.hermes/hermes-agent)
@@ -45,10 +60,17 @@ DEFAULT_TENANT_NAME = "Demo Tenant"
 DEFAULT_ADMIN_EMAIL = "admin@demo.openatlas"
 DEFAULT_ADMIN_PASSWORD = "openatlas"
 
-# CORS
-CORS_ORIGINS = [
+# CORS. Same-origin nginx deployments do not need CORS, but preview/dev often do.
+_cors_env = os.environ.get("OPENATLAS_CORS_ORIGINS", "")
+CORS_ORIGINS = [s.strip() for s in _cors_env.split(",") if s.strip()] or [
     "http://localhost:3381",
     "http://127.0.0.1:3381",
     "http://localhost:58003",
     "http://127.0.0.1:58003",
 ]
+
+# Runtime stability / quota governance. These are soft guards in front of the
+# tenant Hermes runtime so one user cannot accidentally saturate the gateway.
+OPENATLAS_MAX_ACTIVE_RUNS_PER_TENANT = _env_int("OPENATLAS_MAX_ACTIVE_RUNS_PER_TENANT", 6)
+OPENATLAS_MAX_ACTIVE_RUNS_PER_USER = _env_int("OPENATLAS_MAX_ACTIVE_RUNS_PER_USER", 2)
+OPENATLAS_QUOTA_RETRY_AFTER_SECONDS = _env_int("OPENATLAS_QUOTA_RETRY_AFTER_SECONDS", 90, minimum=15)

@@ -50,6 +50,11 @@
   --glass-border: rgba(0, 0, 0, 0.06);
 }
 
+html[data-theme="light"] {
+  color-scheme: light;
+  background: #FFFFFF;
+}
+
 /* --- Dark Theme --- */
 [data-theme="dark"] {
   --bg-primary: #0A0A0C;
@@ -86,6 +91,11 @@
   --glass-bg: rgba(22, 22, 24, 0.75);
   --glass-blur: saturate(180%) blur(24px);
   --glass-border: rgba(255, 255, 255, 0.08);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  background: #0A0A0C;
 }
 
 /* ============================================================

@@ -1,7 +1,7 @@
 """Password hashing + JWT issue/verify."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from jose import jwt, JWTError
@@ -24,7 +24,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 
 def issue_token(*, user_id: str, tenant_id: str, role: str) -> str:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     payload: dict[str, Any] = {
         "sub": user_id,
         "tenant_id": tenant_id,

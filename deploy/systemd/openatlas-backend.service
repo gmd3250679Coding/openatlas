@@ -1,0 +1,27 @@
+[Unit]
+Description=OpenAtlas Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openatlas
+Group=openatlas
+WorkingDirectory=/opt/openatlas/current/backend
+EnvironmentFile=/etc/openatlas/openatlas.env
+Environment=HOME=/var/lib/openatlas
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/openatlas/current/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 58003 --proxy-headers
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# Basic hardening. Keep write access to OPENATLAS_HOME and release logs only.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/openatlas /opt/openatlas
+
+[Install]
+WantedBy=multi-user.target

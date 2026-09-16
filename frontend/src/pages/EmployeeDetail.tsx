@@ -5,14 +5,6 @@ import { SettingOutlined, FileTextOutlined, ApiOutlined, ClockCircleOutlined, Pl
 import type { EmployeeDetail as EmployeeDetailType, SkillPackage } from '../services/api';
 import { fetchEmployeeDetail, executeSkill, fetchSkillBindings, deleteSkillBinding, fetchSkillMarket, bindSkill, type SkillBindingRow } from '../services/api';
 
-const recentActivity = [
-  { topic: '差旅报销分摊规则咨询', user: '张明', time: '11:42', status: '已完成' },
-  { topic: '发票验真 - 2026年4月第3批次', user: '李婷', time: '11:20', status: '已完成' },
-  { topic: 'Q1 费用报销政策解读', user: '王伟', time: '10:55', status: '已完成' },
-  { topic: '差旅标准 - 出差住宿限额', user: '陈伟', time: '10:30', status: '已完成' },
-  { topic: '费用分摊 - 跨部门项目', user: '赵敏', time: '09:45', status: '已完成' },
-];
-
 const STATS_LABEL: Record<string, string> = {
   conversations: '今日对话',
   responseTime: '平均响应',
@@ -34,6 +26,49 @@ function skillRiskColor(risk?: string) {
   if (r === 'medium') return 'orange';
   if (r === 'low') return 'green';
   return 'default';
+}
+
+function formatMs(value?: number | null) {
+  if (value == null || !Number.isFinite(Number(value))) return '--';
+  const ms = Number(value);
+  if (ms >= 1000) return `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)}s`;
+  return `${Math.round(ms)}ms`;
+}
+
+function formatPercent(value?: number | null) {
+  if (value == null || !Number.isFinite(Number(value))) return '--';
+  return `${Math.round(Number(value) * 100)}%`;
+}
+
+function taskStatusText(status?: string) {
+  const map: Record<string, string> = {
+    draft: '草稿',
+    queued: '排队中',
+    running: '进行中',
+    stalled: '停滞',
+    needs_input: '需补充',
+    waiting_input: '需补充',
+    waiting_approval: '待审批',
+    completed: '已完成',
+    done: '已完成',
+    failed: '失败',
+  };
+  return map[String(status || '')] || status || '-';
+}
+
+function taskStatusChipClass(status?: string) {
+  const s = String(status || '');
+  if (s === 'completed' || s === 'done') return 'atlas-chip atlas-chip--success';
+  if (s === 'failed') return 'atlas-chip atlas-chip--danger';
+  if (s === 'running' || s === 'queued') return 'atlas-chip atlas-chip--accent';
+  return 'atlas-chip atlas-chip--neutral';
+}
+
+function skillSourceLabel(sourceRef?: string) {
+  const source = String(sourceRef || '');
+  if (source.startsWith('hermes:')) return 'Hermes 运行时';
+  if (source.startsWith('zip:') || source.startsWith('openatlas:')) return '本地导入包';
+  return 'OpenAtlas 元数据';
 }
 
 export default function EmployeeDetail() {
@@ -113,8 +148,9 @@ export default function EmployeeDetail() {
     () => marketSkills
       .filter((s: any) => s.status === 'enabled' && !boundSkillIds.has((s as any).__id || String(s.id)))
       .sort((a: any, b: any) => {
-        const ah = String(a.source_ref || '').startsWith('hermes:') ? 0 : 1;
-        const bh = String(b.source_ref || '').startsWith('hermes:') ? 0 : 1;
+        const rank = (s: any) => String(s.source_ref || '').startsWith('hermes:') ? 0 : String(s.source_ref || '').startsWith('zip:') || String(s.source_ref || '').startsWith('openatlas:') ? 1 : 2;
+        const ah = rank(a);
+        const bh = rank(b);
         return ah - bh || a.scope.localeCompare(b.scope) || a.name.localeCompare(b.name);
       }),
     [marketSkills, boundSkillIds],
@@ -215,16 +251,18 @@ export default function EmployeeDetail() {
   const empId = String(employee.id);
   const status = employee.status_text || employee.status;
   const statusTier = employee.status === 'active' ? 'busy' : employee.status === 'idle' ? 'idle' : 'offline';
-  const conversations = String(employee.conversation_count || 0);
-  const responseTime = '--';
-  const successRate = '--';
+  const conversations = String(employee.today_conversation_count ?? employee.conversation_count ?? 0);
+  const responseTime = formatMs(employee.avg_response_ms);
+  const successRate = formatPercent(employee.success_rate);
   const tokens = String(employee.total_tokens || 0);
-  const skill = (employee.skills || []).map((s: any) => s.skill_name || s.name || String(s)).join(' / ') || '未配置';
+  const skillNames = (employee.skills || []).map((s: any) => s.skill_name || s.name || String(s)).filter(Boolean);
   // Bug C 修复：system_prompt 存在 employees 表，不在 skills.description
   const systemPrompt = (employee.system_prompt && employee.system_prompt.trim())
     ? employee.system_prompt
     : '暂无系统 Prompt（招聘时填的 system_prompt 不为空时才会显示）';
-  const tools = (employee.skills || []).map((s: any) => s.skill_name || s.name || String(s));
+  const tools = Array.isArray(employee.toolsets) ? employee.toolsets : [];
+  const runtimeParams = employee.runtime_params || {};
+  const recentActivity = employee.recent_activity || [];
 
   return (
     <div style={{ padding: '32px 48px 64px', maxWidth: 1200 }}>
@@ -293,11 +331,13 @@ export default function EmployeeDetail() {
               <div>
                 <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-tertiary)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.06em' }}>已绑定 Skills</div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 28 }}>
-                  {skill.split(' / ').map((s) => (
+                  {skillNames.length > 0 ? skillNames.map((s) => (
                     <span key={s} className="atlas-chip atlas-chip--accent" style={{ fontFamily: 'var(--font-mono)', padding: '4px 10px' }}>
                       {s.trim()}
                     </span>
-                  ))}
+                  )) : (
+                    <span className="atlas-chip atlas-chip--neutral" style={{ padding: '4px 10px' }}>未配置</span>
+                  )}
                 </div>
                 {/* Phase 3.9: OpenAtlas SkillBinding — 来自技能市场的可绑定技能 */}
                 <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-tertiary)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
@@ -367,12 +407,16 @@ export default function EmployeeDetail() {
                     padding: 16,
                   }}
                 >
-                  <Descriptions.Item label="模型">Qwen2.5-72B</Descriptions.Item>
-                  <Descriptions.Item label="超时">30s</Descriptions.Item>
-                  <Descriptions.Item label="温度">0.7</Descriptions.Item>
-                  <Descriptions.Item label="最大 Token">4096</Descriptions.Item>
-                  <Descriptions.Item label="Top P">0.9</Descriptions.Item>
-                  <Descriptions.Item label="频率惩罚">0.1</Descriptions.Item>
+                  <Descriptions.Item label="模型">{runtimeParams.model || employee.model || 'Hermes 默认'}</Descriptions.Item>
+                  <Descriptions.Item label="Provider">{runtimeParams.provider || employee.provider || 'hermes'}</Descriptions.Item>
+                  <Descriptions.Item label="Run Events 超时">
+                    {runtimeParams.run_event_idle_timeout_seconds ? `${runtimeParams.run_event_idle_timeout_seconds}s` : 'Hermes 默认'}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="温度">{runtimeParams.temperature ?? employee.temperature ?? 'Hermes 默认'}</Descriptions.Item>
+                  <Descriptions.Item label="最大 Token">{runtimeParams.max_tokens ?? employee.max_tokens ?? 'Hermes 默认'}</Descriptions.Item>
+                  <Descriptions.Item label="Top P">{runtimeParams.top_p ?? 'Hermes 默认'}</Descriptions.Item>
+                  <Descriptions.Item label="频率惩罚">{runtimeParams.frequency_penalty ?? 'Hermes 默认'}</Descriptions.Item>
+                  <Descriptions.Item label="真实运行次数">{employee.run_count || 0}</Descriptions.Item>
                 </Descriptions>
               </div>
             ),
@@ -433,6 +477,17 @@ export default function EmployeeDetail() {
                   </button>
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {tools.length === 0 && (
+                    <div style={{
+                      color: 'var(--text-tertiary)',
+                      fontSize: 13,
+                      padding: '12px 16px',
+                      border: '1px dashed var(--border-default)',
+                      borderRadius: 'var(--radius-md)',
+                    }}>
+                      暂无绑定工具集
+                    </div>
+                  )}
                   {tools.map((tool) => (
                     <div key={tool} style={{
                       background: 'var(--bg-elevated)',
@@ -444,7 +499,7 @@ export default function EmployeeDetail() {
                       <ApiOutlined style={{ color: 'var(--accent)', fontSize: 14 }} />
                       <span style={{ color: 'var(--text-primary)', fontWeight: 500, fontSize: 13 }}>{tool}</span>
                       <span className="atlas-chip atlas-chip--neutral" style={{ marginLeft: 'auto' }}>
-                        业务标签
+                        Hermes Toolset
                       </span>
                     </div>
                   ))}
@@ -461,11 +516,32 @@ export default function EmployeeDetail() {
                 rowKey={(_, i) => String(i)}
                 pagination={false}
                 size="small"
+                locale={{ emptyText: '暂无真实会话活动' }}
                 columns={[
                   { title: '对话主题', dataIndex: 'topic' },
                   { title: '用户', dataIndex: 'user', width: 100 },
-                  { title: '时间', dataIndex: 'time', width: 100, render: (t: string) => <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)', fontSize: 12 }}>{t}</span> },
-                  { title: '状态', dataIndex: 'status', width: 100, render: (t: string) => <span className="atlas-chip atlas-chip--success">{t}</span> },
+                  {
+                    title: '时间',
+                    dataIndex: 'time',
+                    width: 150,
+                    render: (t: string) => (
+                      <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)', fontSize: 12 }}>
+                        {t ? new Date(t).toLocaleString() : '-'}
+                      </span>
+                    ),
+                  },
+                  {
+                    title: '状态',
+                    dataIndex: 'status',
+                    width: 100,
+                    render: (t: string) => <span className={taskStatusChipClass(t)}>{taskStatusText(t)}</span>,
+                  },
+                  {
+                    title: '消息',
+                    dataIndex: 'message_count',
+                    width: 80,
+                    render: (n: number) => <span style={{ fontFamily: 'var(--font-mono)' }}>{n || 0}</span>,
+                  },
                 ]}
               />
             ),
@@ -489,6 +565,7 @@ export default function EmployeeDetail() {
               选择已启用 Skill
             </div>
             <Select
+              aria-label="选择 Skill"
               showSearch
               value={bindingSkillId}
               onChange={setBindingSkillId}
@@ -497,7 +574,7 @@ export default function EmployeeDetail() {
               optionFilterProp="label"
               options={bindableSkills.map((s: any) => ({
                 value: s.__id || String(s.id),
-                label: `${s.name} · ${s.scope} · v${s.version}${String(s.source_ref || '').startsWith('hermes:') ? ' · Hermes' : ''}`,
+                label: `${s.name} · ${s.scope} · v${s.version} · ${skillSourceLabel(s.source_ref)}`,
               }))}
             />
           </div>
@@ -506,6 +583,7 @@ export default function EmployeeDetail() {
               绑定模式
             </div>
             <Select
+              aria-label="绑定模式"
               value={bindingMode}
               onChange={setBindingMode}
               style={{ width: '100%' }}
@@ -533,8 +611,8 @@ export default function EmployeeDetail() {
                 <Tag color={selectedBindingSkill.scope === 'global' ? 'geekblue' : selectedBindingSkill.scope === 'tenant' ? 'blue' : 'purple'}>
                   {selectedBindingSkill.scope}
                 </Tag>
-                <Tag color={String(selectedBindingSkill.source_ref || '').startsWith('hermes:') ? 'cyan' : 'default'}>
-                  {String(selectedBindingSkill.source_ref || '').startsWith('hermes:') ? 'Hermes' : 'OpenAtlas'}
+                <Tag color={String(selectedBindingSkill.source_ref || '').startsWith('hermes:') ? 'cyan' : String(selectedBindingSkill.source_ref || '').startsWith('zip:') || String(selectedBindingSkill.source_ref || '').startsWith('openatlas:') ? 'purple' : 'default'}>
+                  {skillSourceLabel(selectedBindingSkill.source_ref)}
                 </Tag>
                 <Tag color={skillRiskColor(selectedBindingSkill.risk_level)}>风险 {selectedBindingSkill.risk_level || 'low'}</Tag>
               </div>

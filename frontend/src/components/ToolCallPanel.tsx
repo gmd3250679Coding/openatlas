@@ -12,8 +12,11 @@ export interface ToolCallItem {
   toolCallId?: string;
   args?: unknown;
   result?: unknown;
-  error?: string;
+  error?: unknown;
   duration?: number | string;
+  waitDurationMs?: number | string;
+  startedAt?: string;
+  completedAt?: string;
   preview?: string;
   command?: string;
   delta?: string;
@@ -39,17 +42,18 @@ const TOOL_ICON: Record<string, string> = {
   skills: '◆',
 };
 
-function statusColor(status?: string): string {
+function statusColor(status?: string, softened = false): string {
+  if (softened && (status === 'failed' || status === 'error')) return '#F59E0B';
   if (status === 'completed') return '#3FB950';
   if (status === 'running') return '#4F46E5';
   if (status === 'error' || status === 'failed') return '#EF4444';
   return '#8B8FA3';
 }
 
-function statusLabel(status?: string): string {
+function statusLabel(status?: string, softened = false): string {
   if (status === 'running') return '执行中';
   if (status === 'completed') return '完成';
-  if (status === 'failed' || status === 'error') return '失败';
+  if (status === 'failed' || status === 'error') return softened ? '未采用' : '失败';
   if (status === 'progress') return '进行中';
   return status || '';
 }
@@ -64,14 +68,71 @@ function compact(value: unknown): string {
   }
 }
 
-export default function ToolCallPanel({ tools }: { tools: ToolCallItem[] }) {
+function compactError(value: unknown): string {
+  if (value === false || value == null || value === '') return '';
+  if (typeof value === 'string') {
+    const clean = value.trim().toLowerCase();
+    if (!clean || clean === 'false' || clean === 'null' || clean === 'undefined') return '';
+  }
+  if (value === true) return '工具调用失败，但运行时没有返回具体错误信息。';
+  return compact(value);
+}
+
+function isFalseErrorMarker(value: unknown): boolean {
+  return value === false || (typeof value === 'string' && value.trim().toLowerCase() === 'false');
+}
+
+function displayStatus(status: string | undefined, rawError: unknown): string | undefined {
+  if (isFalseErrorMarker(rawError) && (status === 'failed' || status === 'error')) return 'completed';
+  return status;
+}
+
+function formatElapsedMs(value: number | string | undefined): string {
+  if (value == null || value === '') return '';
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n < 1000) return `${Math.max(1, Math.round(n))}ms`;
+  const secondsTotal = n / 1000;
+  if (secondsTotal < 10) return `${secondsTotal.toFixed(1)}s`;
+  if (secondsTotal < 60) return `${Math.round(secondsTotal)}s`;
+  const minutes = Math.floor(secondsTotal / 60);
+  const seconds = Math.round(secondsTotal % 60);
+  return `${minutes}m${seconds ? ` ${seconds}s` : ''}`;
+}
+
+function parseTimeMs(value?: string): number | undefined {
+  if (!value) return undefined;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+function formatToolWait(t: ToolCallItem, status?: string): string {
+  const explicit = formatElapsedMs(t.waitDurationMs);
+  if (explicit) return status === 'running' || status === 'progress' ? `已等待 ${explicit}` : `等待 ${explicit}`;
+  const started = parseTimeMs(t.startedAt);
+  if (started) {
+    const ended = parseTimeMs(t.completedAt) || Date.now();
+    const elapsed = formatElapsedMs(Math.max(0, ended - started));
+    if (elapsed) return status === 'running' || status === 'progress' ? `已等待 ${elapsed}` : `等待 ${elapsed}`;
+  }
+  if (t.duration != null && t.duration !== '') {
+    const n = typeof t.duration === 'number' ? t.duration : Number(t.duration);
+    if (Number.isFinite(n) && n > 0) return `工具耗时 ${formatElapsedMs(n * 1000)}`;
+  }
+  return '';
+}
+
+export default function ToolCallPanel({ tools, hasDeliverables = false }: { tools: ToolCallItem[]; hasDeliverables?: boolean }) {
   // Phase B (2026-06-04):默认折叠 — 学 Hermes-WebUI 的 Activity: N tools 汇总行,
   // 用户主动点击展开。已完成态折叠避免噪音,运行中态展开方便观察。
-  const hasRunning = tools.some(t => t.status === 'running');
+  const hasRunning = tools.some(t => displayStatus(t.status, t.error) === 'running');
   const [open, setOpen] = useState(hasRunning);
   if (!tools || tools.length === 0) return null;
 
-  const running = tools.some(t => t.status === 'running');
+  const running = tools.some(t => displayStatus(t.status, t.error) === 'running');
+  const failedCount = tools.filter(t => ['failed', 'error'].includes(displayStatus(t.status, t.error) || '')).length;
+  const completedCount = tools.filter(t => displayStatus(t.status, t.error) === 'completed').length;
+  const softenFailures = hasDeliverables && completedCount > 0 && failedCount > 0;
 
   return (
     <div style={{
@@ -91,10 +152,13 @@ export default function ToolCallPanel({ tools }: { tools: ToolCallItem[] }) {
       >
         <span style={{
           display: 'inline-block', width: 7, height: 7, borderRadius: '50%',
-          background: running ? '#4F46E5' : '#3FB950',
+          background: running ? '#4F46E5' : softenFailures ? '#F59E0B' : failedCount > 0 ? '#EF4444' : '#3FB950',
           animation: running ? 'blink 1s step-end infinite' : 'none',
         }} />
-        <span>工具调用 · {tools.length}</span>
+        <span>
+          工具调用 · {tools.length}
+          {softenFailures ? ' · 部分未采用' : failedCount > 0 ? ` · ${failedCount} 个失败` : ''}
+        </span>
         <span style={{ marginLeft: 'auto', fontSize: 11, color: '#6B7280' }}>
           {open ? '收起 ▲' : '展开 ▼'}
         </span>
@@ -104,10 +168,13 @@ export default function ToolCallPanel({ tools }: { tools: ToolCallItem[] }) {
           {tools.map((t, i) => {
             const args = compact(t.args);
             const result = compact(t.result);
-            const error = compact(t.error);
-            const hasDetails = Boolean(args || result || error || t.command || t.preview || t.duration || t.toolCallId);
+            const error = compactError(t.error);
+            const status = displayStatus(t.status, t.error);
+            const softened = softenFailures && (status === 'failed' || status === 'error');
+            const durationText = formatToolWait(t, status);
+            const hasDetails = Boolean(args || result || error || t.command || t.preview || durationText || t.toolCallId);
             return (
-              <details key={`${t.toolCallId || t.name}-${i}`} open={t.status === 'running' || t.status === 'failed'} style={{
+              <details key={`${t.toolCallId || t.name}-${i}`} open={status === 'running' || status === 'failed'} style={{
                 padding: '5px 0',
                 borderTop: i === 0 ? 'none' : '1px solid rgba(255,255,255,0.04)',
               }}>
@@ -127,16 +194,16 @@ export default function ToolCallPanel({ tools }: { tools: ToolCallItem[] }) {
                       whiteSpace: 'nowrap', maxWidth: 240,
                     }}>{t.label}</span>
                   )}
-                  {t.duration != null && (
+                  {durationText && (
                     <span style={{ color: '#8B8FA3', fontSize: 11 }}>
-                      {t.duration}ms
+                      {durationText}
                     </span>
                   )}
                   <span style={{
                     marginLeft: 'auto', fontSize: 11, fontWeight: 600,
-                    color: statusColor(t.status),
+                    color: statusColor(status, softened),
                   }}>
-                    {statusLabel(t.status)}
+                    {statusLabel(status, softened)}
                   </span>
                 </summary>
                 {hasDetails && (
@@ -152,7 +219,10 @@ export default function ToolCallPanel({ tools }: { tools: ToolCallItem[] }) {
                     {!t.command && t.preview && <MetaBlock label="Preview" value={t.preview} />}
                     {args && <MetaBlock label="Args" value={args} />}
                     {result && <MetaBlock label="Result" value={result} />}
-                    {error && <MetaBlock label="Error" value={error} tone="danger" />}
+                    {softened && (
+                      <MetaLine label="说明" value="本轮已有交付物入库，该工具结果未被最终采用。" />
+                    )}
+                    {error && <MetaBlock label="Error" value={error} tone={softened ? undefined : "danger"} />}
                   </div>
                 )}
               </details>

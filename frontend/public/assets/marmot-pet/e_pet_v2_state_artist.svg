@@ -1,0 +1,387 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" shape-rendering="crispEdges">
+  <title>Electronic Pet Marmot - V2 Artist State</title>
+  <defs>
+    <style>
+      .outline{fill:#101218}
+      .fur{fill:#d99a5d}
+      .fur2{fill:#be7e49}
+      .shade{fill:#b07242;opacity:.45}
+      .muzzle{fill:#b87a4c}
+      .muzzle2{fill:#825238}
+      .cream{fill:#f4edd0}
+      .white{fill:#f5f7f6}
+      .black{fill:#101218}
+      .pink{fill:#ef8f86}
+      .blush{fill:#ef8f86;opacity:.34}
+      .accent{fill:#4fb9ad}
+      .accent2{fill:#2e7f7a}
+      .leaf{fill:#78a56a}
+      .leaf2{fill:#557a55}
+      .glow{fill:#ffe49a}
+      .gold{fill:#f5c84b}
+      .gold2{fill:#b9852f}
+      .anger{fill:#e55348}
+      .sick{fill:#83b96c}
+      .cool{fill:#78d0df}
+      .paper{fill:#fff7dc}
+      .paper2{fill:#d6caa9}
+      .ink{fill:#3b4354}
+      .board{fill:#42655b}
+      .purple{fill:#9a7bd1}
+      .spark{fill:#f4edd0}
+    </style>
+  </defs>
+
+  <g id="reference_frame" opacity="0">
+    <rect x="0" y="0" width="512" height="512" fill="none"/>
+    <rect x="64" y="64" width="384" height="384" fill="none" stroke="#00f"/>
+  </g>
+
+  <g id="pet_root">
+    <g id="body" data-rive-origin="256,306">
+      <path id="body_outline" class="outline" d="M136 176h32v-32h48v-16h80v16h48v32h32v48h32v80h24v112h-32v32H112v-32H80V304h24v-80h32z"/>
+      <path id="body_fill" class="fur" d="M152 184h32v-32h48v-16h48v16h48v32h32v48h32v80h24v96h-32v24H128v-24H96v-96h24v-80h32z"/>
+      <path id="body_shadow_left" class="shade" d="M128 288h40v128h-40zm40-96h32v88h-32zm24 224h152v16H192z"/>
+      <path id="body_shadow_right" class="shade" d="M336 184h24v64h32v72h24v88h-40V296h-24v-72h-16z"/>
+      <rect id="neck_shadow" class="fur2" x="188" y="278" width="144" height="14"/>
+      <path id="belly_patch" class="cream" opacity=".45" d="M200 326h112v24h16v64h-16v18H200v-18h-16v-64h16z"/>
+      <g id="feet" data-rive-origin="256,430">
+        <rect class="outline" x="140" y="416" width="68" height="32" rx="8"/>
+        <rect class="fur2" x="152" y="424" width="44" height="16" rx="4"/>
+        <rect class="outline" x="304" y="416" width="68" height="32" rx="8"/>
+        <rect class="fur2" x="316" y="424" width="44" height="16" rx="4"/>
+      </g>
+    </g>
+
+    <g id="ears" data-rive-origin="256,105">
+      <g id="ear_left" data-rive-origin="168,98">
+        <rect class="outline" x="144" y="72" width="48" height="48" rx="16"/>
+        <rect class="fur2" x="156" y="84" width="28" height="28" rx="10"/>
+        <rect class="cream" opacity=".35" x="162" y="90" width="10" height="10" rx="3"/>
+      </g>
+      <g id="ear_right" data-rive-origin="344,98">
+        <rect class="outline" x="320" y="72" width="48" height="48" rx="16"/>
+        <rect class="fur2" x="328" y="84" width="28" height="28" rx="10"/>
+      </g>
+      <g id="ear_tag" data-rive-origin="373,105">
+        <rect class="outline" x="360" y="94" width="26" height="38" rx="8"/>
+        <rect class="accent" x="368" y="102" width="10" height="22" rx="4"/>
+        <rect class="accent2" x="368" y="120" width="10" height="4"/>
+      </g>
+    </g>
+
+    <g id="head" data-rive-origin="256,192">
+      <path id="head_outline" class="outline" d="M136 104h48V88h144v16h48v32h24v112h-24v40h-40v24H176v-24h-40v-40h-24V136h24z"/>
+      <path id="head_fill" class="fur" d="M152 112h40V96h128v16h40v32h24v96h-24v40h-40v16H184v-16h-40v-40h-24v-96h32z"/>
+      <path id="cheek_shadow" class="shade" d="M272 120h72v24h24v88h-16v32h-56v-16h24v-32h16v-56h-32v-24h-32z"/>
+      <rect id="forehead_highlight" class="cream" opacity=".28" x="184" y="112" width="88" height="14" rx="4"/>
+      <rect id="cheek_left" class="blush" x="168" y="218" width="42" height="18" rx="8"/>
+      <rect id="cheek_right" class="blush" x="328" y="208" width="34" height="16" rx="8"/>
+    </g>
+
+    <g id="eyes_open" data-rive-visible="idle,breathing,talking,thinking" opacity="1">
+      <g id="eye_left_open" data-rive-origin="214,164">
+        <rect class="outline" x="176" y="128" width="72" height="72" rx="26"/>
+        <rect class="white" x="188" y="140" width="48" height="48" rx="18"/>
+        <rect id="pupil_left" class="black" x="212" y="160" width="12" height="12"/>
+        <rect class="white" x="218" y="148" width="8" height="8"/>
+      </g>
+      <g id="eye_right_open" data-rive-origin="308,154">
+        <rect class="outline" x="272" y="116" width="72" height="72" rx="26"/>
+        <rect class="white" x="284" y="128" width="48" height="48" rx="18"/>
+        <rect id="pupil_right" class="black" x="304" y="148" width="12" height="12"/>
+        <rect class="white" x="310" y="136" width="8" height="8"/>
+      </g>
+    </g>
+
+    <g id="eyes_blink" data-rive-visible="blink" opacity="0">
+      <rect class="black" x="188" y="162" width="48" height="10"/>
+      <rect class="black" x="284" y="150" width="48" height="10"/>
+      <rect class="pink" opacity=".55" x="168" y="216" width="42" height="12" rx="6"/>
+      <rect class="pink" opacity=".55" x="330" y="206" width="32" height="12" rx="6"/>
+    </g>
+
+    <g id="muzzle" data-rive-origin="285,227">
+      <path class="muzzle" d="M232 200h80v16h32v48h-16v32H216v-32h-16v-48h32z"/>
+      <rect class="muzzle2" x="248" y="218" width="18" height="10"/>
+      <rect class="muzzle2" x="302" y="218" width="14" height="10"/>
+      <rect class="black" x="264" y="222" width="10" height="10"/>
+      <rect class="black" x="300" y="222" width="10" height="10"/>
+      <rect class="cream" opacity=".30" x="240" y="204" width="38" height="8"/>
+    </g>
+
+    <g id="mouth_idle" data-rive-visible="idle,breathing,thinking" opacity="0">
+      <rect class="black" x="282" y="244" width="8" height="64"/>
+      <rect class="black" x="258" y="306" width="32" height="8"/>
+    </g>
+
+    <g id="mouth_talk_a" data-rive-visible="talking" opacity="0">
+      <rect class="black" x="270" y="248" width="36" height="56"/>
+      <rect class="pink" x="278" y="272" width="20" height="22"/>
+    </g>
+
+    <g id="mouth_talk_b" data-rive-visible="talking" opacity="0">
+      <rect class="black" x="268" y="254" width="40" height="28"/>
+      <rect class="pink" x="280" y="268" width="16" height="8"/>
+    </g>
+
+    <g id="sleep_face" data-rive-visible="sleeping" opacity="0">
+      <rect class="black" x="188" y="160" width="52" height="8"/>
+      <rect class="black" x="284" y="150" width="52" height="8"/>
+      <rect class="black" x="262" y="268" width="56" height="8"/>
+      <g id="zzz" class="white">
+        <rect x="362" y="86" width="42" height="8"/>
+        <rect x="394" y="94" width="8" height="8"/>
+        <rect x="386" y="102" width="8" height="8"/>
+        <rect x="378" y="110" width="42" height="8"/>
+        <rect x="404" y="50" width="30" height="8"/>
+        <rect x="426" y="58" width="8" height="8"/>
+        <rect x="418" y="66" width="30" height="8"/>
+      </g>
+    </g>
+
+    <g id="arms" data-rive-origin="256,340">
+      <g id="arm_left" data-rive-origin="136,324">
+        <rect class="outline" x="72" y="300" width="56" height="24"/>
+        <rect class="outline" x="88" y="324" width="24" height="48"/>
+        <rect class="fur" x="80" y="308" width="40" height="16"/>
+        <rect class="fur" x="96" y="324" width="12" height="40"/>
+        <rect class="fur2" x="102" y="356" width="8" height="10"/>
+      </g>
+      <g id="arm_right" data-rive-origin="376,324">
+        <rect class="outline" x="384" y="300" width="56" height="24"/>
+        <rect class="outline" x="400" y="324" width="24" height="48"/>
+        <rect class="fur" x="392" y="308" width="40" height="16"/>
+        <rect class="fur" x="404" y="324" width="12" height="40"/>
+        <rect class="fur2" x="402" y="356" width="8" height="10"/>
+      </g>
+    </g>
+
+    <g id="sleep_blanket" data-rive-visible="sleeping" opacity="0">
+      <path class="outline" d="M126 342h260v24h28v54h-28v24H126v-24H98v-54h28z"/>
+      <path class="leaf" d="M138 350h236v22h28v40h-28v20H138v-20h-28v-40h28z"/>
+      <path class="leaf2" d="M138 350h90v82h-90zm106 0h18v82h-18zm34 0h18v82h-18z" opacity=".55"/>
+      <rect class="cream" opacity=".40" x="158" y="366" width="56" height="12" rx="4"/>
+    </g>
+
+    <g id="thinking_bulb" data-rive-visible="thinking" opacity="0">
+      <rect class="outline" x="370" y="78" width="48" height="48" rx="18"/>
+      <rect class="glow" x="380" y="88" width="28" height="28" rx="10"/>
+      <rect class="outline" x="390" y="126" width="12" height="20"/>
+      <rect class="outline" x="382" y="146" width="28" height="8"/>
+      <rect class="outline" x="358" y="98" width="8" height="8"/>
+      <rect class="outline" x="424" y="98" width="8" height="8"/>
+      <rect class="outline" x="392" y="64" width="8" height="8"/>
+      <rect class="spark" x="404" y="66" width="8" height="8"/>
+    </g>
+
+    <g id="breath_pixels" data-rive-visible="breathing" opacity="0">
+      <rect class="spark" x="76" y="254" width="8" height="8"/>
+      <rect class="spark" x="428" y="250" width="8" height="8"/>
+      <rect class="accent" x="86" y="266" width="8" height="8"/>
+      <rect class="accent" x="416" y="264" width="8" height="8"/>
+    </g>
+
+    <g id="talk_pixels" data-rive-visible="talking" opacity="0">
+      <rect class="accent" x="386" y="190" width="12" height="8"/>
+      <rect class="accent" x="404" y="174" width="8" height="8"/>
+      <rect class="spark" x="408" y="204" width="18" height="8"/>
+    </g>
+
+    <g id="happy_face" data-rive-visible="happy" opacity="0">
+      <rect class="black" x="188" y="154" width="48" height="8"/>
+      <rect class="black" x="196" y="146" width="32" height="8"/>
+      <rect class="black" x="284" y="142" width="48" height="8"/>
+      <rect class="black" x="292" y="134" width="32" height="8"/>
+      <rect class="black" x="262" y="274" width="56" height="8"/>
+      <rect class="black" x="254" y="266" width="8" height="8"/>
+      <rect class="black" x="318" y="266" width="8" height="8"/>
+      <rect class="pink" x="282" y="280" width="18" height="10"/>
+      <rect class="spark" x="96" y="154" width="10" height="10"/>
+      <rect class="spark" x="420" y="154" width="10" height="10"/>
+      <rect class="accent" x="112" y="170" width="8" height="8"/>
+      <rect class="accent" x="404" y="174" width="8" height="8"/>
+    </g>
+
+    <g id="lovestruck_face" data-rive-visible="lovestruck" opacity="0">
+      <rect class="pink" x="188" y="140" width="16" height="16"/>
+      <rect class="pink" x="220" y="140" width="16" height="16"/>
+      <rect class="pink" x="188" y="156" width="48" height="16"/>
+      <rect class="pink" x="196" y="172" width="32" height="16"/>
+      <rect class="pink" x="208" y="188" width="12" height="12"/>
+      <rect class="pink" x="286" y="128" width="16" height="16"/>
+      <rect class="pink" x="318" y="128" width="16" height="16"/>
+      <rect class="pink" x="286" y="144" width="48" height="16"/>
+      <rect class="pink" x="294" y="160" width="32" height="16"/>
+      <rect class="pink" x="306" y="176" width="12" height="12"/>
+      <rect class="black" x="264" y="268" width="48" height="8"/>
+      <rect class="black" x="256" y="260" width="8" height="8"/>
+      <rect class="black" x="312" y="260" width="8" height="8"/>
+      <rect class="pink" x="282" y="276" width="16" height="8"/>
+      <rect class="pink" opacity=".65" x="156" y="220" width="58" height="18" rx="8"/>
+      <rect class="pink" opacity=".65" x="322" y="206" width="52" height="18" rx="8"/>
+      <rect class="pink" x="398" y="78" width="14" height="14"/>
+      <rect class="pink" x="420" y="86" width="12" height="12"/>
+      <rect class="pink" x="408" y="96" width="18" height="12"/>
+    </g>
+
+    <g id="money_face" data-rive-visible="money" opacity="0">
+      <rect class="outline" x="180" y="132" width="62" height="62" rx="20"/>
+      <rect class="gold" x="190" y="142" width="42" height="42" rx="16"/>
+      <rect class="gold2" x="208" y="152" width="10" height="24"/>
+      <rect class="outline" x="276" y="120" width="62" height="62" rx="20"/>
+      <rect class="gold" x="286" y="130" width="42" height="42" rx="16"/>
+      <rect class="gold2" x="304" y="140" width="10" height="24"/>
+      <rect class="black" x="270" y="252" width="40" height="40"/>
+      <rect class="pink" x="282" y="274" width="16" height="12"/>
+      <rect class="outline" x="382" y="250" width="42" height="14"/>
+      <rect class="gold" x="388" y="244" width="30" height="14"/>
+      <rect class="gold2" x="388" y="260" width="30" height="8"/>
+      <rect class="gold" x="94" y="108" width="18" height="18" rx="6"/>
+      <rect class="gold" x="408" y="96" width="18" height="18" rx="6"/>
+    </g>
+
+    <g id="hungry_face" data-rive-visible="hungry" opacity="0">
+      <rect class="black" x="268" y="250" width="42" height="44"/>
+      <rect class="pink" x="280" y="268" width="18" height="30"/>
+      <rect class="cool" x="314" y="256" width="8" height="28" rx="4"/>
+      <rect class="cool" x="318" y="282" width="8" height="8"/>
+      <rect class="outline" x="82" y="104" width="72" height="30"/>
+      <rect class="cream" x="94" y="112" width="48" height="12"/>
+      <rect class="outline" x="98" y="92" width="38" height="18"/>
+      <rect class="leaf" x="106" y="88" width="22" height="14"/>
+      <rect class="spark" x="366" y="174" width="12" height="12"/>
+    </g>
+
+    <g id="angry_face" data-rive-visible="angry" opacity="0">
+      <rect class="black" x="178" y="132" width="62" height="10"/>
+      <rect class="black" x="188" y="144" width="42" height="14"/>
+      <rect class="black" x="282" y="120" width="62" height="10"/>
+      <rect class="black" x="292" y="132" width="42" height="14"/>
+      <rect class="anger" opacity=".32" x="156" y="206" width="54" height="24" rx="10"/>
+      <rect class="anger" opacity=".32" x="326" y="196" width="48" height="22" rx="10"/>
+      <rect class="black" x="260" y="276" width="56" height="8"/>
+      <rect class="black" x="252" y="284" width="8" height="8"/>
+      <rect class="black" x="316" y="284" width="8" height="8"/>
+      <rect class="anger" x="386" y="84" width="8" height="34"/>
+      <rect class="anger" x="398" y="72" width="8" height="34"/>
+      <rect class="anger" x="410" y="84" width="8" height="34"/>
+    </g>
+
+    <g id="sick_face" data-rive-visible="sick" opacity="0">
+      <rect class="sick" opacity=".18" x="152" y="112" width="232" height="184"/>
+      <rect class="black" x="190" y="156" width="42" height="8"/>
+      <rect class="black" x="286" y="146" width="42" height="8"/>
+      <rect class="black" x="266" y="272" width="16" height="8"/>
+      <rect class="black" x="282" y="280" width="16" height="8"/>
+      <rect class="black" x="298" y="272" width="16" height="8"/>
+      <rect class="cool" x="350" y="166" width="12" height="26" rx="6"/>
+      <rect class="cool" x="354" y="190" width="8" height="8"/>
+      <rect class="outline" x="116" y="236" width="58" height="16" rx="6"/>
+      <rect class="white" x="124" y="240" width="42" height="8"/>
+      <rect class="anger" x="158" y="240" width="10" height="8"/>
+      <rect class="sick" x="394" y="92" width="34" height="10"/>
+      <rect class="sick" x="404" y="80" width="14" height="34"/>
+    </g>
+
+    <g id="programmer_face" data-rive-visible="programmer" opacity="0">
+      <rect class="outline" x="154" y="346" width="204" height="78" rx="8"/>
+      <rect class="ink" x="166" y="358" width="180" height="50" rx="4"/>
+      <rect class="accent" x="190" y="374" width="20" height="8"/>
+      <rect class="accent" x="220" y="374" width="36" height="8"/>
+      <rect class="spark" x="264" y="374" width="12" height="8"/>
+      <rect class="accent" x="216" y="390" width="18" height="8"/>
+      <rect class="spark" x="244" y="390" width="54" height="8"/>
+      <rect class="outline" x="224" y="424" width="64" height="12"/>
+      <rect class="cool" x="184" y="126" width="58" height="10"/>
+      <rect class="cool" x="278" y="114" width="58" height="10"/>
+      <rect class="cool" x="248" y="134" width="24" height="8"/>
+      <rect class="accent" x="394" y="92" width="12" height="8"/>
+      <rect class="accent" x="414" y="108" width="20" height="8"/>
+      <rect class="spark" x="404" y="124" width="12" height="8"/>
+    </g>
+
+    <g id="document_face" data-rive-visible="document" opacity="0">
+      <rect class="outline" x="78" y="116" width="76" height="94" rx="6"/>
+      <rect class="paper" x="90" y="128" width="52" height="70" rx="3"/>
+      <rect class="paper2" x="100" y="144" width="34" height="6"/>
+      <rect class="paper2" x="100" y="160" width="28" height="6"/>
+      <rect class="paper2" x="100" y="176" width="36" height="6"/>
+      <rect class="accent" x="112" y="116" width="18" height="12"/>
+      <rect class="outline" x="364" y="304" width="76" height="80" rx="6"/>
+      <rect class="paper" x="376" y="316" width="52" height="56" rx="3"/>
+      <rect class="paper2" x="386" y="330" width="32" height="6"/>
+      <rect class="paper2" x="386" y="346" width="38" height="6"/>
+      <rect class="anger" opacity=".55" x="390" y="358" width="24" height="8"/>
+      <rect class="black" x="260" y="268" width="56" height="8"/>
+      <rect class="black" x="252" y="260" width="8" height="8"/>
+      <rect class="black" x="316" y="260" width="8" height="8"/>
+    </g>
+
+    <g id="phd_face" data-rive-visible="phd" opacity="0">
+      <rect class="outline" x="168" y="54" width="176" height="28"/>
+      <rect class="ink" x="184" y="62" width="144" height="12"/>
+      <rect class="outline" x="222" y="78" width="68" height="24"/>
+      <rect class="ink" x="234" y="78" width="44" height="14"/>
+      <rect class="gold" x="330" y="76" width="8" height="42"/>
+      <rect class="gold" x="324" y="114" width="20" height="12"/>
+      <rect class="outline" x="176" y="132" width="70" height="70" rx="24"/>
+      <rect class="white" x="188" y="144" width="46" height="46" rx="16"/>
+      <rect class="black" x="210" y="162" width="10" height="10"/>
+      <rect class="outline" x="274" y="120" width="70" height="70" rx="24"/>
+      <rect class="white" x="286" y="132" width="46" height="46" rx="16"/>
+      <rect class="black" x="306" y="150" width="10" height="10"/>
+      <rect class="outline" x="246" y="152" width="28" height="8"/>
+      <rect class="paper" x="390" y="278" width="50" height="18" rx="9"/>
+      <rect class="outline" x="386" y="274" width="58" height="26" rx="13" opacity=".96"/>
+      <rect class="paper" x="394" y="280" width="42" height="14" rx="7"/>
+      <rect class="anger" x="410" y="270" width="10" height="34"/>
+    </g>
+
+    <g id="writer_face" data-rive-visible="writer" opacity="0">
+      <rect class="outline" x="94" y="320" width="112" height="86" rx="6"/>
+      <rect class="paper" x="106" y="332" width="88" height="62" rx="3"/>
+      <rect class="paper2" x="120" y="350" width="56" height="6"/>
+      <rect class="paper2" x="120" y="366" width="46" height="6"/>
+      <rect class="paper2" x="120" y="382" width="62" height="6"/>
+      <rect class="outline" x="344" y="116" width="14" height="94" rx="4" transform="rotate(24 351 163)"/>
+      <rect class="gold" x="346" y="110" width="18" height="18" rx="4" transform="rotate(24 355 119)"/>
+      <rect class="ink" x="330" y="198" width="20" height="10" transform="rotate(24 340 203)"/>
+      <rect class="black" x="270" y="272" width="36" height="8"/>
+      <rect class="spark" x="384" y="92" width="10" height="10"/>
+      <rect class="spark" x="408" y="104" width="8" height="8"/>
+    </g>
+
+    <g id="artist_face" data-rive-visible="artist" opacity="1">
+      <rect class="outline" x="188" y="72" width="118" height="42" rx="20"/>
+      <rect class="purple" x="200" y="82" width="94" height="22" rx="10"/>
+      <rect class="outline" x="242" y="58" width="28" height="28" rx="10"/>
+      <rect class="purple" x="250" y="66" width="12" height="12" rx="4"/>
+      <rect class="outline" x="360" y="306" width="72" height="58" rx="22"/>
+      <rect class="paper" x="372" y="316" width="48" height="38" rx="16"/>
+      <rect class="anger" x="382" y="326" width="10" height="10" rx="4"/>
+      <rect class="gold" x="398" y="322" width="10" height="10" rx="4"/>
+      <rect class="accent" x="392" y="340" width="10" height="10" rx="4"/>
+      <rect class="outline" x="92" y="282" width="14" height="88" rx="4" transform="rotate(-28 99 326)"/>
+      <rect class="gold2" x="84" y="268" width="22" height="22" rx="6" transform="rotate(-28 95 279)"/>
+      <rect class="black" x="264" y="268" width="48" height="8"/>
+      <rect class="black" x="256" y="260" width="8" height="8"/>
+      <rect class="black" x="312" y="260" width="8" height="8"/>
+    </g>
+
+    <g id="lecturer_face" data-rive-visible="lecturer" opacity="0">
+      <rect class="outline" x="66" y="94" width="116" height="76" rx="6"/>
+      <rect class="board" x="78" y="106" width="92" height="52" rx="3"/>
+      <rect class="spark" x="96" y="122" width="44" height="6"/>
+      <rect class="accent" x="96" y="138" width="28" height="6"/>
+      <rect class="gold" x="132" y="138" width="18" height="6"/>
+      <rect class="outline" x="184" y="170" width="14" height="82" rx="4" transform="rotate(42 191 211)"/>
+      <rect class="gold" x="188" y="162" width="18" height="18" rx="4" transform="rotate(42 197 171)"/>
+      <rect class="black" x="262" y="270" width="52" height="8"/>
+      <rect class="black" x="254" y="262" width="8" height="8"/>
+      <rect class="black" x="314" y="262" width="8" height="8"/>
+      <rect class="accent" x="396" y="90" width="10" height="10"/>
+      <rect class="spark" x="416" y="108" width="8" height="8"/>
+    </g>
+  </g>
+</svg>

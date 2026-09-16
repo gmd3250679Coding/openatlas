@@ -28,9 +28,9 @@ async function loginApi(request: APIRequestContext) {
 
 async function loginUi(page: Page) {
   await page.goto('/login');
-  await page.getByPlaceholder('用户名').fill(EMAIL);
-  await page.getByPlaceholder('密码').fill(PASSWORD);
-  await page.getByRole('button', { name: /登\s*录/ }).click();
+  await page.locator('#atlas-auth_username').fill(EMAIL);
+  await page.locator('#atlas-auth_password').fill(PASSWORD);
+  await page.getByRole('button', { name: /进入 Atlas/ }).click();
   await expect(page).toHaveURL(/\/overview/);
 }
 

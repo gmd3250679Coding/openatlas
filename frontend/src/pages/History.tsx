@@ -5,6 +5,7 @@ import { SearchOutlined } from '@ant-design/icons';
 import type { Conversation, Employee } from '../services/api';
 import { fetchConversations, fetchEmployees, forkSession } from '../services/api';
 import { productVisible, showTestFixtures } from '../utils/productVisibility';
+import { resolveEmployeeAvatarImage } from '../utils/employeeVisuals';
 
 export default function History() {
   const navigate = useNavigate();
@@ -70,24 +71,29 @@ export default function History() {
   };
 
   return (
-    <div style={{ padding: '32px 48px 64px', maxWidth: 900 }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 28 }}>
+    <div className="admin-console" style={{ maxWidth: 1040 }}>
+      <section className="admin-hero">
         <div>
-          <h1 style={{
-            fontSize: 28, fontWeight: 700, color: 'var(--text-primary)',
-            letterSpacing: '-0.02em', margin: 0,
-          }}>对话历史</h1>
-          <p style={{ fontSize: 14, color: 'var(--text-secondary)', margin: '6px 0 0' }}>
-            {conversations.length} 条对话记录
+          <div className="admin-kicker">Conversation Archive</div>
+          <h1 className="admin-title">对话历史</h1>
+          <p className="admin-subtitle">
+            回看单员工、群聊接力和任务会话，支持从历史会话创建分支继续推进。
           </p>
         </div>
-        <Input
-          prefix={<SearchOutlined />}
-          placeholder="搜索对话..."
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          style={{ width: 260 }}
-        />
+        <div className="admin-actions">
+          <Input
+            prefix={<SearchOutlined />}
+            placeholder="搜索对话..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={{ width: 280 }}
+          />
+        </div>
+      </section>
+      <div className="admin-stat-grid">
+        <div className="admin-stat-card"><div className="admin-stat-label">全部会话</div><div className="admin-stat-value">{conversations.length}</div><div className="admin-stat-hint">当前可见历史</div></div>
+        <div className="admin-stat-card"><div className="admin-stat-label">群聊协作</div><div className="admin-stat-value">{conversations.filter((c) => c.is_group).length}</div><div className="admin-stat-hint">多员工接力</div></div>
+        <div className="admin-stat-card"><div className="admin-stat-label">进行中</div><div className="admin-stat-value">{conversations.filter((c) => c.task_status === 'running' || c.status === 'running').length}</div><div className="admin-stat-hint">仍可能恢复</div></div>
       </div>
 
       {loading ? (
@@ -101,29 +107,18 @@ export default function History() {
             const avatar = emp?.avatar_char || '?';
             const color = emp?.department?.color || 'var(--accent)';
             const empName = emp?.name || (item.is_group ? '群聊协作' : '未分配员工');
+            const avatarImage = emp ? resolveEmployeeAvatarImage(emp) : '';
 
             return (
               <article
                 key={item.id}
                 onClick={() => navigate(`/overview?conversation=${item.id}`)}
+                className="admin-history-card"
                 style={{
-                  background: 'var(--bg-elevated)',
-                  border: '1px solid var(--border-subtle)',
-                  borderRadius: 'var(--radius-md)',
-                  padding: '14px 18px',
                   cursor: 'pointer',
                   display: 'flex',
                   alignItems: 'center',
                   gap: 14,
-                  transition: 'border-color 0.15s, background 0.15s',
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.borderColor = 'var(--accent)';
-                  e.currentTarget.style.background = 'var(--bg-secondary)';
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.borderColor = 'var(--border-subtle)';
-                  e.currentTarget.style.background = 'var(--bg-elevated)';
                 }}
               >
                 <div style={{
@@ -131,8 +126,9 @@ export default function History() {
                   background: color, color: '#fff',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
                   fontSize: 16, fontWeight: 700, flexShrink: 0,
+                  overflow: 'hidden',
                 }}>
-                  {avatar}
+                  {avatarImage ? <img src={avatarImage} alt={empName} style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : avatar}
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>

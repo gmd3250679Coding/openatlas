@@ -4,6 +4,8 @@ import { Input, Select } from 'antd';
 import type { Employee } from '../services/api';
 import { fetchEmployees } from '../services/api';
 import { IconSearch, IconPlus } from '../components/Icons';
+import { employeePhotoVariant, resolveEmployeeCardImage } from '../utils/employeeVisuals';
+import { useAuth } from '../contexts/AuthContext';
 
 const TIER_INFO: Record<string, { dot: string; label: string; cls: string }> = {
   busy: { dot: 'var(--color-success)', label: '在岗', cls: 'busy' },
@@ -30,6 +32,7 @@ interface UIEmployee {
   mood: string;
   skill: string;
   photo?: string;
+  photoVariant: number;
   conversations: string;
   responseTime: string;
   successRate: string;
@@ -56,6 +59,8 @@ function mapEmployee(e: Employee): UIEmployee {
     statusTier: mapStatusToTier(e.status),
     mood: e.mood || '',
     skill: skillList.length > 0 ? skillList.slice(0, 4).join(' / ') : '默认 Hermes 能力',
+    photo: resolveEmployeeCardImage(e),
+    photoVariant: employeePhotoVariant(e.__id || e.id || e.name),
     conversations: String(e.conversation_count || e.total_messages || 0),
     responseTime: e.model || 'hermes-agent',
     successRate: e.total_tokens ? `${e.total_tokens} Token` : '待积累',
@@ -64,6 +69,8 @@ function mapEmployee(e: Employee): UIEmployee {
 
 export default function Workforce() {
   const navigate = useNavigate();
+  const { user } = useAuth();
+  const isAdmin = Boolean(user?.is_admin);
   const [search, setSearch] = useState('');
   const [dept, setDept] = useState<string>('all');
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -136,7 +143,7 @@ export default function Workforce() {
             <h1 className="wf-title">数智员工</h1>
             <p className="wf-sub">
               <span className="wf-dot-live" />
-              {onlineCount}/{mapped.length} 在线 · {depts.length} 个部门 · 平均响应 0.6s
+              {onlineCount}/{mapped.length} 在线 · {depts.length} 个部门{isAdmin ? ' · 平均响应 0.6s' : ' · 内置员工可直接试用'}
             </p>
           </div>
           <button
@@ -191,7 +198,7 @@ export default function Workforce() {
                   <img
                     src={e.photo}
                     alt={e.name}
-                    className="id-badge-img"
+                    className={`id-badge-img id-badge-img--v${e.photoVariant}`}
                   />
                 ) : (
                   <span style={{ background: e.color }} className="id-badge-initial">
@@ -209,19 +216,22 @@ export default function Workforce() {
                 </div>
 
                 {/* Dismiss action */}
-                <button
-                  className="id-badge-dismiss"
-                  onClick={(ev) => {
-                    ev.stopPropagation();
-                    navigate(`/workforce/dismiss/${e.id}`);
-                  }}
-                  title="开除"
-                >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
-                </button>
+                {user?.is_admin && (
+                  <button
+                    className="id-badge-dismiss"
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      navigate(`/workforce/dismiss/${e.id}`);
+                    }}
+                    title="开除"
+                    aria-label={`开除 ${e.name}`}
+                  >
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="18" y1="6" x2="6" y2="18" />
+                      <line x1="6" y1="6" x2="18" y2="18" />
+                    </svg>
+                  </button>
+                )}
               </div>
 
               {/* Info */}
@@ -240,17 +250,31 @@ export default function Workforce() {
                   ))}
                 </div>
 
-                <div className="id-badge-meta">
-                  <span className="id-badge-meta-item">
-                    <strong>{e.conversations}</strong>次
-                  </span>
-                  <span className="id-badge-meta-item">
-                    <strong>{e.responseTime}</strong>
-                  </span>
-                  <span className="id-badge-meta-item">
-                    <strong>{e.successRate}</strong>
-                  </span>
-                </div>
+                {isAdmin ? (
+                  <div className="id-badge-meta">
+                    <span className="id-badge-meta-item">
+                      <strong>{e.conversations}</strong>次
+                    </span>
+                    <span className="id-badge-meta-item">
+                      <strong>{e.responseTime}</strong>
+                    </span>
+                    <span className="id-badge-meta-item">
+                      <strong>{e.successRate}</strong>
+                    </span>
+                  </div>
+                ) : (
+                  <div className="id-badge-meta id-badge-meta--viewer">
+                    <span className="id-badge-meta-item">
+                      <strong>可试用</strong>
+                    </span>
+                    <span className="id-badge-meta-item">
+                      <strong>内置员工</strong>
+                    </span>
+                    <span className="id-badge-meta-item">
+                      <strong>只读配置</strong>
+                    </span>
+                  </div>
+                )}
               </div>
             </article>
           );

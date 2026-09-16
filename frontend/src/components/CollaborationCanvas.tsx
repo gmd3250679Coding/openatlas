@@ -39,6 +39,7 @@ import {
   type NodeChange,
   type EdgeChange,
   type Connection,
+  type ReactFlowInstance,
   addEdge,
   applyNodeChanges,
   applyEdgeChanges,
@@ -271,10 +272,10 @@ async function layoutWithElk(
     layoutOptions: {
       'elk.algorithm': 'layered',
       'elk.direction': 'RIGHT',
-      'elk.layered.spacing.nodeNodeBetweenLayers': '80',
-      'elk.spacing.nodeNode': '40',
+      'elk.layered.spacing.nodeNodeBetweenLayers': '44',
+      'elk.spacing.nodeNode': '28',
     },
-    children: nodes.map((n) => ({ id: n.id, width: 220, height: 80 })),
+    children: nodes.map((n) => ({ id: n.id, width: 190, height: 72 })),
     edges: edges.map((e) => ({ id: e.id, sources: [e.source], targets: [e.target] })),
   };
   const layout = await elk.layout(graph);
@@ -282,9 +283,13 @@ async function layoutWithElk(
   layout.children?.forEach((c) => {
     positioned.set(c.id, { x: c.x ?? 0, y: c.y ?? 0 });
   });
+  const values = Array.from(positioned.values());
+  const minX = values.length ? Math.min(...values.map((p) => p.x)) : 0;
+  const minY = values.length ? Math.min(...values.map((p) => p.y)) : 0;
+  const margin = 36;
   return nodes.map((n) => {
     const pos = positioned.get(n.id);
-    return pos ? { ...n, position: pos } : n;
+    return pos ? { ...n, position: { x: pos.x - minX + margin, y: pos.y - minY + margin } } : n;
   });
 }
 
@@ -330,6 +335,7 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
   const [allEmployees, setAllEmployees] = useState<Employee[]>([]);
   // M4.5.1: debounce 写入后端 (500ms, 防拖拽时 N req/s)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestCanvasStateRef = useRef<{ nodes: Node<AgentNodeData>[]; edges: Edge[] }>({ nodes: INITIAL_NODES, edges: INITIAL_EDGES });
   const lastSavedRef = useRef<string>(''); // 去重:状态未变不发请求
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
@@ -344,6 +350,21 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedNodeId) || null, [nodes, selectedNodeId]);
   const [messageApi, messageContextHolder] = message.useMessage();
+  const flowInstanceRef = useRef<ReactFlowInstance<Node<AgentNodeData>, Edge> | null>(null);
+  const canvasInitKeyRef = useRef('');
+  const canvasInitKey = useMemo(() => [
+    conversationId || 'new',
+    initialCanvasState?.version || 0,
+    initialCanvasState?.nodes?.length || 0,
+    sessionParticipants?.employee_id || '',
+    ...(sessionParticipants?.participant_ids || []),
+  ].join('|'), [conversationId, initialCanvasState, sessionParticipants]);
+
+  const fitCanvasView = useCallback((delay = 80) => {
+    window.setTimeout(() => {
+      flowInstanceRef.current?.fitView({ padding: 0.4, maxZoom: 0.95, duration: 220 });
+    }, delay);
+  }, []);
 
   const buildSessionTopology = useCallback((): { nodes: Node<AgentNodeData>[]; edges: Edge[] } | null => {
     const orderedIds = [
@@ -483,6 +504,7 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
   // M4.5.1: 打开 + 注入 initialCanvasState → 恢复 React state;空/旧 demo 时按真实会话参与者生成拓扑
   useEffect(() => {
     if (!open) return;
+    if (canvasInitKeyRef.current === canvasInitKey) return;
     const hasState = Boolean(initialCanvasState && (initialCanvasState.nodes.length > 0 || initialCanvasState.edges.length > 0));
     let normalized = hasState
       ? normalizeCanvasState(
@@ -502,7 +524,8 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
       nodes: normalized.nodes,
       edges: normalized.edges,
     });
-  }, [open, initialCanvasState, buildSessionTopology]);
+    canvasInitKeyRef.current = canvasInitKey;
+  }, [open, canvasInitKey, initialCanvasState, buildSessionTopology]);
 
   // M4.3.1: addNode — 选中 palette 员工 → 加节点 (随机位置, 走 ELK 重 layout)
   const addNode = useCallback(
@@ -542,8 +565,15 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
     layoutWithElk(nodes, edges).then((positioned) => {
       setNodes(positioned);
       setLayouted(true);
+      fitCanvasView(120);
+      fitCanvasView(420);
     });
-  }, [open, layouted, nodes, edges]);
+  }, [open, layouted, nodes, edges, fitCanvasView]);
+
+  useEffect(() => {
+    if (!open || !layouted) return;
+    fitCanvasView(180);
+  }, [open, layouted, nodes.length, edges.length, fitCanvasView]);
 
   // M4.5.1: nodes/edges 变化 → debounce 500ms 调 patchCanvasState
   useEffect(() => {
@@ -575,19 +605,33 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
     };
   }, [nodes, edges, open, conversationId]);
 
+  useEffect(() => {
+    latestCanvasStateRef.current = { nodes, edges };
+  }, [nodes, edges]);
+
   // M4.5.1: 卸载/关闭时清掉 pending timer + 卸载时同步 flush
   useEffect(() => {
     const flushOnUnload = () => {
       if (!conversationId || !debounceRef.current) return;
-      // 同步发 (beacon API, 不阻塞 unload)
+      // keepalive fetch can carry Authorization; sendBeacon cannot, and would
+      // leave noisy 401s in the console/product audit.
       try {
+        const latest = latestCanvasStateRef.current;
         const payload = JSON.stringify({
-          nodes: nodes.map((n) => ({ id: n.id, type: n.type, position: n.position, data: n.data })),
-          edges: edges.map((e) => ({ id: e.id, source: e.source, target: e.target })),
+          nodes: latest.nodes.map((n) => ({ id: n.id, type: n.type, position: n.position, data: n.data })),
+          edges: latest.edges.map((e) => ({ id: e.id, source: e.source, target: e.target })),
           version: 1,
         });
-        const blob = new Blob([payload], { type: 'application/json' });
-        navigator.sendBeacon(`/api/sessions/${conversationId}/canvas-state`, blob);
+        const token = localStorage.getItem('openatlas_access_token') || '';
+        void fetch(`/api/sessions/${conversationId}/canvas-state`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: payload,
+          keepalive: true,
+        }).catch(() => undefined);
       } catch {
         // best-effort, ignore
       }
@@ -595,9 +639,8 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
     window.addEventListener('beforeunload', flushOnUnload);
     return () => {
       window.removeEventListener('beforeunload', flushOnUnload);
-      if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [conversationId, nodes, edges]);
+  }, [conversationId]);
 
   // demo 状态切换:模拟 SSE agent_thinking/running/done 序列。
   // 优先在当前画布拓扑上播放，避免把模板节点替换成固定 demo 节点。
@@ -661,7 +704,7 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
 
   const openTemplateModal = useCallback(() => {
     if (!conversationId) {
-      messageApi.warning('请先进入一个会话再保存方案');
+      messageApi.warning('请先通过首页“创建会话 → 新建协作方案”进入画布');
       return;
     }
     setTemplateName(`协作方案-${new Date().toLocaleDateString('zh-CN')}`);
@@ -670,7 +713,7 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
 
   const handleSaveTemplate = useCallback(async () => {
     if (!conversationId) {
-      messageApi.warning('请先进入一个会话再保存方案');
+      messageApi.warning('请先通过首页“创建会话 → 新建协作方案”进入画布');
       return;
     }
     const name = templateName.trim();
@@ -843,7 +886,7 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
             aria-label="保存为协作方案"
             style={{ color: 'var(--text-secondary)' }}
           >
-            保存为方案
+            保存/另存为方案
           </Button>
           <Button
             type="text"
@@ -1035,12 +1078,16 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
             onNodeClick={onNodeClick}  // M5 (Event Log): 节点 click handler
+            onInit={(instance) => {
+              flowInstanceRef.current = instance;
+              window.setTimeout(() => instance.fitView({ padding: 0.4, maxZoom: 0.95, duration: 220 }), 120);
+            }}
             nodesDraggable
             nodesConnectable
             edgesFocusable
             deleteKeyCode={['Backspace', 'Delete']}
             fitView
-            fitViewOptions={{ padding: 0.2 }}
+            fitViewOptions={{ padding: 0.4, maxZoom: 0.95 }}
             proOptions={{ hideAttribution: true }}
             minZoom={0.3}
             maxZoom={1.5}
@@ -1102,14 +1149,24 @@ const CollaborationCanvas = forwardRef<CanvasHandle, Props>(function Collaborati
     </Modal>
     <Modal
       open={templateModalOpen}
-      title="保存为可复用协作方案"
-      okText="保存方案"
+      title="保存/另存为可复用协作方案"
+      okText="保存为方案"
       cancelText="取消"
       onOk={handleSaveTemplate}
       onCancel={() => setTemplateModalOpen(false)}
       destroyOnHidden
     >
       <div style={{ display: 'grid', gap: 12 }}>
+        <div style={{
+          padding: '10px 12px',
+          borderRadius: 10,
+          background: 'var(--accent-soft)',
+          color: 'var(--text-secondary)',
+          fontSize: 12,
+          lineHeight: 1.6,
+        }}>
+          保存后可在首页“创建会话 → 从方案库创建”中复用，系统会按画布节点创建新的作战室。
+        </div>
         <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
           方案名称
           <Input value={templateName} onChange={(e) => setTemplateName(e.target.value)} placeholder="例如：标书评审三员工接力" />

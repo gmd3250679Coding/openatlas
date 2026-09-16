@@ -1,9 +1,25 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      (function () {
+        var theme = 'light';
+        try {
+          var saved = window.localStorage && window.localStorage.getItem('atlas-theme');
+          if (saved === 'dark' || saved === 'light') {
+            theme = saved;
+          }
+        } catch (error) {
+          theme = 'light';
+        }
+        document.documentElement.setAttribute('data-theme', theme);
+        document.documentElement.style.colorScheme = theme;
+      })();
+    </script>
     <title>OpenAtlas · 数智员工工作台</title>
   </head>
   <body>

@@ -81,11 +81,19 @@ def default_target() -> RuntimeTarget:
     )
 
 
-async def resolve_target(db, tenant_id: str) -> RuntimeTarget:
-    """Look up the HermesRuntime row for tenant_id, or fall back to default.
+def _allow_default_runtime_fallback() -> bool:
+    explicit = os.environ.get("OPENATLAS_ALLOW_DEFAULT_RUNTIME_FALLBACK")
+    if explicit is not None:
+        return explicit.strip().lower() in {"1", "true", "yes", "on"}
+    return os.environ.get("OPENATLAS_ENV", "development").strip().lower() not in {"prod", "production"}
 
-    If a row exists with status='running', use it. Otherwise fall back to
-    TENANT_HERMES_BASE_URL so the API still works in dev (no runtime started).
+
+async def resolve_target(db, tenant_id: str) -> RuntimeTarget:
+    """Look up the tenant HermesRuntime row.
+
+    Dev mode may fall back to HERMES_BASE_URL. Production fails closed so a
+    tenant with a stopped/missing runtime cannot accidentally reuse the default
+    gateway and leak state across isolation boundaries.
     """
     from app.db.models import HermesRuntime, RuntimeStatus  # local import to avoid cycle
 
@@ -102,6 +110,9 @@ async def resolve_target(db, tenant_id: str) -> RuntimeTarget:
             tenant_id=tenant_id,
             runtime_id=row.id,
         )
+    if not _allow_default_runtime_fallback():
+        detail = "not registered" if not row else f"status={row.status!r}, gateway={bool(row.gateway_base_url)}"
+        raise RuntimeError(f"Hermes runtime for tenant {tenant_id} is unavailable ({detail})")
     return default_target()
 
 
@@ -124,6 +135,25 @@ async def get_capabilities(t: RuntimeTarget) -> dict[str, Any]:
 async def get_models(t: RuntimeTarget) -> dict[str, Any]:
     async with _client(timeout=10) as c:
         r = await c.get(f"{t.base_url}/v1/models", headers=t.headers())
+        r.raise_for_status()
+        return r.json()
+
+
+async def create_chat_completion(
+    t: RuntimeTarget,
+    *,
+    messages: list[dict[str, Any]],
+    model: str = "hermes-agent",
+    temperature: float = 0,
+    timeout: float = 45,
+) -> dict[str, Any]:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    async with _client(timeout=timeout) as c:
+        r = await c.post(f"{t.base_url}/v1/chat/completions", json=payload, headers=t.headers())
         r.raise_for_status()
         return r.json()
 

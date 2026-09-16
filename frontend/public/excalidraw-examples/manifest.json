@@ -1,0 +1,71 @@
+{
+  "source": "https://github.com/github/awesome-copilot/tree/main/skills/excalidraw-diagram-generator/templates",
+  "license": "MIT",
+  "downloaded_at": "2026-06-20",
+  "examples": [
+    {
+      "key": "flowchart",
+      "title": "流程图示例",
+      "kind": "flowchart",
+      "file": "flowchart-template.excalidraw",
+      "upstream": "https://github.com/github/awesome-copilot/blob/main/skills/excalidraw-diagram-generator/templates/flowchart-template.excalidraw",
+      "summary": "用开始、步骤、判断和结束表达清晰流程。"
+    },
+    {
+      "key": "business-flow-swimlane",
+      "title": "泳道流程示例",
+      "kind": "flowchart",
+      "file": "business-flow-swimlane-template.excalidraw",
+      "upstream": "https://github.com/github/awesome-copilot/blob/main/skills/excalidraw-diagram-generator/templates/business-flow-swimlane-template.excalidraw",
+      "summary": "把角色、部门和交接关系放在同一张图里。"
+    },
+    {
+      "key": "data-flow-diagram",
+      "title": "数据流示例",
+      "kind": "architecture",
+      "file": "data-flow-diagram-template.excalidraw",
+      "upstream": "https://github.com/github/awesome-copilot/blob/main/skills/excalidraw-diagram-generator/templates/data-flow-diagram-template.excalidraw",
+      "summary": "突出数据来源、处理节点、存储和输出。"
+    },
+    {
+      "key": "sequence-diagram",
+      "title": "时序图示例",
+      "kind": "architecture",
+      "file": "sequence-diagram-template.excalidraw",
+      "upstream": "https://github.com/github/awesome-copilot/blob/main/skills/excalidraw-diagram-generator/templates/sequence-diagram-template.excalidraw",
+      "summary": "按时间线展示对象之间的请求与响应。"
+    },
+    {
+      "key": "class-diagram",
+      "title": "类图示例",
+      "kind": "architecture",
+      "file": "class-diagram-template.excalidraw",
+      "upstream": "https://github.com/github/awesome-copilot/blob/main/skills/excalidraw-diagram-generator/templates/class-diagram-template.excalidraw",
+      "summary": "表达类、属性、方法和继承/关联关系。"
+    },
+    {
+      "key": "er-diagram",
+      "title": "ER 图示例",
+      "kind": "architecture",
+      "file": "er-diagram-template.excalidraw",
+      "upstream": "https://github.com/github/awesome-copilot/blob/main/skills/excalidraw-diagram-generator/templates/er-diagram-template.excalidraw",
+      "summary": "展示实体、主外键和数据关系。"
+    },
+    {
+      "key": "mindmap",
+      "title": "脑图示例",
+      "kind": "freeform",
+      "file": "mindmap-template.excalidraw",
+      "upstream": "https://github.com/github/awesome-copilot/blob/main/skills/excalidraw-diagram-generator/templates/mindmap-template.excalidraw",
+      "summary": "围绕中心主题组织分支和子主题。"
+    },
+    {
+      "key": "relationship",
+      "title": "关系图示例",
+      "kind": "architecture",
+      "file": "relationship-template.excalidraw",
+      "upstream": "https://github.com/github/awesome-copilot/blob/main/skills/excalidraw-diagram-generator/templates/relationship-template.excalidraw",
+      "summary": "用少量节点讲清依赖、影响和协作关系。"
+    }
+  ]
+}

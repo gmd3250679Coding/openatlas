@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Tag, Button, Modal, Input, Select, message, Upload, Space, Alert, Empty, Popconfirm, Drawer, Descriptions } from 'antd';
 import { InboxOutlined, FileZipOutlined, DeleteOutlined } from '@ant-design/icons';
 import {
-  fetchSkillMarket, fetchMe, createSkill, publishSkill, disableSkill, forkSkill, importSkillFromZip, fetchEmployees, syncHermesSkills,
+  fetchSkillMarket, fetchMe, createSkill, publishSkill, disableSkill, forkSkill, importSkillFromZip, fetchEmployees, syncHermesSkills, patchSkill,
   fetchSkillHealth, reconcileHermesSkills,
   browseHermesSkillsHub, searchHermesSkillsHub, installHermesSkill,
   hermesSkillLifecycleAction, exportHermesSkillSnapshot,
@@ -25,11 +25,29 @@ function isHermesSkill(skill: any) {
   return String(skill?.source_ref || '').startsWith('hermes:');
 }
 
+function isLocalPackageSkill(skill: any) {
+  return String(skill?.source_ref || '').startsWith('zip:') || String(skill?.source_ref || '').startsWith('openatlas:');
+}
+
+function skillSourceKind(skill: any): 'hermes' | 'local' | 'openatlas' {
+  if (isHermesSkill(skill)) return 'hermes';
+  if (isLocalPackageSkill(skill)) return 'local';
+  return 'openatlas';
+}
+
+function skillSourceTag(skill: any) {
+  const kind = skillSourceKind(skill);
+  if (kind === 'hermes') return { label: 'Hermes 运行时', color: 'cyan' };
+  if (kind === 'local') return { label: '本地导入包', color: 'purple' };
+  return { label: 'OpenAtlas 元数据', color: 'default' };
+}
+
 function skillSort(a: any, b: any) {
   const enabledDelta = Number(b.status === 'enabled') - Number(a.status === 'enabled');
   if (enabledDelta) return enabledDelta;
-  const hermesDelta = Number(isHermesSkill(b)) - Number(isHermesSkill(a));
-  if (hermesDelta) return hermesDelta;
+  const sourceRank: Record<string, number> = { hermes: 0, local: 1, openatlas: 2 };
+  const sourceDelta = sourceRank[skillSourceKind(a)] - sourceRank[skillSourceKind(b)];
+  if (sourceDelta) return sourceDelta;
   const scopeDelta = (SCOPE_ORDER[a.scope] ?? 9) - (SCOPE_ORDER[b.scope] ?? 9);
   if (scopeDelta) return scopeDelta;
   return String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN');
@@ -41,6 +59,78 @@ function riskColor(risk?: string) {
   if (r === 'medium') return 'orange';
   if (r === 'low') return 'green';
   return 'default';
+}
+
+const CAPABILITY_TAG_RULES: Array<{ label: string; pattern: RegExp }> = [
+  { label: '联网检索', pattern: /web|search|browse|browser|联网|检索|搜索/i },
+  { label: '浏览器操作', pattern: /browser|page|crawl|爬取|网页/i },
+  { label: '数据源调用', pattern: /stock|finance|market|data|api|股票|行情|数据/i },
+  { label: '文档解析', pattern: /docx|pdf|paper|document|文档|论文|合同/i },
+  { label: '表格处理', pattern: /xlsx|excel|sheet|csv|表格/i },
+  { label: '代码执行', pattern: /code|python|script|代码|脚本/i },
+  { label: '终端命令', pattern: /terminal|shell|command|终端|命令/i },
+  { label: '报告生成', pattern: /report|ppt|html|markdown|报告|交付物/i },
+  { label: '多员工协作', pattern: /workflow|relay|agent|collaboration|协作|接力/i },
+];
+
+function skillSearchText(skill: any) {
+  return [
+    skill?.name,
+    skill?.slug,
+    skill?.description,
+    skill?.category,
+    skill?.source_ref,
+    skill?.ability_description,
+    skill?.input_example,
+    skill?.output_example,
+    ...(skill?.suitable_employees || []),
+  ].filter(Boolean).join(' ');
+}
+
+function skillCategoryText(skill: any) {
+  return [
+    skill?.name,
+    skill?.slug,
+    skill?.description,
+    skill?.category,
+    skill?.ability_description,
+  ].filter(Boolean).join(' ');
+}
+
+function abilityTagsForSkill(skill: any) {
+  const text = skillSearchText(skill);
+  const tags = CAPABILITY_TAG_RULES.filter((rule) => rule.pattern.test(text)).map((rule) => rule.label);
+  return [...new Set(tags)].slice(0, 4);
+}
+
+function categoryForSkill(skill: any) {
+  const text = skillCategoryText(skill);
+  if (/stock|finance|a.?股|投资|行情|财务|经营/i.test(text)) return '投资财务';
+  if (/market|sales|crm|客户|销售|市场|推广/i.test(text)) return '市场销售';
+  if (/data|analysis|excel|csv|表格|指标/i.test(text)) return '数据分析';
+  if (/law|legal|contract|合规|法务|合同/i.test(text)) return '法务合规';
+  if (/doc|paper|knowledge|pdf|文档|论文|知识/i.test(text)) return '文档知识';
+  if (/hr|recruit|resume|candidate|简历|招聘|候选人|面试/i.test(text)) return 'HR 招聘';
+  if (/project|workflow|delivery|项目|运营|交付/i.test(text)) return '项目运营';
+  if (/terminal|shell|browser|code|system|工具|命令/i.test(text)) return '系统工具';
+  return skill?.category || '通用能力';
+}
+
+function skillStatusText(skill: any) {
+  const failureRate = Math.round(Number(skill?.health?.failure_rate || 0) * 100);
+  if (skill?.status !== 'enabled') return '未启用';
+  if (skill?.health?.last_error) return '需关注';
+  if (failureRate > 0) return `失败率 ${failureRate}%`;
+  return '可用';
+}
+
+function readableSkillExample(example: any) {
+  if (!example) return '由任务、文件和员工上下文自动触发';
+  const text = typeof example === 'string' ? example : JSON.stringify(example);
+  if (!text || text === '{}' || text === '[]' || text === 'null') {
+    return '由任务、文件和员工上下文自动触发';
+  }
+  return text.length > 88 ? `${text.slice(0, 88)}…` : text;
 }
 
 function TrustBox({ title, text }: { title: string; text: string }) {
@@ -96,8 +186,9 @@ export default function SkillMarket() {
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'enabled' | 'disabled'>('enabled');
-  const [sourceFilter, setSourceFilter] = useState<'all' | 'hermes' | 'openatlas'>('all');
+  const [sourceFilter, setSourceFilter] = useState<'all' | 'hermes' | 'local' | 'openatlas'>('all');
   const [scopeFilter, setScopeFilter] = useState<'all' | 'global' | 'tenant' | 'user' | 'employee'>('all');
+  const [categoryFilter, setCategoryFilter] = useState<string>('all');
   const [showCreate, setShowCreate] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [showHub, setShowHub] = useState(false);
@@ -130,10 +221,16 @@ export default function SkillMarket() {
 
   const isSysadmin = me?.user?.role === 'system_admin' || me?.role === 'system_admin';
   const isTenantAdmin = me?.user?.role === 'tenant_admin' || me?.role === 'tenant_admin';
+  const isSkillAdmin = isSysadmin || isTenantAdmin;
 
   const canPublishGlobal = isSysadmin;
   const canPublishTenant = isSysadmin || isTenantAdmin;
-  const canPublishUser = true;
+  const canPublishUser = isSkillAdmin;
+
+  const categoryOptions = useMemo(() => {
+    const categories = [...new Set(skills.map(categoryForSkill).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+    return [{ value: 'all', label: '全部分类' }, ...categories.map((c) => ({ value: c, label: c }))];
+  }, [skills]);
 
   const filteredSkills = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -142,22 +239,23 @@ export default function SkillMarket() {
         if (statusFilter !== 'all' && s.status !== statusFilter) return false;
         if (scopeFilter !== 'all' && s.scope !== scopeFilter) return false;
         if (sourceFilter === 'hermes' && !isHermesSkill(s)) return false;
-        if (sourceFilter === 'openatlas' && isHermesSkill(s)) return false;
+        if (sourceFilter === 'local' && !isLocalPackageSkill(s)) return false;
+        if (sourceFilter === 'openatlas' && skillSourceKind(s) !== 'openatlas') return false;
+        if (categoryFilter !== 'all' && categoryForSkill(s) !== categoryFilter) return false;
         if (!q) return true;
-        return [s.name, s.slug, s.description, s.category, s.source_ref]
-          .filter(Boolean)
-          .some((v) => String(v).toLowerCase().includes(q));
+        return skillSearchText(s).toLowerCase().includes(q);
       })
       .sort(skillSort);
-  }, [query, skills, scopeFilter, sourceFilter, statusFilter]);
+  }, [categoryFilter, query, skills, scopeFilter, sourceFilter, statusFilter]);
 
   const marketStats = useMemo(() => {
     const enabled = skills.filter((s) => s.status === 'enabled').length;
     const hermes = skills.filter(isHermesSkill).length;
+    const local = skills.filter(isLocalPackageSkill).length;
     const boundEmployees = skills.reduce((sum, s) => sum + Number(s.bound_employee_count || 0), 0);
     const unhealthy = skills.filter((s) => Number(s.health?.failure_rate || 0) > 0 || s.health?.last_error).length;
     const highRisk = skills.filter((s) => s.risk_level === 'high').length;
-    return { enabled, hermes, boundEmployees, unhealthy, highRisk };
+    return { enabled, hermes, local, boundEmployees, unhealthy, highRisk };
   }, [skills]);
 
   const onPublish = async (s: any) => {
@@ -167,6 +265,16 @@ export default function SkillMarket() {
   const onDisable = async (s: any) => {
     try { await disableSkill(s.__id || s.id); message.success('disabled'); await load(); }
     catch (ex: any) { message.error('disable failed: ' + (ex?.message || ex)); }
+  };
+  const onSaveSkillDefinition = async (s: any, patch: any) => {
+    try {
+      const updated = await patchSkill(s.__id || s.id, patch);
+      message.success('Skill 定义已保存');
+      setDetailSkill(updated);
+      await load();
+    } catch (ex: any) {
+      message.error('保存失败: ' + (ex?.message || ex));
+    }
   };
   const onFork = async (s: any, target: 'user' | 'employee') => {
     try {
@@ -314,56 +422,57 @@ export default function SkillMarket() {
   };
 
   return (
-    <div style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-        <h2 style={{ margin: 0 }}>技能市场 Skill Market</h2>
-        <Space>
-          {(isSysadmin || isTenantAdmin) && (
+    <div className="admin-console">
+      <section className="admin-hero">
+        <div>
+          <div className="admin-kicker">Skill Governance</div>
+          <h1 className="admin-title">技能市场 Skill Market</h1>
+          <p className="admin-subtitle">
+            对齐 Hermes Skills 的安装、同步、健康检查和企业私有 Skill 治理；员工创建或绑定时只选择已启用能力。
+          </p>
+        </div>
+        <div className="admin-actions">
+          <Button onClick={() => setShowHub(true)}>浏览 Skills Hub</Button>
+          {isSkillAdmin && (
             <>
-              <Button onClick={() => setShowHub(true)}>浏览 Skills Hub</Button>
               <Button onClick={onSyncHermes}>同步已安装</Button>
               <Button onClick={openHealth}>健康检查</Button>
               <Button onClick={openReconcile}>Hermes 对账</Button>
               <Button onClick={() => setLifecycleOpen(true)}>生命周期</Button>
+              <Button icon={<FileZipOutlined />} onClick={() => setShowImport(true)}>导入私有 Skill ZIP</Button>
+              <Button type="primary" onClick={() => setShowCreate(true)}>登记 OpenAtlas 技能</Button>
             </>
           )}
-          <Button icon={<FileZipOutlined />} onClick={() => setShowImport(true)}>导入私有 Skill ZIP</Button>
-          <Button type="primary" onClick={() => setShowCreate(true)}>登记 OpenAtlas 技能</Button>
-        </Space>
-      </div>
-      <p style={{ color: 'var(--text-tertiary)' }}>
-        主路径对齐 Hermes Skills: 管理员先同步/安装 Hermes 已安装技能,员工创建或绑定时选择启用项。
-        ZIP/登记入口保留给企业私有 Skill 包治理。
-      </p>
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(5, minmax(0, 1fr))',
-        gap: 10,
-        marginBottom: 14,
-      }}>
+        </div>
+      </section>
+      {!isSkillAdmin && (
+        <Alert
+          style={{ marginBottom: 16 }}
+          type="info"
+          showIcon
+          message="当前为普通用户只读视图"
+          description="你可以查看 Skill 能力说明、风险等级、适用员工和安装来源；安装、导入、同步、禁用等治理操作由管理员执行。"
+        />
+      )}
+      <div className="admin-stat-grid">
         {[
           ['启用 Skill', marketStats.enabled, '可被员工绑定'],
           ['Hermes 来源', marketStats.hermes, '已与运行时对齐'],
+          ['本地导入', marketStats.local, '企业私有 SKILL.md 包'],
           ['员工绑定', marketStats.boundEmployees, '影响真实员工能力'],
-          ['健康异常', marketStats.unhealthy, '需检查最近错误'],
+          ['健康关注', marketStats.unhealthy, '需检查最近错误'],
           ['高风险', marketStats.highRisk, '禁用/审批需谨慎'],
         ].map(([label, value, hint]) => (
-          <div key={label} style={{
-            padding: '12px 14px',
-            borderRadius: 10,
-            border: '1px solid var(--border-subtle)',
-            background: 'var(--bg-elevated)',
-            boxShadow: '0 10px 30px rgba(15,23,42,0.04)',
-          }}>
-            <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>{label}</div>
-            <div style={{ marginTop: 4, fontSize: 24, fontWeight: 750, color: 'var(--text-primary)' }}>{value}</div>
-            <div style={{ marginTop: 2, fontSize: 11, color: 'var(--text-tertiary)' }}>{hint}</div>
+          <div key={label} className="admin-stat-card">
+            <div className="admin-stat-label">{label}</div>
+            <div className="admin-stat-value">{value}</div>
+            <div className="admin-stat-hint">{hint}</div>
           </div>
         ))}
       </div>
-      <div style={{
+      <div className="admin-toolbar" style={{
         display: 'grid',
-        gridTemplateColumns: 'minmax(220px, 1fr) 150px 150px 150px',
+        gridTemplateColumns: 'minmax(220px, 1fr) 150px 150px 150px 150px',
         gap: 8,
         marginBottom: 12,
       }}>
@@ -387,8 +496,9 @@ export default function SkillMarket() {
           onChange={setSourceFilter}
           options={[
             { value: 'all', label: '全部来源' },
-            { value: 'hermes', label: 'Hermes' },
-            { value: 'openatlas', label: 'OpenAtlas' },
+            { value: 'hermes', label: 'Hermes 运行时' },
+            { value: 'local', label: '本地导入包' },
+            { value: 'openatlas', label: 'OpenAtlas 元数据' },
           ]}
         />
         <Select
@@ -402,14 +512,19 @@ export default function SkillMarket() {
             { value: 'employee', label: 'employee' },
           ]}
         />
+        <Select
+          value={categoryFilter}
+          onChange={setCategoryFilter}
+          options={categoryOptions}
+        />
       </div>
       <div style={{ color: 'var(--text-tertiary)', fontSize: 12, marginBottom: 8 }}>
-        显示 {filteredSkills.length} / {skills.length} 个技能，排序优先级：启用 → Hermes 已安装 → scope → 名称。
+        显示 {filteredSkills.length} / {skills.length} 个技能。优先看能力标签、适用员工和运行状态；版本/风险/对账信息在详情里治理。
       </div>
-      <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-default)', borderRadius: 8 }}>
+      <div className="admin-panel">
         {loading && <div style={{ padding: 24 }}>loading…</div>}
         {!loading && skills.length === 0 && (
-          <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-tertiary)' }}>
+          <div className="admin-empty">
             暂无技能,点右上角发布
           </div>
         )}
@@ -418,90 +533,77 @@ export default function SkillMarket() {
             <Empty description="没有匹配的技能，请调整筛选条件" />
           </div>
         )}
-        {!loading && filteredSkills.map((s) => (
-          <div key={s.id} style={{
-            padding: '12px 16px', borderTop: '1px solid var(--border-default)',
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
-                <strong>{s.name}</strong>
-                <Tag color={SCOPE_COLORS[s.scope] || 'default'}>{s.scope}</Tag>
-                <Tag color={s.status === 'enabled' ? 'green' : s.status === 'disabled' ? 'red' : 'default'}>{s.status}</Tag>
-                <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>
-                  v{s.version} · {s.category}
-                </span>
-                <Tag color={(s.bound_employee_count || 0) > 0 ? 'gold' : 'default'} style={{ fontSize: 11 }}>
-                  已绑员工 {s.bound_employee_count || 0}
-                </Tag>
-                <Tag color={riskColor(s.risk_level)} style={{ fontSize: 11 }}>
-                  风险 {s.risk_level || 'low'}
-                </Tag>
-                <Tag color={(s.health?.failure_rate || 0) > 0 ? 'red' : 'green'} style={{ fontSize: 11 }}>
-                  失败率 {Math.round((s.health?.failure_rate || 0) * 100)}%
-                </Tag>
-                {(s.binding_count || 0) > 0 && (
-                  <Tag color="orange" style={{ fontSize: 11 }}>
-                    禁用影响 {s.binding_count} 个绑定
-                  </Tag>
-                )}
-                {s.source_ref && (
-                  <Tag color={String(s.source_ref).startsWith('hermes:') ? 'cyan' : 'default'} style={{ fontSize: 11 }}>
-                    {sanitizedSourceLabel(String(s.source_ref))}
-                  </Tag>
-                )}
-              </div>
-              <div style={{ display: 'flex', gap: 6 }}>
-                <Button size="small" onClick={() => setDetailSkill(s)}>详情/治理</Button>
-                {s.mutable && (s.scope === 'global' && canPublishGlobal || s.scope === 'tenant' && canPublishTenant || s.scope === 'user' && canPublishUser) && (
-                  <>
+        {!loading && filteredSkills.map((s) => {
+          const tags = abilityTagsForSkill(s);
+          const category = categoryForSkill(s);
+          const statusText = skillStatusText(s);
+          return (
+            <div key={s.id} className="admin-list-row" style={{ padding: '14px 16px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 14, alignItems: 'start' }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <strong style={{ fontSize: 15, color: 'var(--text-primary)', marginRight: 2 }}>{s.name}</strong>
+                    <Tag color="blue">{category}</Tag>
+                    <Tag color={s.status === 'enabled' ? 'green' : s.status === 'disabled' ? 'red' : 'default'}>{statusText}</Tag>
+                    <Tag color={skillSourceTag(s).color}>{skillSourceTag(s).label}</Tag>
+                    <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>v{s.version}</span>
+                  </div>
+                  <div style={{
+                    marginTop: 6,
+                    color: 'var(--text-secondary)',
+                    fontSize: 13,
+                    lineHeight: 1.5,
+                    overflow: 'hidden',
+                    display: '-webkit-box',
+                    WebkitLineClamp: 2,
+                    WebkitBoxOrient: 'vertical',
+                  }}>
+                    {s.ability_description || s.description || '暂未登记能力说明。'}
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                    {(tags.length ? tags : ['通用能力']).map((tag) => <Tag key={tag}>{tag}</Tag>)}
+                    <Tag color={(s.bound_employee_count || 0) > 0 ? 'gold' : 'default'}>已绑员工 {s.bound_employee_count || 0}</Tag>
+                    <Tag color={riskColor(s.risk_level)}>风险 {s.risk_level || 'low'}</Tag>
+                    {s.health?.last_error && <Tag color="red">最近错误</Tag>}
+                  </div>
+                  <div style={{ marginTop: 8, color: 'var(--text-tertiary)', fontSize: 12 }}>
+                    适合员工: {(s.suitable_employees || []).join(' / ') || '通用数智员工'} ·
+                    示例输入: {readableSkillExample(s.input_example)}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end', maxWidth: 360 }}>
+                  <Button size="small" type="primary" onClick={() => setDetailSkill(s)}>查看能力</Button>
+                  {isSkillAdmin && s.mutable && (s.scope === 'global' && canPublishGlobal || s.scope === 'tenant' && canPublishTenant || s.scope === 'user' && canPublishUser) && (
                     <Button size="small" onClick={() => onPublish(s)}>Publish</Button>
-                  </>
-                )}
-                {(canPublishGlobal || canPublishTenant || s.mutable) && (
-                  <Popconfirm
-                    title="确认禁用该 Skill？"
-                    description={`会影响 ${s.disable_impact?.binding_count || s.binding_count || 0} 个绑定、${s.disable_impact?.employee_count || s.bound_employee_count || 0} 个员工。`}
-                    okText="禁用"
-                    cancelText="取消"
-                    okButtonProps={{ danger: true }}
-                    onConfirm={() => onDisable(s)}
-                  >
-                    <Button size="small" danger>Disable</Button>
-                  </Popconfirm>
-                )}
-                {(s.scope === 'global' || s.scope === 'tenant') && !String(s.source_ref || '').startsWith('hermes:') && (
-                  <>
-                    <Button size="small" onClick={() => onFork(s, 'user')}>Fork→user</Button>
-                    <Button size="small" onClick={() => onFork(s, 'employee')}>Fork→employee</Button>
-                  </>
-                )}
-                {String(s.source_ref || '').startsWith('hermes:') && (
-                  <span style={{ alignSelf: 'center', color: 'var(--text-tertiary)', fontSize: 12 }}>
-                    在创建员工或员工技能页绑定
-                  </span>
-                )}
+                  )}
+                  {isSkillAdmin && (s.scope === 'global' || s.scope === 'tenant') && !String(s.source_ref || '').startsWith('hermes:') && (
+                    <>
+                      <Button size="small" onClick={() => onFork(s, 'user')}>Fork→user</Button>
+                      <Button size="small" onClick={() => onFork(s, 'employee')}>Fork→employee</Button>
+                    </>
+                  )}
+                  {isSkillAdmin && (canPublishGlobal || canPublishTenant || s.mutable) && (
+                    <Popconfirm
+                      title="确认禁用该 Skill？"
+                      description={`会影响 ${s.disable_impact?.binding_count || s.binding_count || 0} 个绑定、${s.disable_impact?.employee_count || s.bound_employee_count || 0} 个员工。`}
+                      okText="禁用"
+                      cancelText="取消"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={() => onDisable(s)}
+                    >
+                      <Button size="small" danger>禁用</Button>
+                    </Popconfirm>
+                  )}
+                </div>
               </div>
             </div>
-            {s.description && (
-              <div style={{ color: 'var(--text-tertiary)', fontSize: 13, marginTop: 4 }}>{s.description}</div>
-            )}
-            <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr 1fr', gap: 8, marginTop: 8 }}>
-              <TrustBox title="能力说明" text={s.ability_description || s.description || '暂未登记能力说明'} />
-              <TrustBox title="输入示例" text={s.input_example || '由对话任务和文件上下文触发'} />
-              <TrustBox title="输出示例" text={s.output_example || '结构化建议、报告或可下载交付物'} />
-            </div>
-            <div style={{ marginTop: 6, color: 'var(--text-tertiary)', fontSize: 12 }}>
-              适用员工: {(s.suitable_employees || []).join(' / ') || '通用数智员工'} ·
-              调用 {s.health?.run_count || 0} 次 · 失败 {s.health?.failure_count || 0} 次
-              {s.health?.last_error ? ` · 最近错误: ${String(s.health.last_error).slice(0, 80)}` : ''}
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
       <CreateModal open={showCreate} onClose={() => setShowCreate(false)} onCreated={load} canGlobal={canPublishGlobal} canTenant={canPublishTenant} />
       <ImportModal open={showImport} onClose={() => setShowImport(false)} onImported={load}
         canGlobal={canPublishGlobal} canTenant={canPublishTenant} />
-      <HubModal open={showHub} onClose={() => setShowHub(false)} onInstalled={load} />
+      <HubModal open={showHub} onClose={() => setShowHub(false)} onInstalled={load} canInstall={isSkillAdmin} />
       <Modal open={healthOpen} onCancel={() => setHealthOpen(false)} footer={null} width={840} title="Skill 健康检查">
         <DiagnosticTable
           loading={diagnosticLoading}
@@ -522,8 +624,11 @@ export default function SkillMarket() {
         skill={detailSkill}
         onClose={() => setDetailSkill(null)}
         onDisable={onDisable}
+        onSave={onSaveSkillDefinition}
         onFork={onFork}
-        canDisable={canPublishGlobal || canPublishTenant || Boolean(detailSkill?.mutable)}
+        canDisable={isSkillAdmin && (canPublishGlobal || canPublishTenant || Boolean(detailSkill?.mutable))}
+        canEdit={isSkillAdmin && Boolean(detailSkill?.mutable) && !isHermesSkill(detailSkill)}
+        canFork={isSkillAdmin}
       />
       <Modal open={lifecycleOpen} onCancel={() => setLifecycleOpen(false)} footer={null} width={900} title="Hermes Skill 生命周期">
         <div style={{ display: 'grid', gap: 12 }}>
@@ -628,17 +733,42 @@ function SkillGovernanceDrawer({
   skill,
   onClose,
   onDisable,
+  onSave,
   onFork,
   canDisable,
+  canEdit,
+  canFork,
 }: {
   skill: any | null;
   onClose: () => void;
   onDisable: (skill: any) => Promise<void>;
+  onSave: (skill: any, patch: any) => Promise<void>;
   onFork: (skill: any, target: 'user' | 'employee') => Promise<void>;
   canDisable: boolean;
+  canEdit: boolean;
+  canFork: boolean;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({
+    description: '',
+    system_prompt: '',
+    input_schema: '{}',
+    output_schema: '{}',
+    few_shot_examples: '[]',
+  });
+  useEffect(() => {
+    if (!skill) return;
+    setEditing(false);
+    setForm({
+      description: skill.description || '',
+      system_prompt: skill.system_prompt || '',
+      input_schema: skill.input_schema || '{}',
+      output_schema: skill.output_schema || '{}',
+      few_shot_examples: skill.few_shot_examples || '[]',
+    });
+  }, [skill?.id, skill?.updated_at]);
   if (!skill) return null;
-  const source = isHermesSkill(skill) ? 'Hermes runtime' : 'OpenAtlas registry';
+  const sourceTag = skillSourceTag(skill);
   const failureRate = Math.round(Number(skill.health?.failure_rate || 0) * 100);
   const boundEmployees = Number(skill.bound_employee_count || 0);
   const bindingCount = Number(skill.binding_count || 0);
@@ -647,7 +777,11 @@ function SkillGovernanceDrawer({
     highRisk ? '高风险 Skill 建议仅绑定给明确角色员工，并配合审批/审计查看。' : '当前风险较低，可作为普通员工能力扩展。',
     boundEmployees > 0 ? `已影响 ${boundEmployees} 个员工，禁用前建议通知负责人并查看最近会话。` : '暂无员工绑定，适合先做灰度验证。',
     failureRate > 0 ? `最近失败率 ${failureRate}%，建议先运行健康检查或 Hermes 对账。` : '最近暂无失败记录。',
-    isHermesSkill(skill) ? '该 Skill 来源于 Hermes，OpenAtlas 负责绑定、可见性、健康和审计。' : '该 Skill 来源于 OpenAtlas，可按 scope 做企业内部治理。',
+    isHermesSkill(skill)
+      ? '该 Skill 来源于 Hermes，OpenAtlas 负责绑定、可见性、健康和审计。'
+      : isLocalPackageSkill(skill)
+        ? '该 Skill 是企业本地导入的 Hermes 兼容 SKILL.md 包，会作为员工能力上下文注入。'
+        : '该 Skill 来源于 OpenAtlas，可按 scope 做企业内部治理。',
   ];
 
   return (
@@ -665,13 +799,14 @@ function SkillGovernanceDrawer({
             <Tag color={SCOPE_COLORS[skill.scope] || 'default'}>{skill.scope}</Tag>
             <Tag color={skill.status === 'enabled' ? 'green' : 'red'}>{skill.status}</Tag>
             <Tag color={riskColor(skill.risk_level)}>风险 {skill.risk_level || 'low'}</Tag>
+            <Tag color={sourceTag.color}>{sourceTag.label}</Tag>
           </div>
           <div style={{ marginTop: 6, color: 'var(--text-tertiary)', lineHeight: 1.6 }}>{skill.description || '暂无描述'}</div>
         </div>
 
         <Descriptions size="small" column={1} bordered>
           <Descriptions.Item label="版本">v{skill.version || '-'}</Descriptions.Item>
-          <Descriptions.Item label="来源">{source} · {sanitizedSourceLabel(String(skill.source_ref || 'openatlas'))}</Descriptions.Item>
+          <Descriptions.Item label="来源">{sourceTag.label} · {sanitizedSourceLabel(String(skill.source_ref || 'openatlas'))}</Descriptions.Item>
           <Descriptions.Item label="分类">{skill.category || '-'}</Descriptions.Item>
           <Descriptions.Item label="绑定影响">{bindingCount} 个绑定 / {boundEmployees} 个员工</Descriptions.Item>
           <Descriptions.Item label="健康">{skill.health?.run_count || 0} 次调用 · {skill.health?.failure_count || 0} 次失败 · 失败率 {failureRate}%</Descriptions.Item>
@@ -679,9 +814,42 @@ function SkillGovernanceDrawer({
         </Descriptions>
 
         <div style={{ display: 'grid', gap: 8 }}>
-          <TrustBox title="能力说明" text={skill.ability_description || skill.description || '暂未登记能力说明'} />
-          <TrustBox title="输入示例" text={skill.input_example || '输入业务目标、相关文件或上下文说明。'} />
-          <TrustBox title="输出示例" text={skill.output_example || '结构化结论、报告、表格或可下载交付物。'} />
+          {editing ? (
+            <>
+              <label>
+                描述
+                <Input.TextArea rows={2} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
+              </label>
+              <label>
+                System Prompt
+                <Input.TextArea rows={7} value={form.system_prompt} onChange={(e) => setForm({ ...form, system_prompt: e.target.value })} />
+              </label>
+              <label>
+                Input Schema
+                <Input.TextArea rows={8} value={form.input_schema} onChange={(e) => setForm({ ...form, input_schema: e.target.value })} />
+              </label>
+              <label>
+                Output Schema
+                <Input.TextArea rows={8} value={form.output_schema} onChange={(e) => setForm({ ...form, output_schema: e.target.value })} />
+              </label>
+              <label>
+                Few-shot Examples
+                <Input.TextArea rows={8} value={form.few_shot_examples} onChange={(e) => setForm({ ...form, few_shot_examples: e.target.value })} />
+              </label>
+              <Space>
+                <Button type="primary" onClick={() => onSave(skill, form)}>保存定义</Button>
+                <Button onClick={() => setEditing(false)}>取消</Button>
+              </Space>
+            </>
+          ) : (
+            <>
+              <TrustBox title="能力说明" text={skill.ability_description || skill.description || '暂未登记能力说明'} />
+              <TrustBox title="System Prompt" text={skill.system_prompt || '暂未配置 system prompt'} />
+              <TrustBox title="Input Schema" text={skill.input_schema || '{}'} />
+              <TrustBox title="Output Schema" text={skill.output_schema || '{}'} />
+              <TrustBox title="Few-shot Examples" text={skill.few_shot_examples || '[]'} />
+            </>
+          )}
         </div>
 
         <div>
@@ -710,7 +878,10 @@ function SkillGovernanceDrawer({
         </div>
 
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          {(skill.scope === 'global' || skill.scope === 'tenant') && !isHermesSkill(skill) && (
+          {canEdit && !editing && (
+            <Button type="primary" onClick={() => setEditing(true)}>编辑定义</Button>
+          )}
+          {canFork && (skill.scope === 'global' || skill.scope === 'tenant') && !isHermesSkill(skill) && (
             <>
               <Button onClick={() => onFork(skill, 'user')}>Fork 到个人</Button>
               <Button onClick={() => onFork(skill, 'employee')}>Fork 到员工</Button>
@@ -734,7 +905,7 @@ function SkillGovernanceDrawer({
   );
 }
 
-function HubModal({ open, onClose, onInstalled }: { open: boolean; onClose: () => void; onInstalled: () => void }) {
+function HubModal({ open, onClose, onInstalled, canInstall }: { open: boolean; onClose: () => void; onInstalled: () => void; canInstall: boolean }) {
   const [items, setItems] = useState<any[]>([]);
   const [query, setQuery] = useState('');
   const [source, setSource] = useState('all');
@@ -766,6 +937,10 @@ function HubModal({ open, onClose, onInstalled }: { open: boolean; onClose: () =
   }, [open, source]);
 
   const install = async (item: any) => {
+    if (!canInstall) {
+      message.info('当前账号仅可浏览 Skills Hub，安装请联系管理员。');
+      return;
+    }
     const identifier = item.identifier;
     if (!identifier) return;
     setInstalling(identifier);
@@ -792,6 +967,15 @@ function HubModal({ open, onClose, onInstalled }: { open: boolean; onClose: () =
 
   return (
     <Modal open={open} onCancel={onClose} footer={null} width={920} title="Hermes Skills Hub">
+      {!canInstall && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="普通用户可浏览 Hub，安装由管理员执行"
+          description="这样可以保证 Hermes 运行时、租户 Skill 市场和员工绑定关系可审计、可回滚。"
+        />
+      )}
       <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
         <Input.Search
           allowClear
@@ -836,9 +1020,11 @@ function HubModal({ open, onClose, onInstalled }: { open: boolean; onClose: () =
                 type="primary"
                 size="small"
                 loading={installing === item.identifier}
+                disabled={!canInstall}
+                title={!canInstall ? '仅管理员可安装' : undefined}
                 onClick={() => install(item)}
               >
-                安装
+                {canInstall ? '安装' : '仅管理员'}
               </Button>
             </div>
           </div>

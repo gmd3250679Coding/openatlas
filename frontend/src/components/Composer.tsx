@@ -22,11 +22,15 @@ interface Props {
   input: string;
   setInput: (v: string) => void;
   disabled: boolean;
+  running?: boolean;
   uploading: boolean;
   pendingAttachments: Attachment[];
   onSend: () => void;
   onAbort?: () => void;
   onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  onCompositionStart?: (e: React.CompositionEvent<HTMLTextAreaElement>) => void;
+  onCompositionEnd?: (e: React.CompositionEvent<HTMLTextAreaElement>) => void;
+  onPasteUpload?: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
   onFileSelect: (file: File) => void;
   /** Phase B (2026-06-04):可选 — 移除待发附件(Scene 2 用) */
   onRemoveAttachment?: (url: string) => void;
@@ -34,6 +38,7 @@ interface Props {
   relayChips?: Employee[];
   /** M4.2 (Group Chat): 移除接力 chip */
   onRemoveRelay?: (employeeId: number) => void;
+  placeholder?: string;
   reasoningEffort?: string;
   onReasoningEffortChange?: (value: string) => void;
 }
@@ -49,11 +54,12 @@ const REASONING_EFFORTS = [
 ];
 
 export default function Composer({
-  input, setInput, disabled, uploading,
-  pendingAttachments, onSend, onKeyDown, onFileSelect,
+  input, setInput, disabled, running = false, uploading,
+  pendingAttachments, onSend, onKeyDown, onCompositionStart, onCompositionEnd, onPasteUpload, onFileSelect,
   onAbort,
   onRemoveAttachment,
   relayChips, onRemoveRelay,
+  placeholder = '输入需求，试试 @行政小六 或 @投资研究分析师...',
   reasoningEffort = '',
   onReasoningEffortChange,
 }: Props) {
@@ -61,6 +67,21 @@ export default function Composer({
   const imageInputRef = useRef<HTMLInputElement>(null);
 
   const canSend = !!input.trim() && !disabled;
+  const handleTextareaKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const key = e.key.toLowerCase();
+    const commandLike = e.metaKey || e.ctrlKey;
+    if (commandLike && e.shiftKey && key === 'u') {
+      e.preventDefault();
+      if (!uploading) fileInputRef.current?.click();
+      return;
+    }
+    if (commandLike && e.shiftKey && key === 'p') {
+      e.preventDefault();
+      if (!uploading) imageInputRef.current?.click();
+      return;
+    }
+    onKeyDown(e);
+  };
 
   return (
     <div className="composer-root">
@@ -117,11 +138,11 @@ export default function Composer({
           const f = e.target.files?.[0]; if (f) onFileSelect(f);
           e.target.value = '';
         }} />
-        <button onClick={() => fileInputRef.current?.click()} disabled={uploading} title="附件"
+        <button onClick={() => fileInputRef.current?.click()} disabled={uploading} title="附件 · ⌘/Ctrl+Shift+U"
           className="composer-tool-btn"
           data-disabled={uploading}
         ><IconPaperclip size={17} /></button>
-        <button onClick={() => imageInputRef.current?.click()} disabled={uploading} title="图片"
+        <button onClick={() => imageInputRef.current?.click()} disabled={uploading} title="图片 · ⌘/Ctrl+Shift+P"
           className="composer-tool-btn"
           data-disabled={uploading}
         ><IconImage size={17} /></button>
@@ -144,21 +165,23 @@ export default function Composer({
         )}
         <textarea
           value={input} onChange={e => setInput(e.target.value)}
-          onKeyDown={onKeyDown}
-          placeholder="输入消息,用 @ 法务智囊 召唤员工接力..." disabled={disabled} rows={1}
+          onKeyDown={handleTextareaKeyDown}
+          onCompositionStart={onCompositionStart}
+          onCompositionEnd={onCompositionEnd}
+          onPaste={onPasteUpload}
+          placeholder={placeholder} disabled={disabled} rows={1}
           className="composer-textarea"
         />
-        {disabled && onAbort ? (
+        {running && onAbort && (
           <button onClick={onAbort}
             className="composer-stop-btn"
             title="停止当前运行"
           >■</button>
-        ) : (
-          <button onClick={onSend} disabled={!canSend}
-            className="composer-send-btn"
-            data-active={canSend}
-          ><IconSend size={17} /></button>
         )}
+        <button onClick={onSend} disabled={!canSend}
+          className="composer-send-btn"
+          data-active={canSend}
+        ><IconSend size={17} /></button>
       </div>
     </div>
   );

@@ -11,15 +11,48 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean,
-    DateTime,
+    DateTime as _SQLAlchemyDateTime,
     Enum as SqlEnum,
     ForeignKey,
+    Float,
     Integer,
     String,
     Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator
+
+
+class UTCDateTime(TypeDecorator):
+    """Store datetimes as UTC and restore tzinfo after SQLite reads them.
+
+    SQLite does not preserve timezone info for SQLAlchemy DateTime columns.
+    Without this adapter, an aware UTC value such as 2026-06-19T08:00:00+00:00
+    is read back as naive 2026-06-19T08:00:00, then serialized without an
+    offset and parsed by browsers as local time. That is the source of the
+    visible -8h timestamp drift in Asia/Shanghai.
+    """
+
+    impl = _SQLAlchemyDateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect) -> datetime | None:  # noqa: ANN001
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def process_result_value(self, value: datetime | None, dialect) -> datetime | None:  # noqa: ANN001
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
+DateTime = UTCDateTime
 
 
 def _uuid() -> str:
@@ -225,6 +258,22 @@ class SessionRun(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 
+class SessionRunEvent(Base):
+    """Append-only runtime event log for replaying a Hermes/OpenAtlas task turn."""
+    __tablename__ = "session_run_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), index=True)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("session_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    hermes_run_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    event_type: Mapped[str] = mapped_column(String(96), index=True)
+    sequence: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(String(32), default="openatlas")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+
+
 class CollaborationTemplate(Base):
     """Reusable group/session orchestration template.
 
@@ -245,6 +294,158 @@ class CollaborationTemplate(Base):
     source_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class WhiteboardDocument(Base):
+    """User-owned creative whiteboard stored as Excalidraw scene JSON."""
+    __tablename__ = "whiteboard_documents"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(160), default="未命名白板")
+    description: Mapped[str] = mapped_column(Text, default="")
+    kind: Mapped[str] = mapped_column(String(32), default="freeform")
+    scene_json: Mapped[str] = mapped_column(Text, default="{}")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    element_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class ContractDocument(Base):
+    """User-owned contract review workspace document."""
+    __tablename__ = "contract_documents"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    file_asset_id: Mapped[str | None] = mapped_column(ForeignKey("file_assets.id", ondelete="SET NULL"), nullable=True)
+    title: Mapped[str] = mapped_column(String(255), default="")
+    contract_type: Mapped[str] = mapped_column(String(64), default="general")
+    review_perspective: Mapped[str] = mapped_column(String(32), default="balanced")
+    status: Mapped[str] = mapped_column(String(32), default="uploaded")
+    current_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    parties_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class ContractVersion(Base):
+    """Original/revised contract files produced by the review workspace."""
+    __tablename__ = "contract_versions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    contract_id: Mapped[str] = mapped_column(ForeignKey("contract_documents.id", ondelete="CASCADE"), index=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    version_no: Mapped[int] = mapped_column(Integer, default=1)
+    kind: Mapped[str] = mapped_column(String(32), default="original")  # original/revised/report
+    name: Mapped[str] = mapped_column(String(255), default="")
+    mime_type: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
+    storage_path: Mapped[str] = mapped_column(String(512), default="")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    extracted_text: Mapped[str] = mapped_column(Text, default="")
+    change_summary: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class ContractReviewIssue(Base):
+    """Structured AI/rule review suggestion linked to a contract location."""
+    __tablename__ = "contract_review_issues"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    contract_id: Mapped[str] = mapped_column(ForeignKey("contract_documents.id", ondelete="CASCADE"), index=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    severity: Mapped[str] = mapped_column(String(16), default="medium")
+    category: Mapped[str] = mapped_column(String(64), default="general")
+    title: Mapped[str] = mapped_column(String(255), default="")
+    clause_ref: Mapped[str] = mapped_column(String(128), default="")
+    page_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    paragraph_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    excerpt: Mapped[str] = mapped_column(Text, default="")
+    risk: Mapped[str] = mapped_column(Text, default="")
+    recommendation: Mapped[str] = mapped_column(Text, default="")
+    proposed_revision: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(24), default="open")  # open/accepted/ignored
+    confidence: Mapped[float] = mapped_column(Float, default=0.72)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class OfficialDocument(Base):
+    """User-owned official writing workspace document."""
+    __tablename__ = "official_documents"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(255), default="")
+    doc_type: Mapped[str] = mapped_column(String(48), default="notice")
+    template_key: Mapped[str] = mapped_column(String(80), default="gbt9704")
+    status: Mapped[str] = mapped_column(String(32), default="draft")
+    query: Mapped[str] = mapped_column(Text, default="")
+    fields_json: Mapped[str] = mapped_column(Text, default="{}")
+    compliance_json: Mapped[str] = mapped_column(Text, default="[]")
+    current_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class OfficialDocumentVersion(Base):
+    """DOCX/Markdown outputs generated by the official writing workspace."""
+    __tablename__ = "official_document_versions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    document_id: Mapped[str] = mapped_column(ForeignKey("official_documents.id", ondelete="CASCADE"), index=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    version_no: Mapped[int] = mapped_column(Integer, default=1)
+    kind: Mapped[str] = mapped_column(String(32), default="docx")
+    name: Mapped[str] = mapped_column(String(255), default="")
+    mime_type: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
+    storage_path: Mapped[str] = mapped_column(String(512), default="")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    extracted_text: Mapped[str] = mapped_column(Text, default="")
+    change_summary: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class PresentationDeckDocument(Base):
+    """User-owned AIPPT deck plan generated by the presentation workspace."""
+    __tablename__ = "presentation_deck_documents"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(255), default="")
+    use_case: Mapped[str] = mapped_column(String(32), default="report")
+    aspect_ratio: Mapped[str] = mapped_column(String(16), default="16:9")
+    style_key: Mapped[str] = mapped_column(String(64), default="executive_blue")
+    status: Mapped[str] = mapped_column(String(32), default="outline")
+    source: Mapped[str] = mapped_column(String(64), default="hermes-stream")
+    model: Mapped[str] = mapped_column(String(80), default="hermes-agent")
+    query: Mapped[str] = mapped_column(Text, default="")
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    plan_json: Mapped[str] = mapped_column(Text, default="{}")
+    warnings_json: Mapped[str] = mapped_column(Text, default="[]")
+    slide_count: Mapped[int] = mapped_column(Integer, default=0)
+    knowledge_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class PresentationDeckVersion(Base):
+    """Saved schema snapshots for the AIPPT low-code designer."""
+    __tablename__ = "presentation_deck_versions"
+    __table_args__ = (UniqueConstraint("deck_id", "version_no", name="uq_presentation_deck_version_no"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    deck_id: Mapped[str] = mapped_column(ForeignKey("presentation_deck_documents.id", ondelete="CASCADE"), index=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    version_no: Mapped[int] = mapped_column(Integer, default=1)
+    title: Mapped[str] = mapped_column(String(255), default="")
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    plan_json: Mapped[str] = mapped_column(Text, default="{}")
+    change_summary: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
 class JobStatus(str, enum.Enum):
@@ -293,6 +494,10 @@ class SkillPackage(Base):
     category: Mapped[str] = mapped_column(String(64), default="general")
     version: Mapped[str] = mapped_column(String(32), default="1.0.0")
     source_ref: Mapped[str] = mapped_column(String(255), default="")
+    system_prompt: Mapped[str] = mapped_column(Text, default="")
+    input_schema: Mapped[str] = mapped_column(Text, default="{}")
+    output_schema: Mapped[str] = mapped_column(Text, default="{}")
+    few_shot_examples: Mapped[str] = mapped_column(Text, default="[]")
     visibility: Mapped[str] = mapped_column(String(16), default="public")  # public / tenant / private
     mutable: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(16), default="enabled")  # enabled / disabled / deprecated
@@ -420,6 +625,9 @@ class TaskArtifact(Base):
     content: Mapped[str] = mapped_column(Text, default="")
     source: Mapped[str] = mapped_column(String(32), default="assistant")
     source_path: Mapped[str] = mapped_column(String(512), default="")
+    storage_path: Mapped[str] = mapped_column(String(512), default="")
+    storage_size: Mapped[int] = mapped_column(Integer, default=0)
+    managed_status: Mapped[str] = mapped_column(String(24), default="pending")  # pending/managed/missing/failed
     run_id: Mapped[str | None] = mapped_column(ForeignKey("session_runs.id", ondelete="SET NULL"), nullable=True, index=True)
     employee_id: Mapped[str | None] = mapped_column(ForeignKey("digital_employees.id"), nullable=True, index=True)
     version: Mapped[int] = mapped_column(Integer, default=1)

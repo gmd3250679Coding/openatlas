@@ -31,25 +31,35 @@ export default function Jobs() {
   const onDelete = async (id: string) => { Modal.confirm({ title: 'Delete job?', onOk: async () => { await deleteJob(id); await load(); } }); };
 
   return (
-    <div style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
-        <h2 style={{ margin: 0 }}>自动任务 Jobs</h2>
-        <Button type="primary" onClick={() => setShowCreate(true)}>新建任务</Button>
+    <div className="admin-console">
+      <section className="admin-hero">
+        <div>
+          <div className="admin-kicker">Automation Scheduler</div>
+          <h1 className="admin-title">自动任务 Jobs</h1>
+          <p className="admin-subtitle">
+            管理 Cron / interval / once 任务，支持立即触发、暂停恢复和调度结果回看。
+          </p>
+        </div>
+        <div className="admin-actions">
+          <Button onClick={load} loading={loading}>刷新</Button>
+          <Button type="primary" onClick={() => setShowCreate(true)}>新建任务</Button>
+        </div>
+      </section>
+      <div className="admin-stat-grid">
+        <div className="admin-stat-card"><div className="admin-stat-label">全部任务</div><div className="admin-stat-value">{jobs.length}</div><div className="admin-stat-hint">当前租户任务</div></div>
+        <div className="admin-stat-card"><div className="admin-stat-label">运行中</div><div className="admin-stat-value">{jobs.filter((j) => j.status === 'active').length}</div><div className="admin-stat-hint">调度可触发</div></div>
+        <div className="admin-stat-card"><div className="admin-stat-label">已暂停</div><div className="admin-stat-value">{jobs.filter((j) => j.status === 'paused').length}</div><div className="admin-stat-hint">等待恢复</div></div>
       </div>
-      <p style={{ color: 'var(--text-tertiary)', marginTop: 0 }}>
-        Cron / interval / once 任务。点 Run 立即触发;点 Pause 暂停调度。
-      </p>
-      <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border-default)', borderRadius: 8 }}>
+      <div className="admin-panel">
         {loading && <div style={{ padding: 24 }}>loading…</div>}
         {!loading && jobs.length === 0 && (
-          <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-tertiary)' }}>
+          <div className="admin-empty">
             暂无任务,点右上角新建
           </div>
         )}
         {!loading && jobs.map((j) => (
-          <div key={j.id} style={{
+          <div key={j.id} className="admin-list-row" style={{
             display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            padding: '12px 16px', borderTop: '1px solid var(--border-default)',
           }}>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

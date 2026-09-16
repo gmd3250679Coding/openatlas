@@ -45,6 +45,19 @@ def request(method: str, path: str, body: object | None = None, token: str | Non
         raise SmokeError(f"{method} {path} -> HTTP {exc.code}: {detail[:500]}") from exc
 
 
+def request_raw(method: str, path: str, token: str | None = None, timeout: int = 20) -> tuple[int, str, bytes]:
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(BASE + path, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.headers.get("Content-Type", ""), resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise SmokeError(f"{method} {path} -> HTTP {exc.code}: {detail[:500]}") from exc
+
+
 def expect(label: str, fn):
     started = time.time()
     try:
@@ -305,18 +318,34 @@ def run() -> dict:
         )
         if uploaded.get("extracted_chars", 0) <= 0:
             raise SmokeError(f"uploaded markdown was not extracted: {uploaded}")
+        preview = request("GET", f"/files/{uploaded['id']}/preview", token=token)
+        if preview.get("preview_kind") != "markdown" or "OPENATLAS_FILE_SMOKE" not in (preview.get("content") or ""):
+            raise SmokeError(f"uploaded markdown preview failed: {preview}")
+        status, content_type, raw = request_raw("GET", f"/files/{uploaded['id']}/download", token=token)
+        if status != 200 or "markdown" not in content_type or b"OPENATLAS_FILE_SMOKE" not in raw:
+            raise SmokeError(f"uploaded markdown download failed: status={status} content_type={content_type} bytes={len(raw)}")
+        workspace_uploads = request("GET", f"/workspace/files?session_id={urllib.parse.quote(sid)}&scope=uploads", token=token)
+        names = {item.get("name") for item in workspace_uploads.get("items", [])}
+        if "openatlas-api-smoke.md" not in names:
+            raise SmokeError(f"session upload workspace did not list uploaded file: {workspace_uploads}")
         stream_result = chat_stream(token, sid, "请用一句话回复: OPENATLAS_API_SMOKE_OK，并说明是否收到 OPENATLAS_FILE_SMOKE", attachment_ids=[uploaded["id"]])
         if not stream_result["files"] or stream_result["files"][0].get("extracted_chars", 0) <= 0:
             raise SmokeError(f"stream did not report injected file metadata: {stream_result['files']}")
         detail = request("GET", f"/sessions/{sid}", token=token)
         if not detail.get("health") or "score" not in detail["health"]:
             raise SmokeError(f"session detail missing health snapshot: {detail}")
+        if not detail.get("progress") or "phase_label" not in detail["progress"]:
+            raise SmokeError(f"session detail missing task progress cockpit: {detail}")
         health = request("GET", f"/sessions/{sid}/health", token=token)
         if not health.get("health") or "recommended_actions" not in health["health"]:
             raise SmokeError(f"session health endpoint missing actionable payload: {health}")
+        if not (health["health"].get("progress") or {}).get("timeline"):
+            raise SmokeError(f"session health missing progress timeline: {health}")
         recovered = request("POST", f"/sessions/{sid}/recover", {}, token=token)
         if not recovered.get("health") or "score" not in recovered["health"]:
             raise SmokeError(f"session recover missing health payload: {recovered}")
+        if not recovered.get("progress") or "actions" not in recovered["progress"]:
+            raise SmokeError(f"session recover missing progress payload: {recovered}")
         runs = request("GET", f"/sessions/{sid}/runs", token=token)
         if not runs.get("items"):
             raise SmokeError(f"session runs missing after chat stream: {runs}")
@@ -382,6 +411,8 @@ def run() -> dict:
                 "event_count": len(replay.get("events") or []),
                 "step_count": len(replay.get("steps") or []),
                 "checkpoint_count": len(replay.get("checkpoints") or []),
+                "progress_phase": detail["progress"].get("phase_label"),
+                "progress_actions": len((health["health"].get("progress") or {}).get("actions") or []),
                 "node_action": bool(node_action.get("continuation_message")),
                 "checkpoint_resume": bool(checkpoint_resume.get("continuation_message")),
                 "step_action_route": bool(step_action_route.get("ok")),
@@ -442,6 +473,24 @@ def run() -> dict:
                 raise SmokeError(f"dashboard missing {key}: {tenant_dashboard}")
         if "score" not in tenant_dashboard.get("maturity", {}):
             raise SmokeError(f"dashboard maturity missing score: {tenant_dashboard.get('maturity')}")
+        artifacts = request("GET", "/artifacts?limit=5", token=token)
+        if "items" not in artifacts:
+            raise SmokeError(f"artifact governance endpoint missing items: {artifacts}")
+        if artifacts["items"]:
+            first_artifact = artifacts["items"][0]
+            for key in ("managed_status", "storage_ref", "storage_size"):
+                if key not in first_artifact:
+                    raise SmokeError(f"artifact governance item missing {key}: {first_artifact}")
+            if first_artifact.get("storage_path"):
+                raise SmokeError(f"artifact governance leaked server storage_path: {first_artifact}")
+        filtered_artifacts = request("GET", "/artifacts?kind=html&q=%E6%B5%AA%E6%BD%AE&limit=5", token=token)
+        if "items" not in filtered_artifacts:
+            raise SmokeError(f"artifact governance filtered endpoint missing items: {filtered_artifacts}")
+        for row in filtered_artifacts.get("items", []):
+            if row.get("kind") != "html":
+                raise SmokeError(f"artifact governance kind filter returned non-html row: {row}")
+            if "浪潮" not in row.get("name", ""):
+                raise SmokeError(f"artifact governance query filter returned unrelated row: {row}")
         audit_rows = request("GET", f"/audit?resource_id={skill['id']}&limit=10", token=token)
         if not any(row.get("resource_id") == skill["id"] for row in audit_rows):
             raise SmokeError(f"audit resource_id trace missing for skill {skill['id']}: {audit_rows}")

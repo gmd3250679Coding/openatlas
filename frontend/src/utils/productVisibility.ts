@@ -57,7 +57,6 @@ export function isLikelyTestFixture(value: unknown) {
         (value as any).description,
         (value as any).last_message,
         (value as any).content,
-        (value as any).source_ref,
         (value as any).category,
         (value as any).profile_name,
       ].filter(Boolean).join(' ');

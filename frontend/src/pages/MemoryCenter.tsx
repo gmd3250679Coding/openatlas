@@ -4,6 +4,7 @@ import {
   fetchMemories, createMemory, patchMemory, archiveMemory, forkMemory, fetchEffectiveMemories,
 } from '../services/api';
 import { productVisible } from '../utils/productVisibility';
+import { useAuth } from '../contexts/AuthContext';
 
 const SCOPE_COLORS: Record<string, string> = {
   global: 'geekblue', tenant: 'blue', user: 'purple', employee: 'magenta',
@@ -20,6 +21,8 @@ function dedupeMemories(items: any[]) {
 }
 
 export default function MemoryCenter() {
+  const { user } = useAuth();
+  const isAdmin = Boolean(user?.is_admin);
   const [mems, setMems] = useState<any[]>([]);
   const [effective, setEffective] = useState<any[]>([]);
   const [showCreate, setShowCreate] = useState(false);
@@ -48,25 +51,58 @@ export default function MemoryCenter() {
   };
 
   return (
-    <div style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-        <h2 style={{ margin: 0 }}>记忆中心 Memory Center</h2>
-        <Button type="primary" onClick={() => setShowCreate(true)}>新建 Memory</Button>
+    <div style={{ padding: '42px 48px 80px', maxWidth: 1280, margin: '0 auto' }}>
+      <div style={{
+        borderRadius: 24,
+        padding: '34px 36px',
+        marginBottom: 22,
+        background: 'linear-gradient(135deg, rgba(255,255,255,0.86), rgba(245,246,255,0.72))',
+        border: '1px solid var(--border-subtle)',
+        boxShadow: '0 24px 72px rgba(79,70,229,0.10)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 20 }}>
+          <div>
+            <div style={{ color: 'var(--accent)', fontSize: 12, fontWeight: 800, letterSpacing: '0.16em', marginBottom: 8 }}>
+              MEMORY GOVERNANCE
+            </div>
+            <h2 style={{ margin: 0, fontSize: 44, letterSpacing: 0 }}>记忆中心</h2>
+            <p style={{ color: 'var(--text-secondary)', maxWidth: 760, margin: '12px 0 0', lineHeight: 1.8 }}>
+              Hermes 负责真实运行时记忆能力，OpenAtlas 负责企业侧的作用域、权限、版本和注入可见性。全局/租户记忆只读共享，个人与自建员工记忆可定制，避免跨用户串记忆。
+            </p>
+          </div>
+          <Button type="primary" onClick={() => setShowCreate(true)}>
+            {isAdmin ? '新建记忆规则' : '新建个人记忆'}
+          </Button>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12, marginTop: 24 }}>
+          {[
+            ['Hermes 原生记忆', '保留底层 profiles / sessions / memory 注入能力，不在 OpenAtlas 中复制运行时。'],
+            ['OpenAtlas 治理层', '按 global / tenant / user / employee 管控可读、可改、可 Fork 和可绑定范围。'],
+            ['本轮输入来源', '聊天右侧会展示本轮实际注入的 Skill、文件片段和记忆，便于追溯。'],
+          ].map(([title, detail]) => (
+            <div key={title} style={{
+              padding: 16,
+              borderRadius: 16,
+              background: 'rgba(255,255,255,0.66)',
+              border: '1px solid var(--border-subtle)',
+            }}>
+              <strong>{title}</strong>
+              <p style={{ margin: '8px 0 0', color: 'var(--text-tertiary)', fontSize: 13, lineHeight: 1.6 }}>{detail}</p>
+            </div>
+          ))}
+        </div>
       </div>
-      <p style={{ color: 'var(--text-tertiary)' }}>
-        四层作用域:global / tenant / user / employee。effective 列表显示当前用户在 chat 中会被注入的 memory。
-      </p>
       <div style={{ display: 'flex', gap: 12, marginBottom: 12 }}>
-        <Select allowClear placeholder="按 scope 过滤" value={scope} onChange={setScope} style={{ minWidth: 160 }}
+        <Select allowClear placeholder="按作用域过滤" value={scope} onChange={setScope} style={{ minWidth: 180 }}
           options={[
-            { value: 'global', label: 'global' }, { value: 'tenant', label: 'tenant' },
-            { value: 'user', label: 'user' }, { value: 'employee', label: 'employee' },
+            { value: 'global', label: '全局共享' }, { value: 'tenant', label: '租户共享' },
+            { value: 'user', label: '个人记忆' }, { value: 'employee', label: '员工记忆' },
           ]} />
         <Button onClick={load} loading={loading}>刷新</Button>
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 16 }}>
         <div>
-          <h3 style={{ marginTop: 0 }}>所有 Memory ({mems.length})</h3>
+          <h3 style={{ marginTop: 0 }}>可见记忆 ({mems.length})</h3>
           {!loading && mems.length === 0 && (
             <div style={{ padding: 24, background: 'var(--bg-secondary)', borderRadius: 8, color: 'var(--text-tertiary)' }}>
               暂无
@@ -109,9 +145,9 @@ export default function MemoryCenter() {
           ))}
         </div>
         <div>
-          <h3 style={{ marginTop: 0 }}>本次对话生效 ({effective.length})</h3>
+          <h3 style={{ marginTop: 0 }}>当前生效注入 ({effective.length})</h3>
           <p style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>
-            effective memories — 跟 chat stream 中的 <code>openatlas.memories</code> 事件一致
+            与聊天流中的 <code>openatlas.memories</code> 事件一致，用来解释模型本轮看到了哪些记忆。
           </p>
           {effective.length === 0 && (
             <div style={{ padding: 24, background: 'var(--bg-secondary)', borderRadius: 8, color: 'var(--text-tertiary)', fontSize: 13 }}>
@@ -134,19 +170,22 @@ export default function MemoryCenter() {
           ))}
         </div>
       </div>
-      <CreateModal open={showCreate} onClose={() => setShowCreate(false)} onCreated={load} />
+      <CreateModal open={showCreate} onClose={() => setShowCreate(false)} onCreated={load} isAdmin={isAdmin} />
       <EditModal editId={editId} onClose={() => setEditId(null)} mems={mems} onSaved={load} />
     </div>
   );
 }
 
-function CreateModal({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: () => void }) {
+function CreateModal({ open, onClose, onCreated, isAdmin }: { open: boolean; onClose: () => void; onCreated: () => void; isAdmin: boolean }) {
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
   const [scope, setScope] = useState<'global' | 'tenant' | 'user' | 'employee'>('user');
   const [tags, setTags] = useState('');
   const [priority, setPriority] = useState(50);
   const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (!isAdmin) setScope('user');
+  }, [isAdmin, open]);
   const submit = async () => {
     if (!title || !content) { message.error('title + content required'); return; }
     setBusy(true);
@@ -162,17 +201,19 @@ function CreateModal({ open, onClose, onCreated }: { open: boolean; onClose: () 
     finally { setBusy(false); }
   };
   return (
-    <Modal open={open} onCancel={onClose} onOk={submit} title="新建 Memory" confirmLoading={busy} okText="创建">
+    <Modal open={open} onCancel={onClose} onOk={submit} title={isAdmin ? '新建记忆规则' : '新建个人记忆'} confirmLoading={busy} okText="创建">
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
         <label>标题 <Input value={title} onChange={(e) => setTitle(e.target.value)} /></label>
         <label>内容 <Input.TextArea rows={5} value={content} onChange={(e) => setContent(e.target.value)} /></label>
-        <label>Scope
+        <label>作用域
           <Select value={scope} onChange={setScope} style={{ width: '100%' }}
             options={[
-              { value: 'user', label: 'user (个人)' },
-              { value: 'tenant', label: 'tenant (本租户)' },
-              { value: 'global', label: 'global (全局)' },
-              { value: 'employee', label: 'employee (绑定员工)' },
+              { value: 'user', label: '个人记忆' },
+              ...(isAdmin ? [
+                { value: 'tenant', label: '租户共享记忆' },
+                { value: 'global', label: '全局共享记忆' },
+                { value: 'employee', label: '员工记忆' },
+              ] : []),
             ]} />
         </label>
         <label>Tags (逗号分隔) <Input value={tags} onChange={(e) => setTags(e.target.value)} /></label>

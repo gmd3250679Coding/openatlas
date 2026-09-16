@@ -8,9 +8,9 @@ guards fail.
 Usage:
     python runtime/launchers/hermes_api_server.py
 
-Required env (set by start.sh):
-    OPENATLAS_HOME       e.g. /Users/macbook/.openatlas
-    HERMES_HOME          e.g. /Users/macbook/.openatlas/hermes-tenants/demo/.hermes
+Required env (set by start.sh/systemd):
+    OPENATLAS_HOME       e.g. /var/lib/openatlas
+    HERMES_HOME          e.g. /var/lib/openatlas/hermes-tenants/demo/.hermes
     API_SERVER_HOST      127.0.0.1
     API_SERVER_PORT      58642
     API_SERVER_KEY       openatlas-demo-dev-key
@@ -18,7 +18,10 @@ Required env (set by start.sh):
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
+import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -61,24 +64,30 @@ def isolation_guard() -> None:
     print(f"  API_SERVER_KEY    = {os.environ['API_SERVER_KEY'][:8]}***")
 
 
-def setup_hermes_home() -> None:
-    """Create a fresh HERMES_HOME scaffold if missing (no defaults cloned from ~/.hermes).
-
-    Idempotent: existing config.yaml/.env are preserved. To change model/provider
-    edit them directly — start.sh will not clobber them on re-launch.
-    """
-    hermes_home = Path(os.environ["HERMES_HOME"])
-    hermes_home.mkdir(parents=True, exist_ok=True)
-    (hermes_home / "logs").mkdir(exist_ok=True)
-    (hermes_home / "sessions").mkdir(exist_ok=True)
-    (hermes_home / "skills").mkdir(exist_ok=True)
-    (hermes_home / "memory").mkdir(exist_ok=True)
-    if not (hermes_home / "config.yaml").exists():
-        (hermes_home / "config.yaml").write_text(
-            """# OpenAtlas Demo Tenant — Hermes config
+def _openatlas_config_text() -> str:
+    model = os.environ.get("OPENATLAS_DEFAULT_MODEL", "mimo-v2.5-pro")
+    provider = os.environ.get(
+        "OPENATLAS_DEFAULT_PROVIDER",
+        "custom:xiaomimimo",
+    )
+    provider_name = provider.removeprefix("custom:")
+    provider_base_url = os.environ.get(
+        "OPENATLAS_DEFAULT_PROVIDER_BASE_URL",
+        "https://api.xiaomimimo.com/v1",
+    )
+    provider_api_key = os.environ.get(
+        "OPENATLAS_DEFAULT_PROVIDER_API_KEY",
+        "__SET_OPENATLAS_DEFAULT_PROVIDER_API_KEY__",
+    )
+    fallback_model = os.environ.get("OPENATLAS_FALLBACK_MODEL", "deepseek-v4-flash")
+    fallback_provider = os.environ.get("OPENATLAS_FALLBACK_PROVIDER", "custom:deepseek")
+    fallback_provider_name = fallback_provider.removeprefix("custom:")
+    fallback_base_url = os.environ.get("OPENATLAS_FALLBACK_PROVIDER_BASE_URL", "https://api.deepseek.com")
+    fallback_api_key = os.environ.get("OPENATLAS_FALLBACK_PROVIDER_API_KEY", "")
+    return f"""# OpenAtlas tenant Hermes config
 model:
-  default: mimo-v2.5-pro
-  provider: custom:token-plan-cn.xiaomimimo.com
+  default: {json.dumps(model)}
+  provider: {json.dumps(provider)}
 toolsets:
   - hermes-cli
 agent:
@@ -90,12 +99,79 @@ terminal:
   cwd: .
   timeout: 60
 custom_providers:
-  - name: token-plan-cn.xiaomimimo.com
-    base_url: https://token-plan-cn.xiaomimimo.com/v1
-    api_key: tp-ccxrgk6riixm5ephks2bd3aihayxd0csb41ayx6hez6g3rv4
-    model: mimo-v2.5-pro
+  - name: {json.dumps(provider_name)}
+    base_url: {json.dumps(provider_base_url)}
+    api_key: {json.dumps(provider_api_key)}
+    model: {json.dumps(model)}
+  - name: {json.dumps(fallback_provider_name)}
+    base_url: {json.dumps(fallback_base_url)}
+    api_key: {json.dumps(fallback_api_key)}
+    model: {json.dumps(fallback_model)}
+fallback_providers:
+  - provider: {json.dumps(fallback_provider)}
+    model: {json.dumps(fallback_model)}
+    base_url: {json.dumps(fallback_base_url)}
+    api_key: {json.dumps(fallback_api_key)}
 """
-        )
+
+
+def _config_needs_openatlas_migration(text: str) -> bool:
+    """Detect old or incomplete tenant config that Hermes cannot route.
+
+    Earlier OpenAtlas releases wrote a legacy Hermes shape like
+    `model: mimo-v2.5-pro` plus `providers.custom`. Newer Hermes expects a
+    provider-aware model block and named custom/fallback providers. Preserving
+    the legacy file makes `/models` look healthy while chat fails with
+    "No inference provider configured", so we migrate only that stale shape.
+    """
+    if not text.strip():
+        return True
+    has_model_block = bool(re.search(r"(?m)^model:\s*$", text))
+    has_provider_field = bool(re.search(r"(?m)^\s+provider:\s*", text))
+    has_default_field = bool(re.search(r"(?m)^\s+default:\s*", text))
+    has_custom_providers = bool(re.search(r"(?m)^custom_providers:\s*$", text))
+    has_fallback_providers = bool(re.search(r"(?m)^fallback_providers:\s*$", text))
+    has_legacy_custom = bool(re.search(r"(?m)^providers:\s*$", text) and re.search(r"(?m)^\s+custom:\s*$", text))
+    has_legacy_fallbacks = bool(re.search(r"(?m)^fallbacks:\s*$", text))
+    has_scalar_model = bool(re.search(r"(?m)^model:\s*\S+", text))
+    provider_key = os.environ.get("OPENATLAS_DEFAULT_PROVIDER_API_KEY", "").strip()
+    has_provider_key_placeholder = "__SET_OPENATLAS_DEFAULT_PROVIDER_API_KEY__" in text
+    return (
+        has_scalar_model
+        or has_legacy_custom
+        or has_legacy_fallbacks
+        or (has_provider_key_placeholder and bool(provider_key) and provider_key != "__SET_OPENATLAS_DEFAULT_PROVIDER_API_KEY__")
+        or not (has_model_block and has_provider_field and has_default_field and has_custom_providers and has_fallback_providers)
+    )
+
+
+def setup_hermes_home() -> None:
+    """Create or migrate a HERMES_HOME scaffold for the isolated tenant.
+
+    Existing config is preserved when it is already provider-aware. Legacy
+    OpenAtlas tenant config is backed up and rewritten so Hermes can route
+    model calls.
+    """
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "logs").mkdir(exist_ok=True)
+    (hermes_home / "sessions").mkdir(exist_ok=True)
+    (hermes_home / "skills").mkdir(exist_ok=True)
+    (hermes_home / "memory").mkdir(exist_ok=True)
+    config_path = hermes_home / "config.yaml"
+    if not config_path.exists():
+        config_path.write_text(_openatlas_config_text())
+        config_state = "created"
+    else:
+        current = config_path.read_text(errors="replace")
+        if _config_needs_openatlas_migration(current):
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            backup_path = hermes_home / f"config.yaml.bak-{stamp}"
+            config_path.replace(backup_path)
+            config_path.write_text(_openatlas_config_text())
+            config_state = f"migrated legacy config; backup={backup_path.name}"
+        else:
+            config_state = "preserved"
     if not (hermes_home / ".env").exists():
         (hermes_home / ".env").write_text(
             f"""# OpenAtlas demo tenant env
@@ -105,7 +181,7 @@ API_SERVER_KEY={os.environ.get('API_SERVER_KEY', '')}
 HERMES_AGENT_NAME=openatlas-demo
 """
         )
-    print(f"[hermes-home] ready {hermes_home} (config preserved)")
+    print(f"[hermes-home] ready {hermes_home} (config {config_state})")
 
 
 def _isolated_hermes_agent_root() -> str:

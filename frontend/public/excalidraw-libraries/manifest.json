@@ -1,0 +1,79 @@
+{
+  "source": "https://github.com/excalidraw/excalidraw-libraries",
+  "site": "https://libraries.excalidraw.com/",
+  "license": "MIT",
+  "libraries": [
+    {
+      "key": "software-architecture",
+      "name": "Software Architecture",
+      "file": "software-architecture.excalidrawlib",
+      "upstream": "youritjang/software-architecture.excalidrawlib"
+    },
+    {
+      "key": "system-design-template",
+      "name": "System Design Template",
+      "file": "system-design-template.excalidrawlib",
+      "upstream": "aretecode/system-design-template.excalidrawlib"
+    },
+    {
+      "key": "system-design-components",
+      "name": "System Design Components",
+      "file": "system-design-components.excalidrawlib",
+      "upstream": "rohanp/system-design.excalidrawlib"
+    },
+    {
+      "key": "system-design-icons",
+      "name": "System Design Icons",
+      "file": "system-design-icons.excalidrawlib",
+      "upstream": "niknm/systemdesignicons.excalidrawlib"
+    },
+    {
+      "key": "flow-chart-symbols",
+      "name": "Flow Chart Symbols",
+      "file": "flow-chart-symbols.excalidrawlib",
+      "upstream": "finfin/flow-chart-symbols.excalidrawlib"
+    },
+    {
+      "key": "uml-er-library",
+      "name": "Shapes for UML & ER Diagrams",
+      "file": "uml-er-library.excalidrawlib",
+      "upstream": "BjoernKW/UML-ER-library.excalidrawlib"
+    },
+    {
+      "key": "network-topology-icons",
+      "name": "Network topology icons",
+      "file": "network-topology-icons.excalidrawlib",
+      "upstream": "dwelle/network-topology-icons.excalidrawlib"
+    },
+    {
+      "key": "kubernetes-icons-set",
+      "name": "Kubernetes Icons Set",
+      "file": "kubernetes-icons-set.excalidrawlib",
+      "upstream": "lowess/kubernetes-icons-set.excalidrawlib"
+    },
+    {
+      "key": "desktop-resolutions",
+      "name": "Desktop Resolutions",
+      "file": "desktop-resolutions.excalidrawlib",
+      "upstream": "shinkim/desktop-resolutions.excalidrawlib"
+    },
+    {
+      "key": "wireframing-placeholders",
+      "name": "Wireframing placeholders",
+      "file": "wireframing-placeholders.excalidrawlib",
+      "upstream": "xxxdeveloper/wireframing-placeholders.excalidrawlib"
+    },
+    {
+      "key": "html-input-elements",
+      "name": "HTML input elements",
+      "file": "html-input-elements.excalidrawlib",
+      "upstream": "marwinburesch/html-input-elements.excalidrawlib"
+    },
+    {
+      "key": "cloud-design-patterns",
+      "name": "Cloud Design Patterns",
+      "file": "cloud-design-patterns.excalidrawlib",
+      "upstream": "michelcaradec/cloud-design-patterns.excalidrawlib"
+    }
+  ]
+}

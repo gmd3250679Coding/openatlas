@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { lazy, Suspense, type ReactNode } from 'react';
 import ErrorBoundary from './components/ErrorBoundary';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
@@ -24,6 +24,12 @@ const Skills = lazy(() => import('./pages/Skills'));
 const SkillMarket = lazy(() => import('./pages/SkillMarket'));
 const MemoryCenter = lazy(() => import('./pages/MemoryCenter'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Whiteboard = lazy(() => import('./pages/Whiteboard'));
+const ContractReview = lazy(() => import('./pages/ContractReview'));
+const OfficialWriting = lazy(() => import('./pages/OfficialWriting'));
+const PresentationCanvas = lazy(() => import('./pages/PresentationCanvas'));
+const PresentationDesigner = lazy(() => import('./pages/PresentationDesigner'));
+const AipptOfflineDemo = lazy(() => import('./pages/AipptOfflineDemo'));
 
 /* ── Protected Route ── */
 
@@ -43,6 +49,7 @@ function PageFallback() {
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
   const { isAuthenticated, isLoading } = useAuth();
+  const location = useLocation();
 
   if (isLoading) {
     return (
@@ -59,7 +66,8 @@ function ProtectedRoute({ children }: { children: ReactNode }) {
   }
 
   if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    const from = `${location.pathname}${location.search}${location.hash}`;
+    return <Navigate to="/login" replace state={{ from }} />;
   }
 
   return <>{children}</>;
@@ -69,6 +77,7 @@ function ProtectedRoute({ children }: { children: ReactNode }) {
 
 function GuestRoute({ children }: { children: ReactNode }) {
   const { isAuthenticated, isLoading } = useAuth();
+  const location = useLocation();
 
   if (isLoading) {
     return (
@@ -85,9 +94,18 @@ function GuestRoute({ children }: { children: ReactNode }) {
   }
 
   if (isAuthenticated) {
-    return <Navigate to="/overview" replace />;
+    const from = typeof location.state?.from === 'string' ? location.state.from : '/overview';
+    return <Navigate to={from} replace />;
   }
 
+  return <>{children}</>;
+}
+
+function AdminRoute({ children }: { children: ReactNode }) {
+  const { user, isLoading } = useAuth();
+
+  if (isLoading) return <PageFallback />;
+  if (!user?.is_admin) return <Navigate to="/overview" replace />;
   return <>{children}</>;
 }
 
@@ -100,6 +118,7 @@ export default function App() {
         <ErrorBoundary>
           <Suspense fallback={<PageFallback />}>
             <Routes>
+              <Route path="/aippt-offline-demo" element={<AipptOfflineDemo />} />
               <Route
                 path="/login"
                 element={
@@ -119,22 +138,27 @@ export default function App() {
                 <Route index element={<Navigate to="/overview" replace />} />
                 <Route path="overview" element={<CommandCenter />} />
                 <Route path="workforce" element={<Workforce />} />
+                <Route path="whiteboard" element={<Whiteboard />} />
+                <Route path="presentation-canvas" element={<PresentationCanvas />} />
+                <Route path="presentation-canvas/designer/:deckId" element={<PresentationDesigner />} />
+                <Route path="official-writing" element={<OfficialWriting />} />
+                <Route path="contract-review" element={<ContractReview />} />
                 <Route path="workforce/recruit" element={<Recruit />} />
-                <Route path="workforce/dismiss/:id" element={<DismissPage />} />
+                <Route path="workforce/dismiss/:id" element={<AdminRoute><DismissPage /></AdminRoute>} />
                 <Route path="employee/:id" element={<EmployeeDetail />} />
-                <Route path="solutions" element={<Solutions />} />
-                <Route path="knowledge" element={<Knowledge />} />
-                <Route path="evidence" element={<Evidence />} />
-                <Route path="audit" element={<Audit />} />
+                <Route path="solutions" element={<AdminRoute><Solutions /></AdminRoute>} />
+                <Route path="knowledge" element={<AdminRoute><Knowledge /></AdminRoute>} />
+                <Route path="evidence" element={<AdminRoute><Evidence /></AdminRoute>} />
+                <Route path="audit" element={<AdminRoute><Audit /></AdminRoute>} />
                 <Route path="history" element={<History />} />
-                <Route path="settings" element={<Settings />} />
-                <Route path="identity" element={<IdentityAdmin />} />
-                <Route path="admin" element={<Admin />} />
-                <Route path="dashboard" element={<Dashboard />} />
-                <Route path="jobs" element={<Jobs />} />
+                <Route path="settings" element={<AdminRoute><Settings /></AdminRoute>} />
+                <Route path="identity" element={<AdminRoute><IdentityAdmin /></AdminRoute>} />
+                <Route path="admin" element={<AdminRoute><Admin /></AdminRoute>} />
+                <Route path="dashboard" element={<AdminRoute><Dashboard /></AdminRoute>} />
+                <Route path="jobs" element={<AdminRoute><Jobs /></AdminRoute>} />
                 <Route path="skills" element={<Skills />} />
                 <Route path="skill-market" element={<SkillMarket />} />
-                <Route path="memory" element={<MemoryCenter />} />
+                <Route path="memory" element={<AdminRoute><MemoryCenter /></AdminRoute>} />
               </Route>
             </Routes>
           </Suspense>

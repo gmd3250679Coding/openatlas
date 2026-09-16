@@ -6,7 +6,9 @@
 import { lazy, Suspense, useState } from 'react';
 import ToolCallPanel from './ToolCallPanel';
 import type { ToolCallItem } from './ToolCallPanel';
+import ChatArtifactCards from './ChatArtifactCards';
 import type { Attachment } from '../services/api';
+import type { ProgressStage } from '../types/progress';
 import '../styles/chat.css';
 
 const StreamRenderer = lazy(() => import('./StreamRenderer'));
@@ -22,10 +24,12 @@ interface Props {
   tools?: ToolCallItem[];
   attachments?: Attachment[];
   reasoning?: string[];
+  progressStages?: ProgressStage[];
+  artifacts?: any[];
 }
 
 export default function ChatMessage({
-  role, sender, avatar, color, text, timestamp, isStreaming, tools, attachments, reasoning,
+  role, sender, avatar, color, text, timestamp, isStreaming, tools, attachments, reasoning, progressStages, artifacts,
 }: Props) {
   const isUser = role === 'user';
   const [reasoningOpen, setReasoningOpen] = useState(false);
@@ -67,16 +71,16 @@ export default function ChatMessage({
           )}
         </div>
 
-        {/* Content — 配 light main 背景：机器人用浅灰气泡 + 深字；用户用淡紫透明 */}
-        <div className="message-bubble" style={{
-          fontSize: 14, lineHeight: 1.7, color: '#1D1D1F',
-          padding: '12px 16px',
-          borderRadius: isUser ? '16px 4px 16px 16px' : '4px 16px 16px 16px',
-          background: isUser ? 'rgba(79, 70, 229, 0.08)' : '#F5F5F7',
-          border: isUser ? '1px solid rgba(79, 70, 229, 0.18)' : '1px solid #ECECEF',
-          overflow: 'hidden',
-          wordBreak: 'break-word',
-        }}>
+	        {/* Content — 配 light main 背景：机器人用浅灰气泡 + 深字；用户用淡紫透明 */}
+	        <div className="message-bubble" style={{
+	          fontSize: 14, lineHeight: 1.7, color: 'var(--message-text)',
+	          padding: '12px 16px',
+	          borderRadius: isUser ? '16px 4px 16px 16px' : '4px 16px 16px 16px',
+	          background: isUser ? 'var(--message-user-bg)' : 'var(--message-assistant-bg)',
+	          border: isUser ? '1px solid var(--message-user-border)' : '1px solid var(--message-assistant-border)',
+	          overflow: 'hidden',
+	          wordBreak: 'break-word',
+	        }}>
           {isUser ? (
             <>
               <div style={{ whiteSpace: 'pre-wrap' }}>{text}</div>
@@ -85,12 +89,12 @@ export default function ChatMessage({
                   {attachments.map((file, idx) => (
                     <div key={`${file.id || file.name}-${idx}`} style={{
                       display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto auto', alignItems: 'center', gap: 8,
-                      padding: '6px 8px',
-                      borderRadius: 6,
-                      background: 'rgba(255,255,255,0.7)',
-                      border: '1px solid rgba(79, 70, 229, 0.12)',
-                      fontSize: 11,
-                      color: '#4B5563',
+	                      padding: '6px 8px',
+	                      borderRadius: 6,
+	                      background: 'var(--message-attachment-bg)',
+	                      border: '1px solid var(--message-user-border)',
+	                      fontSize: 11,
+	                      color: 'var(--text-secondary)',
                     }}>
                       <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {file.name}
@@ -160,13 +164,52 @@ export default function ChatMessage({
                   )}
                 </div>
               )}
-              {tools && tools.length > 0 && <ToolCallPanel tools={tools} />}
-              <Suspense fallback={<div style={{ whiteSpace: 'pre-wrap' }}>{text}</div>}>
-                <StreamRenderer content={text} isStreaming={isStreaming} />
-              </Suspense>
+              {!isUser && progressStages && progressStages.length > 0 && (
+                <InlineProgress stages={progressStages} />
+              )}
+              {tools && tools.length > 0 && <ToolCallPanel tools={tools} hasDeliverables={Boolean(artifacts?.length)} />}
+              {text.trim() && (
+                <Suspense fallback={<div style={{ whiteSpace: 'pre-wrap' }}>{text}</div>}>
+                  <StreamRenderer content={text} isStreaming={isStreaming} />
+                </Suspense>
+              )}
+              {artifacts && artifacts.length > 0 && <ChatArtifactCards artifacts={artifacts} />}
             </>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function InlineProgress({ stages }: { stages: ProgressStage[] }) {
+  const compactStages = stages.slice(-4);
+  const current = [...stages].reverse().find((stage) => stage.status === 'running' || stage.status === 'waiting') || stages[stages.length - 1];
+  const running = stages.some((stage) => stage.status === 'running' || stage.status === 'waiting');
+  const completed = stages.length > 0 && stages.every((stage) => stage.status === 'completed' || stage.status === 'failed');
+  return (
+    <div className={`chat-progress-rail ${running ? 'is-running' : ''} ${completed ? 'is-complete' : ''}`}>
+      <div className="chat-progress-rail__head">
+        <span className="chat-progress-rail__pulse" aria-hidden="true" />
+        <span className="chat-progress-rail__title">
+          {running ? '正在推进' : completed ? '阶段完成' : '任务进展'}
+          {current?.title ? ` · ${current.title}` : ''}
+        </span>
+        {current?.meta && <span className="chat-progress-rail__meta">{current.meta}</span>}
+      </div>
+      <div className="chat-progress-rail__bar" aria-hidden="true">
+        <span />
+      </div>
+      <div className="chat-progress-rail__steps">
+        {compactStages.map((stage) => (
+          <div key={`${stage.id}-${stage.updatedAt || ''}`} className={`chat-progress-step chat-progress-step--${stage.status || 'running'}`}>
+            <span className="chat-progress-step__dot" />
+            <span className="chat-progress-step__copy">
+              <strong>{stage.title || '任务进展'}</strong>
+              {stage.detail && <span>{stage.detail}</span>}
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );

@@ -22,7 +22,7 @@ BACKEND = ROOT / "backend"
 FRONTEND = ROOT / "frontend"
 SCRIPTS = ROOT / "scripts"
 
-DEFAULT_OPENATLAS_HOME = Path("/Users/macbook/.openatlas")
+DEFAULT_OPENATLAS_HOME = Path.home() / ".openatlas"
 DEFAULT_TENANT = "demo"
 DEFAULT_GATEWAY_PORT = 58642
 DEFAULT_BACKEND_PORT = 58003

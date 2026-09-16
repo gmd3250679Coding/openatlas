@@ -1,22 +1,25 @@
 import { lazy, Suspense, useState, useRef, useEffect, useCallback } from 'react';
-import type { PointerEvent as ReactPointerEvent } from 'react';
+import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { Button, Modal, Space, message } from 'antd';
 import AtlasOrb from '../components/AtlasOrb';
 import type { HeaderStyle, Pet, ProfileMode } from '../components/ChatHeader';
 import LeftAside from '../components/LeftAside';
 import CenterMain from '../components/CenterMain';
+import MentionPopover from '../components/MentionPopover';
 import RightAside from '../components/RightAside';
 import type { CanvasHandle } from '../components/CollaborationCanvas';
 import { canvasApi } from '../services/canvasApi';
 import { ApartmentOutlined, HistoryOutlined } from '@ant-design/icons';
 import type { DispatchTunnel } from '../types/dispatch';
+import type { ProgressStage } from '../types/progress';
 import {
   IconPaperclip, IconImage, IconMic,
   IconSend, IconTrash, IconHistory, IconSettings, IconUsers,
 } from '../components/Icons';
 import {
   chatWithEmployeeStream, conversationChatStream,
+  streamSessionEvents,
   fetchEmployees, fetchConversationDetail,
   fetchEmployeeDetail, routeToEmployee, fetchConversations,
   createConversation, createGroupConversation, deleteConversation, uploadFile,
@@ -31,6 +34,7 @@ import {
 } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import { productVisible, showTestFixtures } from '../utils/productVisibility';
+import { filesFromClipboardData } from '../utils/clipboardFiles';
 
 const CollaborationCanvas = lazy(() => import('../components/CollaborationCanvas'));
 
@@ -53,10 +57,63 @@ interface FloatingHubPosition {
   y: number;
 }
 
+function isImeComposingEvent(e: React.KeyboardEvent | React.KeyboardEvent<HTMLTextAreaElement>): boolean {
+  const native = e.nativeEvent as KeyboardEvent & { isComposing?: boolean; keyCode?: number; which?: number };
+  return Boolean(native.isComposing) || e.key === 'Process' || native.keyCode === 229 || native.which === 229;
+}
+
 const CANVAS_HUB_SIZE = 56;
 const CANVAS_HUB_MARGIN = 16;
-const CANVAS_HUB_STORAGE_KEY = 'atlas-canvas-hub-position';
+const CANVAS_HUB_STORAGE_KEY = 'atlas-canvas-hub-position:v3';
+const CANVAS_HUB_DEFAULT_RIGHT_GUTTER = 392; // keep clear of the right progress rail and its border
 const EMPLOYEE_DOCK_STORAGE_KEY = 'atlas-employee-dock-shortcuts';
+const COMMAND_RAIL_PREF_STORAGE_KEY = 'atlas-command-rail-prefs:v1';
+const DEFAULT_LEFT_RAIL_WIDTH = 280;
+const DEFAULT_RIGHT_RAIL_WIDTH = 360;
+const COLLAPSED_RAIL_WIDTH = 48;
+const LEFT_RAIL_MIN_WIDTH = 240;
+const LEFT_RAIL_MAX_WIDTH = 380;
+const RIGHT_RAIL_MIN_WIDTH = 320;
+const RIGHT_RAIL_MAX_WIDTH = 540;
+
+interface CommandRailPrefs {
+  leftWidth: number;
+  rightWidth: number;
+  leftCollapsed: boolean;
+  rightCollapsed: boolean;
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function getInitialCommandRailPrefs(): CommandRailPrefs {
+  if (typeof window === 'undefined') {
+    return {
+      leftWidth: DEFAULT_LEFT_RAIL_WIDTH,
+      rightWidth: DEFAULT_RIGHT_RAIL_WIDTH,
+      leftCollapsed: false,
+      rightCollapsed: false,
+    };
+  }
+  try {
+    const saved = JSON.parse(localStorage.getItem(COMMAND_RAIL_PREF_STORAGE_KEY) || 'null') as Partial<CommandRailPrefs> | null;
+    if (saved) {
+      return {
+        leftWidth: clampNumber(Number(saved.leftWidth) || DEFAULT_LEFT_RAIL_WIDTH, LEFT_RAIL_MIN_WIDTH, LEFT_RAIL_MAX_WIDTH),
+        rightWidth: clampNumber(Number(saved.rightWidth) || DEFAULT_RIGHT_RAIL_WIDTH, RIGHT_RAIL_MIN_WIDTH, RIGHT_RAIL_MAX_WIDTH),
+        leftCollapsed: Boolean(saved.leftCollapsed),
+        rightCollapsed: Boolean(saved.rightCollapsed),
+      };
+    }
+  } catch {}
+  return {
+    leftWidth: DEFAULT_LEFT_RAIL_WIDTH,
+    rightWidth: DEFAULT_RIGHT_RAIL_WIDTH,
+    leftCollapsed: typeof window !== 'undefined' && window.innerWidth < 1440,
+    rightCollapsed: false,
+  };
+}
 
 function clampCanvasHubPosition(pos: FloatingHubPosition): FloatingHubPosition {
   if (typeof window === 'undefined') return pos;
@@ -74,21 +131,345 @@ function getInitialCanvasHubPosition(): FloatingHubPosition {
       return clampCanvasHubPosition({ x: saved.x, y: saved.y });
     }
   } catch {}
+  const rightGutter = window.innerWidth <= 960 ? 24 : CANVAS_HUB_DEFAULT_RIGHT_GUTTER;
+  const bottomGutter = window.innerWidth <= 960 ? 84 : 96;
   return clampCanvasHubPosition({
-    x: window.innerWidth - CANVAS_HUB_SIZE - 28,
-    y: window.innerHeight - CANVAS_HUB_SIZE - 88,
+    x: window.innerWidth - CANVAS_HUB_SIZE - rightGutter,
+    y: window.innerHeight - CANVAS_HUB_SIZE - bottomGutter,
   });
 }
 
 function taskStatusLabel(status: string) {
   const map: Record<string, string> = {
     draft: '草稿',
+    queued: '排队中',
     running: '进行中',
     needs_input: '需补充',
+    waiting_input: '需补充',
+    waiting_approval: '待审批',
+    quota_waiting: '限流等待',
+    stalled: '后台处理中',
     completed: '已完成',
+    done: '已完成',
     failed: '失败',
   };
   return map[status] || status;
+}
+
+function taskDisplayCopy(status?: string, fallback?: string) {
+  const s = String(status || 'draft');
+  const map: Record<string, { label: string; detail: string }> = {
+    draft: { label: '等待任务', detail: '当前会话还没有正在执行的任务。' },
+    queued: { label: '排队中', detail: '任务已进入调度队列，等待 Hermes 接管执行。' },
+    running: { label: '工作中 · Hermes 正在执行', detail: '正在接收模型、工具和文件事件；长程任务可能会出现短暂静默。' },
+    waiting_approval: { label: '等待人工确认', detail: 'Hermes 请求确认高风险或不确定操作，确认后会继续推进。' },
+    quota_waiting: { label: '限流等待', detail: '模型服务触发额度或频率限制，本轮任务已保留，可稍后继续或换员工接力。' },
+    needs_input: { label: '需要补充信息', detail: '任务暂缺上下文，请补充资料后继续。' },
+    waiting_input: { label: '需要补充信息', detail: '任务暂缺上下文，请补充资料后继续。' },
+    stalled: { label: '后台处理中 · 自动同步中', detail: 'Hermes 暂时没有新事件，Atlas 会继续监听并自动同步结果；这不等于失败。' },
+    failed: { label: '失败 · 可重试', detail: '任务已进入失败态，可从检查点回放或重新执行。' },
+    completed: { label: '已完成', detail: '任务已完成，可以查看交付物、总结和输入来源。' },
+    done: { label: '已完成', detail: '任务已完成，可以查看交付物、总结和输入来源。' },
+  };
+  const item = map[s] || { label: fallback || taskStatusLabel(s), detail: '正在同步最新任务状态。' };
+  const weakFallback = new Set(['执行中', '进行中', '已停滞', '已停滞，可恢复', '后台守护中，可恢复']);
+  return { ...item, label: fallback && !weakFallback.has(fallback) ? fallback : item.label };
+}
+
+function formatTaskTime(value?: string) {
+  if (!value) return '';
+  const ms = Date.now() - new Date(value).getTime();
+  if (!Number.isFinite(ms)) return '';
+  if (ms < 60_000) return '刚刚更新';
+  if (ms < 3_600_000) return `${Math.max(1, Math.round(ms / 60_000))} 分钟前更新`;
+  if (ms < 86_400_000) return `${Math.max(1, Math.round(ms / 3_600_000))} 小时前更新`;
+  return new Date(value).toLocaleString('zh-CN', { hour12: false });
+}
+
+function buildTaskActivity(meta: any, isProcessing: boolean, latestUserTask: string, activeEmployee?: { name?: string } | null) {
+  const progress = meta?.progress || meta?.health?.progress;
+  const status = String(progress?.status || meta?.task_status || (isProcessing ? 'running' : 'draft'));
+  const activeStatuses = new Set(['running', 'queued', 'waiting_approval', 'quota_waiting', 'needs_input', 'waiting_input', 'stalled']);
+  if (!activeStatuses.has(status) && !isProcessing) return null;
+
+  const copy = taskDisplayCopy(status, progress?.phase_label);
+  const counts = progress?.counts || {};
+  const node = progress?.current_node;
+  const step = progress?.current_step;
+  const capabilityPlan = meta?.capability_plan || meta?.capabilityPlan;
+  const requiredCapabilities = Array.isArray(capabilityPlan?.required_capabilities) ? capabilityPlan.required_capabilities : [];
+  const gaps = Array.isArray(capabilityPlan?.gaps) ? capabilityPlan.gaps : [];
+  const routing = capabilityPlan?.routing_applied || capabilityPlan?.auto_route;
+  const collaborationPolicy = meta?.collaboration_policy || meta?.collaborationPolicy;
+  const headline =
+    latestUserTask
+    || progress?.headline
+    || meta?.task_summary
+    || meta?.last_message
+    || '正在处理当前任务';
+  const nodeName =
+    node?.label
+    || node?.employee_name
+    || node?.node_id
+    || activeEmployee?.name
+    || '';
+
+  return {
+    status,
+    label: copy.label,
+    detail: progress?.recovery_hint && status === 'stalled' && !String(progress.recovery_hint).includes('任务已保留检查点')
+      ? progress.recovery_hint
+      : copy.detail,
+    headline,
+    nodeName,
+    stepTitle: step?.title || step?.event_type || '',
+    stepCount: Number(counts.steps || 0),
+    checkpointCount: Number(counts.checkpoints || 0),
+    artifactCount: Array.isArray(meta?.artifacts)
+      ? meta.artifacts.filter((a: any) => !a.archived && isTaskDeliverableArtifact(a)).length
+      : Number(meta?.health?.counts?.artifacts || 0),
+    updatedText: formatTaskTime(progress?.updated_at || meta?.updated_at),
+    capabilitySummary: capabilityPlan?.summary || '',
+    capabilityLabels: requiredCapabilities.slice(0, 4).map((item: any) => String(item.label || item.key || '')).filter(Boolean),
+    gapLabels: gaps.slice(0, 3).map((item: any) => String(item.label || item.key || '')).filter(Boolean),
+    routedTo: routing?.to_employee_name || routing?.employee_name || '',
+    collaborationMode: collaborationPolicy?.mode || '',
+  };
+}
+
+function upsertProgressStage(stages: ProgressStage[] | undefined, incoming: ProgressStage): ProgressStage[] {
+  const next = [...(stages || [])];
+  const idx = next.findIndex((s) => s.id === incoming.id);
+  const stage = { ...incoming, updatedAt: incoming.updatedAt || Date.now() };
+  if (idx >= 0) {
+    next[idx] = { ...next[idx], ...stage };
+  } else {
+    next.push(stage);
+  }
+  return next.slice(-10);
+}
+
+function settleProgressStages(stages: ProgressStage[] | undefined): ProgressStage[] | undefined {
+  if (!stages?.length) return stages;
+  return stages.map((stage) => {
+    if (stage.status === 'running' || stage.status === 'waiting') {
+      return { ...stage, status: 'completed' as const, updatedAt: stage.updatedAt || Date.now() };
+    }
+    return stage;
+  });
+}
+
+function safeStageText(value: unknown, fallback = '') {
+  const raw = String(value ?? '').trim();
+  if (!raw) return fallback;
+  if (/assistant produced a final response/i.test(raw)) return '模型已返回最终回复。';
+  if (/using run events/i.test(raw) || /Run Events/i.test(raw)) return '执行链路已连接，正在监听模型和工具事件。';
+  return raw
+    .replace(/后台守护中，可恢复/g, '后台处理中，自动同步中')
+    .replace(/已停滞，可恢复/g, '后台处理中，自动同步中')
+    .replace(/后台补同步/g, '后台自动同步')
+    .replace(/本轮已停止等待/g, '本轮已转入后台自动同步')
+    .replace(/quota|rate limit|too many requests/gi, '模型额度或频率限制')
+    .replace(/https?:\/\/(?:127\.0\.0\.1|localhost):\d+\/?\S*/gi, '本地运行链路')
+    .replace(/\b(?:run|thread|session|conv)_[a-z0-9_-]{10,}\b/gi, '运行实例')
+    .replace(/\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b/gi, '内部标识')
+    .replace(/\b[a-f0-9]{24,}\b/gi, '内部标识')
+    .slice(0, 220);
+}
+
+function stageMetaLabel(stage: string) {
+  const key = stage.toLowerCase();
+  if (key === 'artifact' || key === 'output') return '输出';
+  if (key === 'context' || key === 'files' || key === 'memory') return '输入';
+  if (key === 'skill') return 'Skill';
+  if (key === 'search' || key === 'web') return '检索';
+  if (key === 'quota') return '限流';
+  if (key === 'tool') return '工具';
+  if (key === 'reasoning' || key === 'thinking') return '思考';
+  if (key === 'approval') return '审批';
+  if (key === 'done' || key === 'completed') return '完成';
+  if (key === 'error' || key === 'failed') return '错误';
+  return '进展';
+}
+
+function toolStageTitle(name: string, status: ProgressStage['status']) {
+  const key = name.toLowerCase();
+  const action =
+    key.includes('skill') ? '调用 Skill'
+      : key.includes('search') || key.includes('browser') || key.includes('web') ? '检索资料'
+        : key.includes('file') || key.includes('read') ? '读取文件'
+          : key.includes('write') || key.includes('artifact') ? '生成交付物'
+            : '调用工具';
+  if (status === 'completed') return `${action}完成 · ${name}`;
+  if (status === 'failed') return `${action}失败 · ${name}`;
+  return `正在${action} · ${name}`;
+}
+
+function formatElapsedMs(value: number | string | undefined): string | undefined {
+  if (value == null || value === '') return undefined;
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  if (n < 1000) return `${Math.max(1, Math.round(n))}ms`;
+  const secondsTotal = n / 1000;
+  if (secondsTotal < 10) return `${secondsTotal.toFixed(1)}s`;
+  if (secondsTotal < 60) return `${Math.round(secondsTotal)}s`;
+  const minutes = Math.floor(secondsTotal / 60);
+  const seconds = Math.round(secondsTotal % 60);
+  return `${minutes}m${seconds ? ` ${seconds}s` : ''}`;
+}
+
+function parseTimeMs(value?: string): number | undefined {
+  if (!value) return undefined;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+function formatToolWait(tool: Partial<ToolCall>, status: ProgressStage['status']): string | undefined {
+  const explicit = formatElapsedMs(tool.waitDurationMs);
+  if (explicit) return status === 'running' ? `已等待 ${explicit}` : `等待 ${explicit}`;
+  const started = parseTimeMs(tool.startedAt);
+  if (started) {
+    const ended = parseTimeMs(tool.completedAt) || Date.now();
+    const elapsed = formatElapsedMs(Math.max(0, ended - started));
+    if (elapsed) return status === 'running' ? `已等待 ${elapsed}` : `等待 ${elapsed}`;
+  }
+  if (tool.duration != null && tool.duration !== '') {
+    const n = typeof tool.duration === 'number' ? tool.duration : Number(tool.duration);
+    if (Number.isFinite(n) && n > 0) return `工具耗时 ${formatElapsedMs(n * 1000)}`;
+  }
+  return undefined;
+}
+
+function toolStage(tool: Partial<ToolCall>): ProgressStage {
+  const normalizedStatus = normalizeToolStatus(tool.status, tool.error);
+  const status = normalizedStatus === 'completed'
+    ? 'completed'
+    : normalizedStatus === 'failed' || normalizedStatus === 'error'
+      ? 'failed'
+      : normalizedStatus === 'progress'
+        ? 'running'
+        : 'running';
+  const label = safeStageText(tool.label || tool.preview || tool.command || '');
+  const name = String(tool.name || 'tool');
+  return {
+    id: `tool:${tool.toolCallId || name}:${label.slice(0, 80)}`,
+    kind: 'tool',
+    status,
+    title: toolStageTitle(name, status),
+    detail: label || (status === 'completed' ? '工具已返回结果。' : '等待 Hermes 工具事件返回。'),
+    meta: formatToolWait(tool, status),
+    action: status === 'failed' ? 'replay' : undefined,
+    actionLabel: status === 'failed' ? '回放' : undefined,
+  };
+}
+
+function traceStage(trace: any): ProgressStage {
+  const stage = String(trace?.stage || trace?.kind || 'info');
+  const rawTitle = String(trace?.title || '任务进展');
+  const rawDetail = String(trace?.detail || trace?.summary || '').trim();
+  const title = safeStageText(rawTitle, '任务进展');
+  const detail = safeStageText(rawDetail);
+  const fingerprint = `${stage} ${rawTitle} ${rawDetail} ${trace?.event_type || ''}`.toLowerCase();
+  const failed = /failed|error|失败|异常/.test(fingerprint);
+  const completed = /completed|complete|done|finished|完成|已返回|最终回复|交付物|artifact|context|files|memory/.test(fingerprint);
+  const waiting = /approval|confirm|waiting|stalled|idle|等待|确认|后台/.test(fingerprint);
+  return {
+    id: `trace:${stage}:${title}`,
+    kind: stage === 'artifact' ? 'artifact' : stage === 'context' || stage === 'files' || stage === 'memory' || stage === 'skill' ? 'context' : stage === 'quota' ? 'quota' : 'info',
+    status: failed ? 'failed' : completed ? 'completed' : waiting ? 'waiting' : 'running',
+    title,
+    detail,
+    meta: stageMetaLabel(stage),
+    action: stage === 'artifact' ? 'outputs' : stage === 'quota' ? 'retry' : undefined,
+    actionLabel: stage === 'artifact' ? '输出物' : undefined,
+  };
+}
+
+function waitStage(ms: number, detached = false): ProgressStage {
+  if (detached) {
+    return {
+      id: 'wait:detached',
+      kind: 'wait',
+      status: 'waiting',
+      title: '后台处理中',
+      detail: 'Hermes 可能仍在继续执行，Atlas 会自动同步最新结果，也可以打开回放查看检查点。',
+      meta: '自动同步',
+      action: 'replay',
+      actionLabel: '回放',
+    };
+  }
+  if (ms >= 45_000) {
+    return {
+      id: 'wait:45',
+      kind: 'wait',
+      status: 'waiting',
+      title: '长步骤仍在执行',
+      detail: '当前步骤耗时较长，可能正在读取大文件、执行脚本或生成交付物。',
+      meta: '45s+',
+    };
+  }
+  if (ms >= 20_000) {
+    return {
+      id: 'wait:20',
+      kind: 'wait',
+      status: 'running',
+      title: '等待工具返回',
+      detail: 'Hermes 暂时没有新事件，Atlas 仍在前台监听。',
+      meta: '20s+',
+    };
+  }
+  return {
+    id: 'wait:8',
+    kind: 'wait',
+    status: 'running',
+    title: '仍在执行',
+    detail: '正在等待模型或工具返回，不是卡死。',
+    meta: '8s+',
+  };
+}
+
+function taskStateStage(state: any): ProgressStage {
+  const raw = String(state?.task_status || state?.status || 'running');
+  const status: ProgressStage['status'] =
+    raw === 'completed' || raw === 'done'
+      ? 'completed'
+      : raw === 'failed'
+        ? 'failed'
+        : raw === 'needs_input' || raw === 'waiting_input' || raw === 'waiting_approval' || raw === 'quota_waiting' || raw === 'stalled'
+          ? 'waiting'
+          : 'running';
+  return {
+    id: `task:${raw}`,
+    kind: raw === 'quota_waiting' ? 'quota' : raw === 'stalled' ? 'wait' : 'runtime',
+    status,
+    title: taskDisplayCopy(raw, state?.label).label,
+    detail: safeStageText(state?.reason || state?.task_summary || taskDisplayCopy(raw).detail),
+    meta: '任务状态',
+    action: raw === 'quota_waiting' ? 'retry' : raw === 'stalled' || raw === 'failed' ? 'replay' : undefined,
+    actionLabel: raw === 'quota_waiting' ? '稍后重试' : raw === 'stalled' ? '回放/恢复' : raw === 'failed' ? '回放' : undefined,
+  };
+}
+
+function capabilityPlanStage(plan: any, policy: any): ProgressStage {
+  const required = Array.isArray(plan?.required_capabilities) ? plan.required_capabilities : [];
+  const gaps = Array.isArray(plan?.gaps) ? plan.gaps : [];
+  const routing = plan?.routing_applied || plan?.auto_route;
+  const labels = required.slice(0, 4).map((item: any) => item.label || item.key).filter(Boolean).join(' / ');
+  const mode = String(policy?.mode || '');
+  const modeText = mode.includes('synthesis')
+    ? '多员工协作 · 合稿交付'
+    : mode.includes('serial')
+      ? '串行接力'
+      : '能力预检';
+  const routedName = routing?.to_employee_name || routing?.employee_name || '';
+  return {
+    id: `capability:${required.map((item: any) => item.key || item.label).join('|') || 'none'}:${routedName || modeText}`,
+    kind: 'capability',
+    status: gaps.length > 0 && !routing ? 'waiting' : 'completed',
+    title: routedName ? `能力路由给 ${routedName}` : '能力清单已生成',
+    detail: safeStageText(plan?.summary || (labels ? `识别到能力: ${labels}` : '本轮任务未识别到特殊工具能力需求。')),
+    meta: modeText,
+  };
 }
 
 interface ToolCall {
@@ -98,8 +479,11 @@ interface ToolCall {
   toolCallId?: string;
   args?: any;
   result?: any;
-  error?: string;
+  error?: any;
   duration?: number | string;
+  waitDurationMs?: number | string;
+  startedAt?: string;
+  completedAt?: string;
   preview?: string;
   command?: string;
   delta?: string;
@@ -120,9 +504,29 @@ interface Msg {
   total_tokens?: number;
   token_count?: number;
   reasoning?: string[];
+  progressStages?: ProgressStage[];
 }
 
 interface Tunnel extends DispatchTunnel {}
+
+function normalizeToolError(value: any): any {
+  if (value === false || value == null || value === '') return undefined;
+  if (typeof value === 'string') {
+    const clean = value.trim().toLowerCase();
+    if (!clean || clean === 'false' || clean === 'null' || clean === 'undefined') return undefined;
+  }
+  return value;
+}
+
+function isFalseErrorMarker(value: any): boolean {
+  return value === false || (typeof value === 'string' && value.trim().toLowerCase() === 'false');
+}
+
+function normalizeToolStatus(status: any, error: any): string | undefined {
+  const raw = status == null ? '' : String(status);
+  if (isFalseErrorMarker(error) && (raw === 'failed' || raw === 'error')) return 'completed';
+  return raw || undefined;
+}
 
 function coerceToolCalls(raw: any): ToolCall[] {
   const rows = Array.isArray(raw) ? raw : [];
@@ -130,12 +534,15 @@ function coerceToolCalls(raw: any): ToolCall[] {
     .map((t: any) => ({
       name: String(t?.name || t?.tool_name || t?.tool || 'tool'),
       label: t?.label || t?.preview || t?.command || undefined,
-      status: t?.status,
+      status: normalizeToolStatus(t?.status, t?.error),
       toolCallId: t?.toolCallId || t?.tool_call_id || t?.id,
       args: t?.args,
       result: t?.result,
-      error: t?.error,
+      error: normalizeToolError(t?.error),
       duration: t?.duration,
+      waitDurationMs: t?.waitDurationMs ?? t?.wait_duration_ms,
+      startedAt: t?.startedAt ?? t?.started_at,
+      completedAt: t?.completedAt ?? t?.completed_at,
       preview: t?.preview,
       command: t?.command,
       delta: t?.delta,
@@ -149,12 +556,15 @@ function mergeToolCall(list: ToolCall[], incoming: Partial<ToolCall> & { name?: 
   const next: ToolCall = {
     name: String(incoming.name || 'tool'),
     label: incoming.label || incoming.preview || incoming.command,
-    status: incoming.status,
+    status: normalizeToolStatus(incoming.status, incoming.error),
     toolCallId: incoming.toolCallId,
     args: incoming.args,
     result: incoming.result,
-    error: incoming.error,
+    error: normalizeToolError(incoming.error),
     duration: incoming.duration,
+    waitDurationMs: incoming.waitDurationMs,
+    startedAt: incoming.startedAt,
+    completedAt: incoming.completedAt,
     preview: incoming.preview,
     command: incoming.command,
     delta: incoming.delta,
@@ -195,20 +605,123 @@ interface SessionMeta {
   task_status?: string;
   task_reason?: string;
   task_summary?: string;
+  updated_at?: string | null;
+  last_message?: string;
+  message_count?: number;
   summary_updated_at?: string | null;
   summary?: any;
   artifacts?: any[];
   context_injections?: any[];
   health?: any;
+  progress?: any;
+  capability_plan?: any;
+  collaboration_policy?: any;
+}
+
+const SESSION_AUTO_SYNC_INTERVAL_MS = 6_000;
+const SESSION_AUTO_SYNC_BACKGROUND_TAIL_MS = 20 * 60_000;
+const SESSION_AUTO_SYNC_NORMAL_TAIL_POLLS = 2;
+const SESSION_BUSY_STATUSES = new Set(['queued', 'running', 'waiting_approval', 'quota_waiting', 'stalled']);
+const SESSION_ATTENTION_STATUSES = new Set(['waiting_approval', 'needs_input', 'waiting_input', 'quota_waiting']);
+const SESSION_TERMINAL_STATUSES = new Set(['completed', 'done', 'failed', 'stopped', 'cancelled']);
+// The cross-session todo surface is temporarily hidden until approval state
+// reconciliation is strict enough to avoid stale Hermes approvals.
+const SHOW_GLOBAL_SESSION_TODOS = false;
+
+function mergeHydratedMessage(current: Msg | undefined, incoming: Msg): Msg {
+  if (!current) return incoming;
+  const merged: Msg = {
+    ...current,
+    ...incoming,
+    progressStages: current.progressStages || incoming.progressStages,
+  };
+  const currentText = String(current.text || '');
+  const incomingText = String(incoming.text || '');
+  if (currentText && incomingText && currentText.length > incomingText.length && currentText.startsWith(incomingText.slice(0, 80))) {
+    merged.text = currentText;
+  }
+  if ((current.tools || []).length > (incoming.tools || []).length) merged.tools = current.tools;
+  if ((current.attachments || []).length > (incoming.attachments || []).length) merged.attachments = current.attachments;
+  if ((current.reasoning || []).length > (incoming.reasoning || []).length) merged.reasoning = current.reasoning;
+  return merged;
+}
+
+function mergeHydratedMessages(current: Msg[], incoming: Msg[]): Msg[] {
+  if (incoming.length === 0) return current;
+  if (current.length === 0) return incoming;
+  const maxLen = Math.max(current.length, incoming.length);
+  const next: Msg[] = [];
+  for (let i = 0; i < maxLen; i += 1) {
+    const cur = current[i];
+    const inc = incoming[i];
+    if (!inc) {
+      if (cur) next.push(cur);
+      continue;
+    }
+    if (!cur) {
+      next.push(inc);
+      continue;
+    }
+    if (cur.role === inc.role) {
+      next.push(mergeHydratedMessage(cur, inc));
+    } else {
+      next.push(inc);
+    }
+  }
+  return next;
+}
+
+function messagesFingerprint(list: Msg[]): string {
+  return JSON.stringify(list.map((m) => [
+    m.role,
+    String(m.text || '').length,
+    String(m.text || '').slice(-160),
+    (m.attachments || []).length,
+    (m.tools || []).map((t) => `${t.name}:${t.status || ''}:${t.label || ''}`).join('|'),
+  ]));
+}
+
+function sessionHasBackgroundWork(detail: any): boolean {
+  const progress = detail?.progress || detail?.health?.progress || {};
+  const timeline = Array.isArray(progress?.timeline) ? progress.timeline : [];
+  const latestRun = progress?.latest_run || {};
+  const latestWorkflow = progress?.workflow_run || {};
+  const participantIds = Array.isArray(detail?.participant_ids) ? detail.participant_ids : [];
+  const eventText = JSON.stringify([
+    latestRun?.status,
+    latestRun?.last_event_type,
+    latestWorkflow?.status,
+    progress?.current_step?.event_type,
+    progress?.current_step?.status,
+    ...timeline.map((t: any) => [t?.event_type, t?.status, t?.title, t?.summary]),
+  ]).toLowerCase();
+  return (
+    participantIds.length > 0
+    || Boolean(detail?.is_group)
+    || /run_detached|run_idle|stalled|后台|自动同步|runtime\.reconciled/.test(eventText)
+    || ['running', 'stalled', 'waiting_approval', 'quota_waiting'].includes(String(detail?.task_status || latestRun?.status || latestWorkflow?.status || ''))
+  );
 }
 
 // Phase 2.6: 快捷指令默认值（DB 加载前的占位 + 兜底）
 const DEFAULT_QUICK_PROMPTS = ['检查围标', '审合同', '差旅报销', '休假规则'];
 
 // 员工信息缓存 (含 __id 真 UUID, 不要丢)
-let employeesCache: Array<{ id: number; __id?: string; name: string; avatar_char: string; department?: { name: string; color: string } | null }> = [];
+let employeesCache: Array<{ id: number; __id?: string; name: string; avatar_char: string; department?: { name: string; color: string } | null; allowed_toolsets?: string[] | null; toolsets?: string[] | null; allowedToolsets?: string[] | null }> = [];
 
 const realSessionId = (v: any): string => String(v?.__id || v?.id || v || '');
+const receptionistEmployeeName = '行政小六';
+const isAbortLikeError = (err: unknown, signal?: AbortSignal) => (
+  Boolean(signal?.aborted)
+  || (err instanceof DOMException && err.name === 'AbortError')
+  || (typeof err === 'object' && err !== null && 'name' in err && String((err as { name?: unknown }).name) === 'AbortError')
+);
+const nonEmptyToolsets = (...values: unknown[]): string[] | null => {
+  for (const value of values) {
+    if (Array.isArray(value) && value.length > 0) return value.map(String);
+  }
+  return null;
+};
 const toEmployeeChip = (emp: any, fallbackId?: number) => ({
   id: Number(emp?.id ?? fallbackId ?? 0),
   uuid: emp?.__id,
@@ -216,8 +729,51 @@ const toEmployeeChip = (emp: any, fallbackId?: number) => ({
   avatar: emp?.avatar_char || emp?.avatar || emp?.name?.[0] || '?',
   color: emp?.department?.color || '#4F46E5',
   department: emp?.department?.name,
-  allowedToolsets: emp?.allowed_toolsets,
+  allowedToolsets: nonEmptyToolsets(emp?.allowed_toolsets, emp?.toolsets, emp?.allowedToolsets),
 });
+
+function findReceptionistEmployee(list: typeof employeesCache) {
+  return list.find((emp) => String(emp.name || '').trim() === receptionistEmployeeName)
+    || list.find((emp) => /行政小六|行政|接待|atlas/i.test(String(emp.name || '')))
+    || list[0];
+}
+
+function messagesFromConversationDetail(detail: any, fallbackEmployee?: any): Msg[] {
+  const rows = Array.isArray(detail?.messages) ? detail.messages : [];
+  return rows.map((m: any) => {
+    if (m.role === 'user') {
+      return {
+        role: 'user',
+        sender: '你',
+        avatar: '你',
+        color: 'var(--text-secondary)',
+        text: m.content || '',
+        attachments: m.attachments ?? [],
+        input_tokens: m.input_tokens,
+        output_tokens: m.output_tokens,
+        total_tokens: m.total_tokens,
+        token_count: m.token_count,
+      };
+    }
+    const speakerId = String(m.speaker_employee_id ?? detail?.employee_id ?? fallbackEmployee?.uuid ?? fallbackEmployee?.id ?? '?');
+    const cached = employeesCache.find((e: any) => String(e.__id || e.id) === speakerId || String(e.id) === speakerId);
+    const sender = m.speaker_name || cached?.name || fallbackEmployee?.name || `员工 #${speakerId}`;
+    return {
+      role: speakerId,
+      sender,
+      avatar: sender[0] || '?',
+      color: cached?.department?.color || fallbackEmployee?.color || '#4F46E5',
+      text: m.content || '',
+      reasoning: Array.isArray(m.reasoning) ? m.reasoning : (m.reasoning ? [String(m.reasoning)] : []),
+      tools: coerceToolCalls(m.tool_calls || m.tools),
+      attachments: m.attachments ?? [],
+      input_tokens: m.input_tokens,
+      output_tokens: m.output_tokens,
+      total_tokens: m.total_tokens,
+      token_count: m.token_count,
+    };
+  });
+}
 
 function formatTraceLine(trace: any): string {
   const title = trace?.title || trace?.stage || '执行事件';
@@ -237,6 +793,7 @@ type PendingApproval = {
   hermes_run_id?: string;
   run_id?: string;
   approval_id?: string;
+  session_id?: string;
   command?: string;
   description?: string;
   pattern_key?: string;
@@ -246,11 +803,72 @@ type PendingApproval = {
   source?: string;
 };
 
+type QueuedRunIntent = 'queue';
+
+type QueuedRunItem = {
+  id: string;
+  sid: string;
+  text: string;
+  intent: QueuedRunIntent;
+  attachments?: Attachment[];
+  primaryEmployee?: any;
+  relayEmployees?: Employee[];
+  createdAt: number;
+};
+
+type SessionRunState = {
+  isProcessing?: boolean;
+  status?: string;
+  reason?: string;
+  queue?: QueuedRunItem[];
+  pendingApproval?: PendingApproval | null;
+  needsInput?: boolean;
+  updatedAt?: number;
+};
+
+type SessionRunRuntime = {
+  abortController?: AbortController | null;
+  hermesRunIds: Set<string>;
+};
+
+type SessionTodo = {
+  id: string;
+  sid: string;
+  type: 'approval' | 'needs_input';
+  title: string;
+  detail?: string;
+  approval?: PendingApproval;
+  createdAt: number;
+};
+
+type SendConflictDraft = {
+  sid: string;
+  text: string;
+  attachments: Attachment[];
+  primaryEmployee?: any;
+  relayEmployees: Employee[];
+};
+
 function approvalChoiceText(choice: ApprovalChoice): string {
   if (choice === 'deny') return '已拒绝执行';
   if (choice === 'session') return '已批准本会话，继续执行';
   if (choice === 'always') return '已永久批准该类操作，继续执行';
   return '已批准一次，继续执行';
+}
+
+function isStaleApprovalError(err: unknown): boolean {
+  const text = String((err as any)?.message || err || '').toLowerCase();
+  return text.includes('approval_not_pending') || text.includes('no pending approval') || text.includes('没有可处理的审批');
+}
+
+function isActionableHermesApproval(approval: PendingApproval | any): boolean {
+  const source = String(approval?.source || '').toLowerCase();
+  const event = String(approval?.event || approval?.event_type || '').toLowerCase();
+  const approvalId = String(approval?.approval_id || approval?.id || '');
+  if (source.includes('openatlas') || event.includes('synthetic') || approvalId.includes('synthetic')) {
+    return false;
+  }
+  return Boolean(approval?.hermes_run_id || approval?.run_id);
 }
 
 function requestApprovalChoice(approval: any): Promise<ApprovalChoice> {
@@ -310,30 +928,58 @@ function requestApprovalChoice(approval: any): Promise<ApprovalChoice> {
   });
 }
 
-async function initEmployees() {
+async function ensureEmployeesCache() {
+  if (employeesCache.length > 0) return employeesCache;
   try {
     employeesCache = await fetchEmployees() as any;
   } catch (e) {
     console.error('Failed to fetch employees:', e);
   }
+  return employeesCache;
 }
 
-async function selectEmployee(input: string): Promise<{ id: number; uuid?: string; name: string; avatar: string; color: string }> {
-  // 优先用第一个 cache 员工,带 __id
-  const first = employeesCache[0] as any;
-  const defaultEmployee = first
-    ? { id: first.id, __id: first.__id, name: first.name, avatar_char: first.avatar_char, department: first.department }
+async function selectEmployee(input: string): Promise<{ id: number; uuid?: string; name: string; avatar: string; color: string; department?: string; allowedToolsets?: string[] | null }> {
+  const availableEmployees = await ensureEmployeesCache();
+  // 默认走接待员工,避免无 @ 时随机落到某个业务岗位.
+  const receptionist = findReceptionistEmployee(availableEmployees) as any;
+  const defaultEmployee = receptionist
+    ? {
+      id: receptionist.id,
+      __id: receptionist.__id,
+      name: receptionist.name,
+      avatar_char: receptionist.avatar_char,
+      department: receptionist.department,
+      allowed_toolsets: receptionist.allowed_toolsets,
+      toolsets: receptionist.toolsets,
+      allowedToolsets: receptionist.allowedToolsets,
+    }
     : { id: 1, name: 'Atlas', avatar_char: 'A', department: { name: '总调度', color: '#4F46E5' } };
   try {
     const route = await routeToEmployee(input);
-    const matched = employeesCache.find(e => e.id === route.employee_id);
+    const matched = availableEmployees.find(e => e.id === route.employee_id);
     if (matched) {
-      return { id: matched.id, uuid: (matched as any).__id, name: matched.name, avatar: matched.avatar_char, color: matched.department?.color || '#4F46E5' };
+      return {
+        id: matched.id,
+        uuid: (matched as any).__id,
+        name: matched.name,
+        avatar: matched.avatar_char,
+        color: matched.department?.color || '#4F46E5',
+        department: matched.department?.name,
+        allowedToolsets: nonEmptyToolsets((matched as any).allowed_toolsets, (matched as any).toolsets, (matched as any).allowedToolsets),
+      };
     }
   } catch (e) {
     console.error('Route failed, using default:', e);
   }
-  return { id: defaultEmployee.id, uuid: (defaultEmployee as any).__id, name: defaultEmployee.name, avatar: defaultEmployee.avatar_char, color: defaultEmployee.department?.color || '#4F46E5' };
+  return {
+    id: defaultEmployee.id,
+    uuid: (defaultEmployee as any).__id,
+    name: defaultEmployee.name,
+    avatar: defaultEmployee.avatar_char,
+    color: defaultEmployee.department?.color || '#4F46E5',
+    department: defaultEmployee.department?.name,
+    allowedToolsets: nonEmptyToolsets((defaultEmployee as any).allowed_toolsets, (defaultEmployee as any).toolsets, (defaultEmployee as any).allowedToolsets),
+  };
 }
 
 export default function CommandCenter() {
@@ -345,13 +991,22 @@ export default function CommandCenter() {
   const [refreshingSummary, setRefreshingSummary] = useState(false);
   const [runQueue, setRunQueue] = useState<any[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  // 当前主对话员工。多个 hydrate / stream callback 都会读取它, 必须在这些 callback 之前初始化。
+  const [activeEmployee, setActiveEmployee] = useState<{ id: number; uuid?: string; name: string; avatar: string; color: string; department?: string; allowedToolsets?: string[] | null } | null>(null);
   // 兼容老代码 — active messages 派生 (不存 state, 避免脏写)
   const messages = activeSessionId ? (messagesBySession[activeSessionId] || []) : [];
+  const activeSyncStatus = activeSessionId
+    ? String(sessionMetaById[activeSessionId]?.progress?.status || sessionMetaById[activeSessionId]?.task_status || '')
+    : '';
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const approvalResolverRef = useRef<((choice: ApprovalChoice) => void) | null>(null);
-  // P3.12 3.4.3: AbortController 切会话时取消前台流
+  // AbortController 只用于“停止当前任务”。普通切会话不能取消 Hermes 长任务,
+  // 否则后台 run 会停在 run.started, 迟到消息/交付物无法自动回收。
   const streamAbortRef = useRef<AbortController | null>(null);
   const activeHermesRunIdsRef = useRef<Set<string>>(new Set());
+  const backgroundSyncSessionIdsRef = useRef<Set<string>>(new Set());
+  const switchSeqRef = useRef(0);
+  const imeComposingRef = useRef(false);
   // P3.12 3.4.3: 每次发送的 stream session id, 用于归属校验
   const streamSessionIdRef = useRef<string | null>(null);
   // P3.12 3.4.3: setMessages 包装 — 写 activeSessionId 对应的桶
@@ -370,10 +1025,105 @@ export default function CommandCenter() {
     });
   }, [activeSessionId]);
 
-  const requestApprovalChoiceInline = useCallback((approval: PendingApproval): Promise<ApprovalChoice> => {
+  const markSessionBackgroundSync = useCallback((sid: string | null | undefined) => {
+    if (!sid) return;
+    backgroundSyncSessionIdsRef.current.add(sid);
+  }, []);
+
+  const appendProgressStage = useCallback((
+    sid: string | null | undefined,
+    speaker: { role: string; sender: string; avatar: string; color: string },
+    stage: ProgressStage,
+  ) => {
+    if (!sid) return;
+    setMessages((prev: Msg[]) => {
+      const lastUserIndex = Math.max(0, prev.map((m) => m.role).lastIndexOf('user'));
+      let idx = -1;
+      for (let i = prev.length - 1; i >= lastUserIndex; i -= 1) {
+        if (prev[i]?.role === speaker.role) {
+          idx = i;
+          break;
+        }
+      }
+      const next = [...prev];
+      if (idx >= 0) {
+        next[idx] = {
+          ...next[idx],
+          progressStages: upsertProgressStage(next[idx].progressStages, stage),
+        };
+        return next;
+      }
+      return [
+        ...next,
+        {
+          role: speaker.role,
+          sender: speaker.sender,
+          avatar: speaker.avatar,
+          color: speaker.color,
+          text: '',
+          progressStages: [stage],
+        },
+      ];
+    }, sid);
+  }, [setMessages]);
+
+  const ensureSpeakerMessage = useCallback((
+    sid: string | null | undefined,
+    speaker: { role: string; sender: string; avatar: string; color: string },
+    patch?: Partial<Msg>,
+  ) => {
+    if (!sid) return;
+    setMessages((prev: Msg[]) => {
+      const lastUserIndex = Math.max(0, prev.map((m) => m.role).lastIndexOf('user'));
+      let idx = -1;
+      for (let i = prev.length - 1; i >= lastUserIndex; i -= 1) {
+        if (prev[i]?.role === speaker.role) {
+          idx = i;
+          break;
+        }
+      }
+      const next = [...prev];
+      if (idx >= 0) {
+        next[idx] = { ...next[idx], ...patch };
+        return next;
+      }
+      return [
+        ...next,
+        {
+          role: speaker.role,
+          sender: speaker.sender,
+          avatar: speaker.avatar,
+          color: speaker.color,
+          text: '',
+          ...patch,
+        },
+      ];
+    }, sid);
+  }, [setMessages]);
+
+  const startProgressHeartbeat = useCallback((
+    getSid: () => string | null | undefined,
+    getSpeaker: () => { role: string; sender: string; avatar: string; color: string },
+    getLastEventAt: () => number,
+  ) => {
+    const emitted = new Set<string>();
+    const timer = window.setInterval(() => {
+      const sid = getSid();
+      if (!sid) return;
+      const idleMs = Date.now() - getLastEventAt();
+      if (idleMs < 8_000) return;
+      const stage = waitStage(idleMs);
+      if (emitted.has(stage.id)) return;
+      emitted.add(stage.id);
+      appendProgressStage(sid, getSpeaker(), stage);
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [appendProgressStage]);
+
+  const requestApprovalChoiceInline = useCallback((approval: PendingApproval, sid?: string | null): Promise<ApprovalChoice> => {
     return new Promise((resolve) => {
       approvalResolverRef.current = resolve;
-      setPendingApproval(approval);
+      setPendingApproval({ ...approval, session_id: sid || approval.session_id });
     });
   }, []);
 
@@ -412,14 +1162,56 @@ export default function CommandCenter() {
         id: sid,
         task_status: detail?.task_status,
         task_summary: detail?.task_summary,
+        updated_at: detail?.updated_at || prev[sid]?.updated_at,
+        last_message: detail?.last_message || prev[sid]?.last_message,
+        message_count: detail?.message_count ?? prev[sid]?.message_count,
         summary_updated_at: detail?.summary_updated_at,
         summary: detail?.summary,
         health: detail?.health || prev[sid]?.health,
+        progress: detail?.progress || detail?.health?.progress || prev[sid]?.progress,
         artifacts: Array.isArray(detail?.artifacts) ? detail.artifacts : (prev[sid]?.artifacts || []),
         context_injections: Array.isArray(detail?.context_injections) ? detail.context_injections : (prev[sid]?.context_injections || []),
       },
     }));
   }, []);
+
+  const hydrateSessionFromDetail = useCallback((detail: any, sidHint?: string | null) => {
+    const sid = sidHint || realSessionId(detail);
+    if (!sid || !detail) return;
+    rememberSessionMeta(detail, sid);
+    const nextMessages = messagesFromConversationDetail(detail, activeEmployee);
+    const detailStatus = String(detail?.progress?.status || detail?.task_status || '');
+    const hasArtifacts = Array.isArray(detail?.artifacts) && detail.artifacts.length > 0;
+    const hasPersistedAssistant = nextMessages.some((m) => m.role !== 'user' && String(m.text || '').trim());
+    const terminalStatuses = new Set(['completed', 'done', 'failed', 'stopped', 'cancelled', 'needs_input', 'waiting_input']);
+    if (nextMessages.length > 0) {
+      setMessagesBySession((prev) => {
+        const current = prev[sid] || [];
+        const shouldReplace =
+          terminalStatuses.has(detailStatus)
+          || detailStatus === 'stalled'
+          || hasArtifacts
+          || hasPersistedAssistant
+          || nextMessages.length >= current.length;
+        if (!shouldReplace) return prev;
+        const merged = mergeHydratedMessages(current, nextMessages);
+        if (messagesFingerprint(current) === messagesFingerprint(merged)) return prev;
+        return { ...prev, [sid]: merged };
+      });
+    }
+    setConversations((prev) => prev.map((c: any) => (
+      realSessionId(c) === sid
+        ? {
+            ...c,
+            task_status: detail.task_status || c.task_status,
+            task_summary: detail.task_summary || c.task_summary,
+            last_message: detail.last_message || c.last_message,
+            message_count: detail.message_count ?? c.message_count,
+            updated_at: detail.updated_at || c.updated_at,
+          }
+        : c
+    )));
+  }, [activeEmployee, rememberSessionMeta]);
 
   const mergeLiveContext = useCallback((sid: string | null | undefined, chunk: any) => {
     if (!sid) return;
@@ -508,19 +1300,23 @@ export default function CommandCenter() {
   }, []);
 
   const mergeTaskState = useCallback((sid: string | null | undefined, state: any) => {
-    if (!sid || !state?.task_status) return;
+    if (!sid || !state) return;
     setSessionMetaById((prev) => ({
       ...prev,
       [sid]: {
         ...(prev[sid] || {}),
-        task_status: state.task_status,
-        task_reason: state.reason,
+        task_status: state.task_status || prev[sid]?.task_status,
+        task_reason: state.reason || prev[sid]?.task_reason,
+        capability_plan: state.capability_plan || prev[sid]?.capability_plan,
+        collaboration_policy: state.collaboration_policy || prev[sid]?.collaboration_policy,
       },
     }));
-    setConversations((prev) => prev.map((c: any) => (
-      realSessionId(c) === sid ? { ...c, task_status: state.task_status } : c
-    )));
-    loadRunQueue();
+    if (state.task_status) {
+      setConversations((prev) => prev.map((c: any) => (
+        realSessionId(c) === sid ? { ...c, task_status: state.task_status } : c
+      )));
+      loadRunQueue();
+    }
   }, [loadRunQueue]);
 
   const refreshActiveSummary = useCallback(async () => {
@@ -626,24 +1422,23 @@ export default function CommandCenter() {
           summary_updated_at: res?.summary_updated_at || prev[activeSessionId]?.summary_updated_at,
           artifacts: Array.isArray(res?.artifacts) ? res.artifacts : (prev[activeSessionId]?.artifacts || []),
           health: res?.health || prev[activeSessionId]?.health,
+          progress: res?.progress || res?.health?.progress || prev[activeSessionId]?.progress,
         },
       }));
       await loadRunQueue();
-      message.success(`已补同步 ${res?.imported || 0} 条 Hermes 记录`);
+      message.success(`已同步 ${res?.imported || 0} 条 Hermes 记录`);
     } catch (e: any) {
       message.error(`恢复失败: ${e?.message || e}`);
     }
   }, [activeSessionId, loadRunQueue]);
-  // P3.12 3.4.3: setActiveSessionIdSafe — 切会话时先 abort 当前流, 再切
+  // 切换会话只是离开当前视图；运行中的流继续归属到原 session。
+  // 真正取消任务只发生在 handleAbortCurrentRun。
   const setActiveSessionIdSafe = useCallback((sid: string | null) => {
-    if (sid !== activeSessionId) {
-      if (streamAbortRef.current) {
-        try { streamAbortRef.current.abort(); } catch { /* ignore */ }
-        streamAbortRef.current = null;
-      }
+    if (sid !== activeSessionId && streamSessionIdRef.current && streamSessionIdRef.current !== sid) {
+      markSessionBackgroundSync(streamSessionIdRef.current);
     }
     setActiveSessionId(sid);
-  }, [activeSessionId]);
+  }, [activeSessionId, markSessionBackgroundSync]);
   const [input, setInput] = useState('');
   const [reasoningEffort, setReasoningEffort] = useState(() => {
     try { return localStorage.getItem('atlas.reasoning_effort:draft') || ''; } catch { return ''; }
@@ -692,6 +1487,112 @@ export default function CommandCenter() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [conclusions, setConclusions] = useState<string[]>([]);
   const [files, setFiles] = useState<string[]>([]);
+  const conversationsRef = useRef<Conversation[]>([]);
+  const [runStateBySession, _setRunStateBySession] = useState<Record<string, SessionRunState>>({});
+  const runStateBySessionRef = useRef<Record<string, SessionRunState>>({});
+  const runRuntimeBySessionRef = useRef<Record<string, SessionRunRuntime>>({});
+  const [sessionTodos, setSessionTodos] = useState<Record<string, SessionTodo[]>>({});
+  const [runConflictDraft, setRunConflictDraft] = useState<SendConflictDraft | null>(null);
+  const drainQueuedRunRef = useRef<((sid: string) => void) | null>(null);
+
+  const setSessionRunState = useCallback((
+    sid: string | null | undefined,
+    patchOrUpdater: Partial<SessionRunState> | ((prev: SessionRunState) => SessionRunState),
+  ) => {
+    if (!sid) return;
+    const prev = runStateBySessionRef.current;
+    const current = prev[sid] || {};
+    const next = typeof patchOrUpdater === 'function'
+      ? patchOrUpdater(current)
+      : { ...current, ...patchOrUpdater };
+    const merged = { ...next, updatedAt: next.updatedAt || Date.now() };
+    const all = { ...prev, [sid]: merged };
+    runStateBySessionRef.current = all;
+    _setRunStateBySession(all);
+  }, []);
+
+  const getSessionRuntime = useCallback((sid: string | null | undefined): SessionRunRuntime | null => {
+    if (!sid) return null;
+    if (!runRuntimeBySessionRef.current[sid]) {
+      runRuntimeBySessionRef.current[sid] = { abortController: null, hermesRunIds: new Set<string>() };
+    }
+    return runRuntimeBySessionRef.current[sid];
+  }, []);
+
+  const setSessionAbortController = useCallback((sid: string | null | undefined, controller: AbortController | null) => {
+    const runtime = getSessionRuntime(sid);
+    if (!runtime) return;
+    runtime.abortController = controller;
+  }, [getSessionRuntime]);
+
+  const addSessionHermesRunId = useCallback((sid: string | null | undefined, runId: string | null | undefined) => {
+    const runtime = getSessionRuntime(sid);
+    if (!runtime || !runId) return;
+    runtime.hermesRunIds.add(String(runId));
+  }, [getSessionRuntime]);
+
+  const getSessionHermesRunIds = useCallback((sid: string | null | undefined): string[] => {
+    const runtime = sid ? runRuntimeBySessionRef.current[sid] : null;
+    return runtime ? Array.from(runtime.hermesRunIds) : [];
+  }, []);
+
+  const clearSessionRuntime = useCallback((sid: string | null | undefined) => {
+    if (!sid) return;
+    delete runRuntimeBySessionRef.current[sid];
+  }, []);
+
+  const getKnownSessionStatus = useCallback((sid: string | null | undefined) => {
+    if (!sid) return '';
+    const state = runStateBySessionRef.current[sid];
+    const meta = sessionMetaById[sid];
+    const listed = conversationsRef.current.find((item: any) => realSessionId(item) === sid || String(item?.id || '') === sid) as any;
+    return String(
+      state?.status
+      || meta?.progress?.status
+      || meta?.task_status
+      || listed?.progress?.status
+      || listed?.task_status
+      || ''
+    );
+  }, [sessionMetaById]);
+
+  const isSessionBusy = useCallback((sid: string | null | undefined) => {
+    if (!sid) return Boolean(isProcessing);
+    const state = runStateBySessionRef.current[sid];
+    const status = getKnownSessionStatus(sid);
+    return Boolean(state?.isProcessing) || SESSION_BUSY_STATUSES.has(status);
+  }, [getKnownSessionStatus, isProcessing]);
+
+  const syncSessionRunStateFromDetail = useCallback((detail: any, sidHint?: string | null) => {
+    const sid = sidHint || realSessionId(detail);
+    if (!sid || !detail) return;
+    const nextStatus = String(detail?.progress?.status || detail?.task_status || '');
+    if (!nextStatus) return;
+    setSessionRunState(sid, {
+      isProcessing: SESSION_BUSY_STATUSES.has(nextStatus),
+      status: nextStatus,
+      reason: detail?.task_reason || detail?.task_summary || detail?.progress?.phase_label,
+      needsInput: ['needs_input', 'waiting_input'].includes(nextStatus),
+    });
+  }, [setSessionRunState]);
+
+  const enqueueSessionTodo = useCallback((todo: SessionTodo) => {
+    setSessionTodos((prev) => {
+      const rows = prev[todo.sid] || [];
+      const nextRows = rows.some((row) => row.id === todo.id) ? rows.map((row) => row.id === todo.id ? todo : row) : [...rows, todo];
+      return { ...prev, [todo.sid]: nextRows.slice(-8) };
+    });
+  }, []);
+
+  const removeSessionTodo = useCallback((sid: string | null | undefined, todoId: string | null | undefined) => {
+    if (!sid || !todoId) return;
+    setSessionTodos((prev) => {
+      const nextRows = (prev[sid] || []).filter((row) => row.id !== todoId);
+      const next = { ...prev, [sid]: nextRows };
+      if (nextRows.length === 0) delete next[sid];
+      return next;
+    });
+  }, []);
 
   // dispatchCid 变化时,从 localStorage 读旧 dispatch state 渲染
   useEffect(() => {
@@ -726,13 +1627,14 @@ export default function CommandCenter() {
     try { localStorage.setItem(`${DISPATCH_LS_PREFIX}:session:${dispatchCid}:files`, JSON.stringify(files)); } catch {}
   }, [files, dispatchCid]);
   // P3.12 3.4.3: 老的 conversationIdRef 已废弃, 统一用 activeSessionId state
-  // (useCallback 包装的 setActiveSessionIdSafe 切会话时 abort 前台流)
+  // (useCallback 包装的 setActiveSessionIdSafe 只切视图；运行流继续按 session 归属)
   // 保留 declaration 兼容老代码 grep, 实际不再使用
   const conversationIdRef = useRef<string | null>(null);
-  // Bug A 修复：已预选的员工（从 /overview?employee={id} 进入时锁定）
-  const [activeEmployee, setActiveEmployee] = useState<{ id: number; uuid?: string; name: string; avatar: string; color: string; department?: string; allowedToolsets?: string[] | null } | null>(null);
   // Phase 2 Aside-Fix：左侧 aside 的会话列表（按 activeEmployee 过滤）
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
   const [loadingConvs, setLoadingConvs] = useState(false);
   // Phase 2 Upload-Real：发送前的待发附件
   const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
@@ -745,6 +1647,7 @@ export default function CommandCenter() {
   const [allEmployeesForMention, setAllEmployeesForMention] = useState<Employee[]>([]);
   // Phase 2 E：员工选择器 modal
   const [showSwitcher, setShowSwitcher] = useState(false);
+  const [warRoomMenuOpen, setWarRoomMenuOpen] = useState(false);
   // M4.3: 协作画布全屏 Modal
   const [canvasOpen, setCanvasOpen] = useState(false);
   const [templateOpen, setTemplateOpen] = useState(false);
@@ -813,13 +1716,71 @@ export default function CommandCenter() {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   const { user } = useAuth();
+  const [railPrefs, setRailPrefs] = useState<CommandRailPrefs>(() => getInitialCommandRailPrefs());
+  const [homeConversationRailOpen, setHomeConversationRailOpen] = useState(false);
 
-  const isWarRoom = messages.length > 0;
+  const isWarRoom = Boolean(activeSessionId);
+  const activeRunState = activeSessionId ? runStateBySession[activeSessionId] : undefined;
+  const activeIsProcessing = activeSessionId
+    ? Boolean(activeRunState?.isProcessing || SESSION_BUSY_STATUSES.has(activeSyncStatus))
+    : Boolean(isProcessing);
 
-  // 初始化员工数据
   useEffect(() => {
-    initEmployees();
+    localStorage.setItem(COMMAND_RAIL_PREF_STORAGE_KEY, JSON.stringify(railPrefs));
+  }, [railPrefs]);
+
+  const commandLayoutStyle = {
+    '--sider-width': `${railPrefs.leftCollapsed ? COLLAPSED_RAIL_WIDTH : railPrefs.leftWidth}px`,
+    '--workspace-width': `${railPrefs.rightCollapsed ? COLLAPSED_RAIL_WIDTH : railPrefs.rightWidth}px`,
+  } as CSSProperties;
+
+  const toggleCommandRail = useCallback((side: 'left' | 'right') => {
+    setRailPrefs((prev) => ({
+      ...prev,
+      leftCollapsed: side === 'left' ? !prev.leftCollapsed : prev.leftCollapsed,
+      rightCollapsed: side === 'right' ? !prev.rightCollapsed : prev.rightCollapsed,
+    }));
   }, []);
+
+  const resetCommandRailWidth = useCallback((side: 'left' | 'right') => {
+    setRailPrefs((prev) => ({
+      ...prev,
+      leftWidth: side === 'left' ? DEFAULT_LEFT_RAIL_WIDTH : prev.leftWidth,
+      rightWidth: side === 'right' ? DEFAULT_RIGHT_RAIL_WIDTH : prev.rightWidth,
+      leftCollapsed: side === 'left' ? false : prev.leftCollapsed,
+      rightCollapsed: side === 'right' ? false : prev.rightCollapsed,
+    }));
+  }, []);
+
+  const beginCommandRailResize = useCallback((side: 'left' | 'right', e: ReactPointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = side === 'left' ? railPrefs.leftWidth : railPrefs.rightWidth;
+    document.body.classList.add('atlas-rail-resizing');
+
+    const onPointerMove = (event: PointerEvent) => {
+      const delta = event.clientX - startX;
+      const nextWidth = side === 'left'
+        ? clampNumber(startWidth + delta, LEFT_RAIL_MIN_WIDTH, LEFT_RAIL_MAX_WIDTH)
+        : clampNumber(startWidth - delta, RIGHT_RAIL_MIN_WIDTH, RIGHT_RAIL_MAX_WIDTH);
+      setRailPrefs((prev) => ({
+        ...prev,
+        leftWidth: side === 'left' ? nextWidth : prev.leftWidth,
+        rightWidth: side === 'right' ? nextWidth : prev.rightWidth,
+        leftCollapsed: side === 'left' ? false : prev.leftCollapsed,
+        rightCollapsed: side === 'right' ? false : prev.rightCollapsed,
+      }));
+    };
+
+    const onPointerUp = () => {
+      document.body.classList.remove('atlas-rail-resizing');
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+    };
+
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp, { once: true });
+  }, [railPrefs.leftWidth, railPrefs.rightWidth]);
 
   useEffect(() => {
     localStorage.setItem(EMPLOYEE_DOCK_STORAGE_KEY, JSON.stringify(employeeDockIds));
@@ -841,14 +1802,414 @@ export default function CommandCenter() {
         if (c.employee_id == null) return false;
         return employeeMap.has(String(c.employee_id));
       });
+      conversationsRef.current = visible;
+      visible.forEach((item: any) => rememberSessionMeta(item, realSessionId(item)));
       setConversations(visible);
-      loadRunQueue();
+      void loadRunQueue();
     } catch (e) {
       console.error('Failed to load conversations:', e);
     } finally {
       setLoadingConvs(false);
     }
-  }, [allEmployees, allEmployeesForMention, loadRunQueue]);
+  }, [allEmployees, allEmployeesForMention, loadRunQueue, rememberSessionMeta]);
+
+  useEffect(() => {
+    const sid = activeSessionId;
+    if (!sid) return;
+    const activeStatuses = new Set(['running', 'queued', 'waiting_approval', 'needs_input', 'waiting_input', 'quota_waiting', 'stalled', 'completed', 'done', 'failed', 'stopped', 'cancelled']);
+    const unlockStatuses = new Set(['completed', 'failed', 'stopped', 'cancelled', 'needs_input', 'waiting_input', 'waiting_approval', 'quota_waiting', 'stalled']);
+    const sessionRunState = runStateBySessionRef.current[sid];
+    const status = activeSyncStatus || sessionRunState?.status || (sessionRunState?.isProcessing || isProcessing ? 'running' : '');
+    if (!activeStatuses.has(status)) return;
+
+    let stopped = false;
+    let busy = false;
+    let lastFingerprint = '';
+    let stableTerminalPolls = 0;
+    let sawBackgroundWork = backgroundSyncSessionIdsRef.current.has(sid) || ['running', 'stalled', 'waiting_approval', 'quota_waiting'].includes(status);
+    const startedAt = Date.now();
+
+    const syncDetail = async () => {
+      if (stopped || busy) return;
+      busy = true;
+      try {
+        const detail = await fetchConversationDetail(sid);
+        if (stopped || !detail) return;
+        const realSid = realSessionId(detail);
+        const nextMessages = messagesFromConversationDetail(detail, activeEmployee);
+        const lastMessage = nextMessages[nextMessages.length - 1];
+        const nextFingerprint = JSON.stringify({
+          count: nextMessages.length,
+          last: lastMessage?.text?.slice(-120) || '',
+          status: detail?.task_status || detail?.progress?.status || '',
+          artifacts: Array.isArray(detail?.artifacts) ? detail.artifacts.length : 0,
+          updated_at: detail?.updated_at || '',
+        });
+        if (nextFingerprint !== lastFingerprint) {
+          lastFingerprint = nextFingerprint;
+          stableTerminalPolls = 0;
+          hydrateSessionFromDetail(detail, realSid);
+        } else if (['completed', 'failed', 'stopped', 'cancelled'].includes(String(detail?.progress?.status || detail?.task_status || ''))) {
+          stableTerminalPolls += 1;
+        }
+        const nextStatus = String(detail?.progress?.status || detail?.task_status || '');
+        if (nextStatus) {
+          setSessionRunState(realSid, {
+            isProcessing: SESSION_BUSY_STATUSES.has(nextStatus),
+            status: nextStatus,
+            reason: detail?.task_reason || detail?.task_summary || detail?.progress?.phase_label,
+            needsInput: ['needs_input', 'waiting_input'].includes(nextStatus),
+          });
+        }
+        if (unlockStatuses.has(nextStatus)) {
+          setIsProcessing(false);
+        }
+        if (nextStatus && !activeStatuses.has(nextStatus)) {
+          await loadConversations();
+        }
+        if (sessionHasBackgroundWork(detail)) {
+          sawBackgroundWork = true;
+          backgroundSyncSessionIdsRef.current.add(realSid);
+        }
+        const terminal = ['completed', 'done', 'failed', 'stopped', 'cancelled'].includes(nextStatus);
+        const backgroundTailExpired = Date.now() - startedAt > SESSION_AUTO_SYNC_BACKGROUND_TAIL_MS;
+        if (
+          terminal
+          && (
+            (!sawBackgroundWork && stableTerminalPolls >= SESSION_AUTO_SYNC_NORMAL_TAIL_POLLS)
+            || (sawBackgroundWork && backgroundTailExpired && stableTerminalPolls >= SESSION_AUTO_SYNC_NORMAL_TAIL_POLLS)
+          )
+        ) {
+          backgroundSyncSessionIdsRef.current.delete(realSid);
+          stopped = true;
+        }
+      } catch (e) {
+        console.warn('[SessionAutoSync] failed:', e);
+      } finally {
+        busy = false;
+      }
+    };
+
+    syncDetail();
+    const timer = window.setInterval(syncDetail, SESSION_AUTO_SYNC_INTERVAL_MS);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [activeSessionId, activeSyncStatus, activeEmployee, isProcessing, loadConversations, hydrateSessionFromDetail, setSessionRunState]);
+
+  useEffect(() => {
+    const sid = activeSessionId;
+    if (!sid) return;
+    const controller = new AbortController();
+    let stopped = false;
+    let busy = false;
+    let pendingHydrate = false;
+
+    const hydrateFromSessionEvent = async () => {
+      if (stopped) return;
+      if (busy) {
+        pendingHydrate = true;
+        return;
+      }
+      busy = true;
+      try {
+        const detail = await fetchConversationDetail(sid);
+        if (stopped || !detail) return;
+        const realSid = realSessionId(detail) || sid;
+        markSessionBackgroundSync(realSid);
+        hydrateSessionFromDetail(detail, realSid);
+        const nextStatus = String(detail?.progress?.status || detail?.task_status || '');
+        if (nextStatus) {
+          setSessionRunState(realSid, {
+            isProcessing: SESSION_BUSY_STATUSES.has(nextStatus),
+            status: nextStatus,
+            reason: detail?.task_reason || detail?.task_summary || detail?.progress?.phase_label,
+            needsInput: ['needs_input', 'waiting_input'].includes(nextStatus),
+          });
+          if (['needs_input', 'waiting_input'].includes(nextStatus)) {
+            enqueueSessionTodo({
+              id: `needs-input:${realSid}`,
+              sid: realSid,
+              type: 'needs_input',
+              title: '需要补充信息',
+              detail: detail?.task_reason || detail?.task_summary || '当前会话需要补充上下文后继续。',
+              createdAt: Date.now(),
+            });
+          }
+          if (SESSION_TERMINAL_STATUSES.has(nextStatus)) {
+            removeSessionTodo(realSid, `needs-input:${realSid}`);
+          }
+        }
+        await loadConversations();
+      } catch (e) {
+        if (!isAbortLikeError(e, controller.signal)) {
+          console.warn('[SessionEvents] hydrate failed:', e);
+        }
+      } finally {
+        busy = false;
+        if (pendingHydrate && !stopped) {
+          pendingHydrate = false;
+          void hydrateFromSessionEvent();
+        }
+      }
+    };
+
+    void (async () => {
+      try {
+        for await (const evt of streamSessionEvents(sid, { signal: controller.signal })) {
+          if (stopped || evt?.aborted) break;
+          const eventName = String(evt?.event_type || evt?.event || '');
+          if (eventName === 'session.updated' || eventName === 'message.created') {
+            markSessionBackgroundSync(sid);
+            void hydrateFromSessionEvent();
+          } else if (eventName === 'openatlas.approval_required' || evt?.approval_required) {
+            const approval = evt.approval_required || evt;
+            const runId = approval.hermes_run_id || approval.run_id;
+            if (!isActionableHermesApproval(approval)) {
+              appendProgressStage(sid, {
+                role: activeEmployee ? String(activeEmployee.id) : 'atlas',
+                sender: activeEmployee?.name || 'Atlas',
+                avatar: activeEmployee?.avatar || 'A',
+                color: activeEmployee?.color || '#4F46E5',
+              }, {
+                id: `approval-diagnostic:${Date.now()}`,
+                kind: 'info',
+                status: 'running',
+                title: '运行诊断',
+                detail: approval.description || approval.command || '收到非 Hermes 原生审批信号，已忽略并继续同步。',
+                meta: '诊断',
+              });
+              markSessionBackgroundSync(sid);
+              void hydrateFromSessionEvent();
+              continue;
+            }
+            const approvalTodoId = `approval:${approval.approval_id || runId || approval.command || sid}`;
+            setSessionRunState(sid, {
+              isProcessing: false,
+              status: 'waiting_approval',
+              pendingApproval: { ...approval, session_id: sid },
+              reason: approval.description || approval.command || 'Hermes 请求人工确认。',
+            });
+            enqueueSessionTodo({
+              id: approvalTodoId,
+              sid,
+              type: 'approval',
+              title: '等待人工确认',
+              detail: approval.description || approval.command || 'Hermes 请求确认高风险或不确定操作。',
+              approval: { ...approval, session_id: sid },
+              createdAt: Date.now(),
+            });
+            const speaker = {
+              role: activeEmployee ? String(activeEmployee.id) : 'atlas',
+              sender: activeEmployee?.name || 'Atlas',
+              avatar: activeEmployee?.avatar || 'A',
+              color: activeEmployee?.color || '#4F46E5',
+            };
+            appendProgressStage(sid, speaker, {
+              id: `approval:${approval.approval_id || runId || approval.command || 'session-event'}`,
+              kind: 'approval',
+              status: 'waiting',
+              title: '等待人工确认',
+              detail: approval.description || approval.command || 'Hermes 请求确认高风险或不确定操作。',
+              meta: '审批',
+            });
+            message.warning('Hermes 正在等待人工确认，请在页面底部处理授权。');
+            const choice = await requestApprovalChoiceInline(approval, sid);
+            if (runId) {
+              try {
+                await approveHermesRun(String(runId), choice, choice === 'always', approval.approval_id);
+                removeSessionTodo(sid, approvalTodoId);
+                setSessionRunState(sid, {
+                  isProcessing: choice !== 'deny',
+                  status: choice === 'deny' ? 'failed' : 'running',
+                  pendingApproval: null,
+                  reason: approvalChoiceText(choice),
+                });
+                appendProgressStage(sid, speaker, {
+                  id: `approval:${approval.approval_id || runId || approval.command || 'session-event'}`,
+                  kind: 'approval',
+                  status: choice === 'deny' ? 'failed' : 'completed',
+                  title: choice === 'deny' ? '审批已拒绝' : '审批已通过',
+                  detail: approvalChoiceText(choice),
+                  meta: '审批',
+                });
+                void hydrateFromSessionEvent();
+              } catch (e: any) {
+                if (isStaleApprovalError(e)) {
+                  removeSessionTodo(sid, approvalTodoId);
+                  setPendingApproval(null);
+                  setSessionRunState(sid, {
+                    isProcessing: true,
+                    status: 'running',
+                    pendingApproval: null,
+                    reason: '审批已不再处于等待状态，正在同步 Hermes 最新结果。',
+                  });
+                  message.info('审批已过期或已被 Hermes 处理，正在同步最新状态。');
+                  void hydrateFromSessionEvent();
+                } else {
+                  message.error(`审批提交失败：${e?.message || e}`);
+                }
+              }
+            }
+          } else if (eventName === 'openatlas.tool_blocked') {
+            const reason = evt.reason || evt.blocked_reason || '该工具不在当前员工授权范围内。';
+            appendProgressStage(sid, {
+              role: activeEmployee ? String(activeEmployee.id) : 'atlas',
+              sender: activeEmployee?.name || 'Atlas',
+              avatar: activeEmployee?.avatar || 'A',
+              color: activeEmployee?.color || '#4F46E5',
+            }, {
+              id: `tool-blocked:${evt.tool_name || evt.command || Date.now()}`,
+              kind: 'tool',
+              status: 'failed',
+              title: '工具被权限策略阻断',
+              detail: reason,
+              meta: '权限',
+            });
+            void hydrateFromSessionEvent();
+          } else if (eventName === 'error' && evt?.error) {
+            console.warn('[SessionEvents] stream error:', evt.error);
+          }
+        }
+      } catch (e) {
+        if (!isAbortLikeError(e, controller.signal)) {
+          console.warn('[SessionEvents] stream failed:', e);
+        }
+      }
+    })();
+
+    return () => {
+      stopped = true;
+      controller.abort();
+    };
+  }, [activeEmployee, activeSessionId, appendProgressStage, enqueueSessionTodo, hydrateSessionFromDetail, loadConversations, markSessionBackgroundSync, removeSessionTodo, requestApprovalChoiceInline, setSessionRunState]);
+
+  useEffect(() => {
+    const candidateIds = conversations
+      .map((conv) => {
+        const sid = realSessionId(conv);
+        const stateStatus = runStateBySessionRef.current[sid]?.status;
+        const status = String(stateStatus || conv.task_status || '');
+        return { sid, status };
+      })
+      .filter(({ sid, status }) => (
+        sid
+        && sid !== activeSessionId
+        && (
+          SESSION_BUSY_STATUSES.has(status)
+          || SESSION_ATTENTION_STATUSES.has(status)
+          || backgroundSyncSessionIdsRef.current.has(sid)
+        )
+      ))
+      .slice(0, 12);
+
+    if (candidateIds.length === 0) return;
+    const controllers: AbortController[] = [];
+    let stopped = false;
+
+    const hydrateBackgroundSession = async (sid: string) => {
+      try {
+        const detail = await fetchConversationDetail(sid);
+        if (stopped || !detail) return;
+        const realSid = realSessionId(detail) || sid;
+        hydrateSessionFromDetail(detail, realSid);
+        const status = String(detail?.progress?.status || detail?.task_status || '');
+        if (status) {
+          setSessionRunState(realSid, {
+            isProcessing: SESSION_BUSY_STATUSES.has(status),
+            status,
+            reason: detail?.task_reason || detail?.task_summary || detail?.progress?.phase_label,
+            needsInput: ['needs_input', 'waiting_input'].includes(status),
+          });
+          if (['needs_input', 'waiting_input'].includes(status)) {
+            enqueueSessionTodo({
+              id: `needs-input:${realSid}`,
+              sid: realSid,
+              type: 'needs_input',
+              title: '需要补充信息',
+              detail: detail?.task_reason || detail?.task_summary || '后台会话需要补充上下文后继续。',
+              createdAt: Date.now(),
+            });
+          }
+          if (SESSION_TERMINAL_STATUSES.has(status)) {
+            removeSessionTodo(realSid, `needs-input:${realSid}`);
+            backgroundSyncSessionIdsRef.current.delete(realSid);
+          }
+        }
+      } catch (e) {
+        console.warn('[BackgroundSessionEvents] hydrate failed:', sid, e);
+      }
+    };
+
+    candidateIds.forEach(({ sid }) => {
+      const controller = new AbortController();
+      controllers.push(controller);
+      void (async () => {
+        try {
+          for await (const evt of streamSessionEvents(sid, { signal: controller.signal })) {
+            if (stopped || evt?.aborted) break;
+            const eventName = String(evt?.event_type || evt?.event || '');
+            if (eventName === 'session.updated' || eventName === 'message.created') {
+              markSessionBackgroundSync(sid);
+              void hydrateBackgroundSession(sid);
+            } else if (eventName === 'openatlas.approval_required' || evt?.approval_required) {
+              const approval = evt.approval_required || evt;
+              const runId = approval.hermes_run_id || approval.run_id;
+              if (!isActionableHermesApproval(approval)) {
+                markSessionBackgroundSync(sid);
+                void hydrateBackgroundSession(sid);
+                continue;
+              }
+              const todoId = `approval:${approval.approval_id || runId || approval.command || sid}`;
+              setSessionRunState(sid, {
+                isProcessing: false,
+                status: 'waiting_approval',
+                pendingApproval: { ...approval, session_id: sid },
+                reason: approval.description || approval.command || 'Hermes 请求人工确认。',
+              });
+              if (SHOW_GLOBAL_SESSION_TODOS) {
+                enqueueSessionTodo({
+                  id: todoId,
+                  sid,
+                  type: 'approval',
+                  title: '后台会话等待确认',
+                  detail: approval.description || approval.command || 'Hermes 请求确认高风险或不确定操作。',
+                  approval: { ...approval, session_id: sid },
+                  createdAt: Date.now(),
+                });
+                message.warning('有后台会话正在等待人工确认，已放入全局待办。');
+              }
+            } else if (eventName === 'openatlas.needs_input' || evt?.needs_input) {
+              setSessionRunState(sid, {
+                isProcessing: false,
+                status: 'needs_input',
+                needsInput: true,
+                reason: evt?.reason || evt?.message || '后台会话需要补充信息。',
+              });
+              enqueueSessionTodo({
+                id: `needs-input:${sid}`,
+                sid,
+                type: 'needs_input',
+                title: '后台会话需要补充信息',
+                detail: evt?.reason || evt?.message || '请打开会话补充上下文。',
+                createdAt: Date.now(),
+              });
+            }
+          }
+        } catch (e) {
+          if (!isAbortLikeError(e, controller.signal)) {
+            console.warn('[BackgroundSessionEvents] stream failed:', sid, e);
+          }
+        }
+      })();
+    });
+
+    return () => {
+      stopped = true;
+      controllers.forEach((controller) => controller.abort());
+    };
+  }, [activeSessionId, conversations, enqueueSessionTodo, hydrateSessionFromDetail, markSessionBackgroundSync, removeSessionTodo, setSessionRunState]);
 
   const loadCollaborationTemplates = useCallback(async () => {
     setLoadingTemplates(true);
@@ -888,7 +2249,7 @@ export default function CommandCenter() {
             ...templateEmployee,
             uuid: (emp as any).__id || String(primaryEmpId),
             department: emp.department?.name,
-            allowedToolsets: emp.allowed_toolsets,
+            allowedToolsets: nonEmptyToolsets(emp.allowed_toolsets, emp.toolsets),
           });
         }
       }
@@ -900,7 +2261,13 @@ export default function CommandCenter() {
         avatar: templateEmployee.avatar,
         color: templateEmployee.color,
         text: `已载入协作方案「${tpl.name}」。你可以直接在本会话中继续发起任务。`,
-      }] : [], sid);
+      }] : [{
+        role: 'atlas',
+        sender: 'Atlas',
+        avatar: 'A',
+        color: '#4F46E5',
+        text: `已载入协作方案「${tpl.name}」。画布已打开，你可以检查员工节点、保存/另存方案，或直接发起作战室任务。`,
+      }], sid);
       setInitialCanvasState(tpl.canvas_state ? {
         nodes: tpl.canvas_state.nodes || [],
         edges: tpl.canvas_state.edges || [],
@@ -1143,19 +2510,24 @@ export default function CommandCenter() {
 
   // M4.2 (Group Chat): 加载员工列表(给 @ 召唤下拉用)
   // 不依赖 activeEmployee,所有员工都拉
-  const loadAllEmployeesForMention = useCallback(async () => {
+  const loadAllEmployeesForMention = useCallback(async (signal?: AbortSignal) => {
     try {
-      const list = await fetchEmployees();
+      const list = await fetchEmployees(signal ? { signal } : undefined);
+      if (signal?.aborted) return;
+      employeesCache = list as any;
       setAllEmployeesForMention(list);
       setAllEmployees(list as any);
     } catch (e) {
+      if (isAbortLikeError(e, signal)) return;
       console.error('[M4.2] fetchEmployees for mention failed:', e);
     }
   }, []);
 
   // M4.2: 启动时预加载(为 MentionPopover 数据源)
   useEffect(() => {
-    loadAllEmployeesForMention();
+    const ac = new AbortController();
+    loadAllEmployeesForMention(ac.signal);
+    return () => ac.abort();
   }, [loadAllEmployeesForMention]);
 
   const employeeForSpeaker = useCallback((speakerId?: string | number | null, speakerName?: string) => {
@@ -1191,6 +2563,10 @@ export default function CommandCenter() {
     });
   }, [relayEmployeeIds]);
 
+  const handleMentionClose = useCallback(() => {
+    setInput(prev => prev.replace(/@[^\s\n,，。.;；]*$/, '').trimEnd());
+  }, []);
+
   // M4.2: 移除接力 chip
   const handleRemoveRelay = useCallback((employeeId: number) => {
     setRelayEmployeeIds(prev => prev.filter(id => id !== employeeId));
@@ -1206,12 +2582,30 @@ export default function CommandCenter() {
   useEffect(() => {
     const convId = searchParams.get('conversation');
     const empId = searchParams.get('employee');
+    const whiteboardHandoff = searchParams.get('whiteboard');
 
-    if (convId) {
+    if (whiteboardHandoff === 'handoff') {
+      try {
+        const raw = localStorage.getItem('atlas.whiteboard.handoff') || '';
+        const payload = raw ? JSON.parse(raw) : null;
+        const prompt = String(payload?.prompt || '').trim();
+        if (prompt) {
+          setInput(prompt);
+          setTimeout(() => inputRef.current?.focus(), 30);
+          message.success(`已载入白板提示词${payload?.title ? `: ${payload.title}` : ''}`);
+        }
+      } catch (e) {
+        console.warn('[whiteboard handoff] failed:', e);
+      } finally {
+        setSearchParams({}, { replace: true });
+      }
+    } else if (convId) {
       fetchConversationDetail(convId)
         .then(async (detail) => {
           if (!detail) return; // P3.12 防御: 404 等情况下 detail 可能是 undefined
-          rememberSessionMeta(detail, realSessionId(detail));
+          const detailSid = realSessionId(detail);
+          rememberSessionMeta(detail, detailSid);
+          syncSessionRunStateFromDetail(detail, detailSid);
           // M4.2: 群聊时 employee_id 可能为 null — 用 detail.messages 第一条 assistant 的 speaker_employee_id
           // 或 fallback 到 activeEmployee(已有),最简:try fetch,失败跳到 fallback
           let empId = detail.employee_id;
@@ -1236,7 +2630,7 @@ export default function CommandCenter() {
               total_tokens: m.total_tokens,
               token_count: m.token_count,
             }));
-            const sid = realSessionId(detail);
+            const sid = detailSid;
             setActiveSessionIdSafe(sid);
             setMessages(restored, sid);
             setDispatchCid(sid);
@@ -1247,7 +2641,7 @@ export default function CommandCenter() {
           const avatar = emp?.avatar_char || '?';
           const color = emp?.department?.color || '#4F46E5';
           // FNV-1a shim safety: include uuid so the next chat stream uses real backend UUID, not shim int.
-          setActiveEmployee({ id: (emp as any)?.id ?? empId, uuid: (emp as any)?.__id ?? empId, name, avatar, color, department: emp?.department?.name, allowedToolsets: emp?.allowed_toolsets });
+          setActiveEmployee({ id: (emp as any)?.id ?? empId, uuid: (emp as any)?.__id ?? empId, name, avatar, color, department: emp?.department?.name, allowedToolsets: nonEmptyToolsets(emp?.allowed_toolsets, emp?.toolsets) });
 
           const restored: Msg[] = detail.messages.map((m: any) => ({
             role: m.role === 'user' ? 'user' : String(m.speaker_employee_id ?? empId),
@@ -1264,17 +2658,16 @@ export default function CommandCenter() {
             token_count: m.token_count,
           }));
 
-          const sid = realSessionId(detail);
+          const sid = detailSid;
           setActiveSessionIdSafe(sid);
           setMessages(restored, sid);
           setDispatchCid(sid); // Bug #2 修复:触发 dispatch 读
         })
-        .catch((e) => console.error('Failed to restore conversation:', e))
-        .finally(() => setSearchParams({}, { replace: true }));
+        .catch((e) => console.error('Failed to restore conversation:', e));
     } else if (empId) {
       fetchEmployeeDetail(empId)
         .then((emp) => {
-          setActiveEmployee({ id: emp.id, uuid: (emp as any).__id, name: emp.name, avatar: emp.avatar_char, color: emp.department?.color || '#4F46E5', department: emp.department?.name, allowedToolsets: emp.allowed_toolsets });
+          setActiveEmployee({ id: emp.id, uuid: (emp as any).__id, name: emp.name, avatar: emp.avatar_char, color: emp.department?.color || '#4F46E5', department: emp.department?.name, allowedToolsets: nonEmptyToolsets(emp.allowed_toolsets, emp.toolsets) });
 
           // 加欢迎气泡（Phase 2 不再自动 setMessages 进 war room；只在 has 历史会话后才进）
           // 这里只预选员工，不立即进 war room — 用户在 aside 选历史或新建会话才进入
@@ -1282,7 +2675,7 @@ export default function CommandCenter() {
         .catch((e) => console.error('Failed to pre-select employee:', e))
         .finally(() => setSearchParams({}, { replace: true }));
     }
-  }, [setSearchParams, searchParams]);
+  }, [setSearchParams, searchParams, syncSessionRunStateFromDetail, rememberSessionMeta]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1399,10 +2792,28 @@ export default function CommandCenter() {
   // Phase 2 Aside-Fix：切换到某个历史会话
   const switchToConversation = useCallback(async (conv: Conversation) => {
     const requestedSid = realSessionId(conv);
-    if (requestedSid === activeSessionId) return;
-    setIsProcessing(true);
+    if (requestedSid === activeSessionId) {
+      setSearchParams({ conversation: requestedSid });
+      return;
+    }
+    setActiveSessionIdSafe(requestedSid);
+    setDispatchCid(requestedSid);
+    setSearchParams({ conversation: requestedSid });
+    setMessages([], requestedSid);
+    const hintedStatus = String(conv.progress?.status || conv.task_status || '');
+    if (hintedStatus) {
+      setSessionRunState(requestedSid, {
+        isProcessing: SESSION_BUSY_STATUSES.has(hintedStatus),
+        status: hintedStatus,
+        reason: conv.task_summary || conv.progress?.phase_label,
+        needsInput: ['needs_input', 'waiting_input'].includes(hintedStatus),
+      });
+    }
+    const switchSeq = ++switchSeqRef.current;
+    const isLatestSwitch = () => switchSeq === switchSeqRef.current;
     try {
       const detail = await fetchConversationDetail(requestedSid);
+      if (!isLatestSwitch()) return;
       rememberSessionMeta(detail, realSessionId(detail));
       // M4.2: 群聊 employee_id 可能为 null — fallback 到 messages[0].speaker_employee_id
       let empId = detail.employee_id;
@@ -1410,7 +2821,8 @@ export default function CommandCenter() {
         const firstAssistant = detail.messages.find((m: any) => m.role === 'assistant' && m.speaker_employee_id);
         empId = firstAssistant?.speaker_employee_id ?? null;
       }
-      const emp = activeEmployee ?? (empId != null ? await fetchEmployeeDetail(empId).catch(() => null) : null);
+      const emp = empId != null ? await fetchEmployeeDetail(empId).catch(() => null) : null;
+      if (!isLatestSwitch()) return;
       const name = (emp as any)?.name || `员工 #${empId ?? '?'}`;
       const avatar = (emp as any)?.avatar_char || '?';
       const color = (emp as any)?.department?.color || '#4F46E5';
@@ -1433,17 +2845,27 @@ export default function CommandCenter() {
       setActiveSessionIdSafe(sid);
       setMessages(restored, sid);
       setDispatchCid(sid); // Bug #2 修复
-      // 把 setActiveEmployee 也更新（防止 activeEmployee 是 null 时）
-      if (!activeEmployee && emp && empId != null) {
+      const nextStatus = String(detail?.progress?.status || detail?.task_status || '');
+      if (nextStatus) {
+        setSessionRunState(sid, {
+          isProcessing: SESSION_BUSY_STATUSES.has(nextStatus),
+          status: nextStatus,
+          reason: detail?.task_reason || detail?.task_summary || detail?.progress?.phase_label,
+          needsInput: ['needs_input', 'waiting_input'].includes(nextStatus),
+        });
+      }
+      setSearchParams({ conversation: sid });
+      // 切会话必须以该会话真实员工为准，不能复用上一个 activeEmployee。
+      if (emp && empId != null) {
         // FNV-1a shim safety: include uuid so the next chat stream uses real backend UUID, not shim int.
         setActiveEmployee({ id: (emp as any)?.id ?? empId, uuid: (emp as any).__id ?? empId, name, avatar, color });
+      } else if (empId == null) {
+        setActiveEmployee(null);
       }
     } catch (e) {
       console.error('Failed to switch conversation:', e);
-    } finally {
-      setIsProcessing(false);
     }
-  }, [activeEmployee, rememberSessionMeta]);
+  }, [activeSessionId, rememberSessionMeta, setActiveSessionIdSafe, setMessages, setSearchParams, setSessionRunState]);
 
   // Phase 2 Aside-Fix：新建会话（清空 messages，conversationId 置空；调用后端 create 返回新 conv）
   const handleNewConversation = useCallback(async () => {
@@ -1490,8 +2912,11 @@ export default function CommandCenter() {
 
   // Phase 2.6: 切换到已有会话（focus mode 顶部 chip + aside 共用）
   const handleSwitchConversation = useCallback(async (convId: number | string) => {
+    const switchSeq = ++switchSeqRef.current;
+    const isLatestSwitch = () => switchSeq === switchSeqRef.current;
     try {
       const detail = await fetchConversationDetail(convId);
+      if (!isLatestSwitch()) return;
       if (!detail) return; // P3.12 防御: 404 等情况下 detail 可能是 undefined
       rememberSessionMeta(detail, realSessionId(detail));
       // M4.2: 群聊 employee_id 可能为 null
@@ -1500,35 +2925,37 @@ export default function CommandCenter() {
         const firstAssistant = detail.messages.find((m: any) => m.role === 'assistant' && m.speaker_employee_id);
         empId = firstAssistant?.speaker_employee_id ?? null;
       }
-      if (empId == null) {
-        message.warning('该会话无法定位发言人(可能是空群聊)');
-        return;
-      }
-      const emp = await fetchEmployeeDetail(empId).catch(() => null);
-      const name = emp?.name || `员工 #${empId}`;
-      const avatar = emp?.avatar_char || '?';
+      const emp = empId != null ? await fetchEmployeeDetail(empId).catch(() => null) : null;
+      if (!isLatestSwitch()) return;
+      const name = emp?.name || (empId != null ? `员工 #${empId}` : 'Atlas');
+      const avatar = emp?.avatar_char || 'A';
       const color = emp?.department?.color || '#4F46E5';
-      // FNV-1a shim safety: include uuid so the next chat stream uses real backend UUID, not shim int.
-      setActiveEmployee({ id: empId, uuid: (emp as any)?.__id, name, avatar, color });
+      if (empId != null) {
+        // FNV-1a shim safety: include uuid so the next chat stream uses real backend UUID, not shim int.
+        setActiveEmployee({
+          id: (emp as any)?.id ?? (typeof empId === 'number' ? empId : 0),
+          uuid: (emp as any)?.__id ?? String(empId),
+          name,
+          avatar,
+          color,
+        });
+      } else {
+        setActiveEmployee(null);
+      }
       if (detail && detail.id != null) {
         const sid = realSessionId(detail);
         setActiveSessionIdSafe(sid);
         setDispatchCid(sid); // Bug #2 修复
-        const restored: Msg[] = (detail.messages || []).map((m: any) => ({
-          role: m.role === 'user' ? 'user' : String(m.speaker_employee_id ?? empId),
-          sender: m.role === 'user' ? '你' : (m.speaker_name || name),
-          avatar: m.role === 'user' ? '你'[0] : (m.speaker_name || name)[0],
-          color: m.role === 'user' ? 'var(--text-secondary)' : color,
-          text: m.content,
-          reasoning: Array.isArray(m.reasoning) ? m.reasoning : (m.reasoning ? [String(m.reasoning)] : []),
-          tools: coerceToolCalls(m.tool_calls || m.tools),
-          input_tokens: m.input_tokens,
-          output_tokens: m.output_tokens,
-          total_tokens: m.total_tokens,
-          token_count: m.token_count,
-        }));
-        setActiveSessionIdSafe(sid);
-        setMessages(restored, sid);
+        hydrateSessionFromDetail(detail, sid);
+        if (!Array.isArray(detail.messages) || detail.messages.length === 0) {
+          setMessages([{
+            role: 'atlas',
+            sender: 'Atlas',
+            avatar: 'A',
+            color: '#4F46E5',
+            text: '这是一个新的作战室。你可以在输入框中用 @ 选择一位或多位数智员工，例如：@行政小六 帮我分诊，或 @项目交付经理 @法务合规顾问 一起处理任务。',
+          }], sid);
+        }
         setSearchParams({ conversation: sid });
       }
       // M4.4.1: 群聊(>=2 个不同 speaker_employee_id) → 自动开协作画布
@@ -1545,11 +2972,12 @@ export default function CommandCenter() {
       console.error('[handleSwitchConversation] failed:', e);
       message.error(`切换会话失败:${e?.message || e}`);
     }
-  }, [setSearchParams, rememberSessionMeta]);
+  }, [setSearchParams, rememberSessionMeta, hydrateSessionFromDetail, setActiveSessionIdSafe, setMessages]);
 
   // Phase 2 Aside-Fix：删除会话（软删除）
-  const handleDeleteConversation = useCallback(async (convId: number, e: React.MouseEvent) => {
+  const handleDeleteConversation = useCallback(async (convId: number | string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const deleteSid = String(convId);
     Modal.confirm({
       title: '确认删除该会话？',
       content: '删除后会从当前会话列表移除。',
@@ -1559,8 +2987,8 @@ export default function CommandCenter() {
       onOk: async () => {
         try {
           await deleteConversation(convId);
-          setConversations(prev => prev.filter(c => c.id !== convId));
-          if (activeSessionId === String(convId)) {
+          setConversations(prev => prev.filter(c => realSessionId(c) !== deleteSid && String(c.id) !== deleteSid));
+          if (activeSessionId === deleteSid) {
             // 删除的是当前会话 → 清空消息
             setActiveSessionIdSafe(null);
             setDispatchCid(null); // Bug #2 修复:清 dispatch
@@ -1616,44 +3044,40 @@ export default function CommandCenter() {
     }
   }, []);
 
-  // M4.2 (Group Chat): 新建群聊(简化:复用 activeEmployee 当主员工,接力从 @ 召唤下拉选)
+  // M4.2 (Group Chat): 新建空群聊,由 Atlas 引导用户用 @ 召唤员工接力。
   const handleNewGroupConversation = useCallback(async () => {
-    const fallbackEmp = (allEmployeesForMention[0] || allEmployees[0]) as Employee | undefined;
-    const primary = activeEmployee ?? (fallbackEmp ? {
-      id: fallbackEmp.id,
-      uuid: (fallbackEmp as any).__id,
-      name: fallbackEmp.name,
-      avatar: fallbackEmp.avatar_char || fallbackEmp.avatar || fallbackEmp.name?.[0] || '?',
-      color: fallbackEmp.department?.color || '#4F46E5',
-      department: fallbackEmp.department?.name,
-      allowedToolsets: fallbackEmp.allowed_toolsets,
-    } : null);
-    if (!primary) {
-      message.warning('暂无可用员工，先去数智员工页面创建一个员工');
-      return;
-    }
     try {
-      setActiveEmployee(primary);
-      const group = await createGroupConversation(
-        [primary.uuid || primary.id],
-        `群聊: ${primary.name}`,
-      );
+      setWarRoomMenuOpen(false);
+      setActiveEmployee(null);
+      setRelayEmployeeIds([]);
+      setRelayChips([]);
+      const group = await createGroupConversation([], '多员工群聊');
       const sid = realSessionId(group);
       setActiveSessionIdSafe(sid);
       setDispatchCid(sid);
       setMessages([{
-        role: String(primary.id),
-        sender: primary.name,
-        avatar: primary.avatar,
-        color: primary.color,
-        text: `欢迎来到群聊。我是「${primary.name}」,你可以在输入框中输入 @ 召唤其他员工接力。`,
+        role: 'atlas',
+        sender: 'Atlas',
+        avatar: 'A',
+        color: '#4F46E5',
+        text: '已创建多员工群聊。请在输入框中用 @ 选择一位或多位数智员工，例如：@翻书人 PageTurner 帮我分析这份 PDF。Atlas 会按你选择的员工组织接力。',
       }], sid);
-      await loadConversations();
+      setConversations(prev => [group, ...prev.filter((c) => realSessionId(c) !== sid)]);
     } catch (e) {
       console.error('[M4.2] createGroupConversation failed:', e);
       message.error(`建群失败: ${e instanceof Error ? e.message : '未知错误'}`);
     }
-  }, [activeEmployee, allEmployees, allEmployeesForMention, loadConversations]);
+  }, [setActiveSessionIdSafe, setMessages]);
+
+  const handleWarRoomMenuSingle = useCallback(() => {
+    setWarRoomMenuOpen(false);
+    setShowSwitcher(true);
+  }, []);
+
+  const handleWarRoomMenuPlan = useCallback(async () => {
+    setWarRoomMenuOpen(false);
+    await handleOpenTemplateLibrary();
+  }, [handleOpenTemplateLibrary]);
 
   // Phase 2 E：员工切换器
   const handleSwitchEmployee = useCallback(async (emp: { id: number; name: string; avatar_char: string; department?: { name: string; color: string } | null }) => {
@@ -1663,6 +3087,8 @@ export default function CommandCenter() {
       name: emp.name,
       avatar: emp.avatar_char,
       color: emp.department?.color || '#4F46E5',
+      department: emp.department?.name,
+      allowedToolsets: nonEmptyToolsets((emp as any).allowed_toolsets, (emp as any).toolsets, (emp as any).allowedToolsets),
     });
     setShowSwitcher(false);
     setMessages([]); // 清空
@@ -1671,7 +3097,7 @@ export default function CommandCenter() {
   }, []);
 
   const handleEmployeeShortcut = useCallback(async (emp: Employee) => {
-    if (isProcessing) return;
+    if (activeSessionId && isSessionBusy(activeSessionId)) return;
     const employee = toEmployeeChip(emp);
     setActiveEmployee(employee);
     setInput('');
@@ -1695,7 +3121,7 @@ export default function CommandCenter() {
       console.error('[handleEmployeeShortcut] failed:', e);
       message.error(`创建员工会话失败:${e?.message || e}`);
     }
-  }, [isProcessing, setActiveSessionIdSafe, setMessages]);
+  }, [activeSessionId, isSessionBusy, setActiveSessionIdSafe, setMessages]);
 
   const handleOpenCustomOrchestration = useCallback(async () => {
     let list = allEmployees as any[];
@@ -1738,18 +3164,63 @@ export default function CommandCenter() {
     await openCollaborationCanvas();
   }, [activeEmployee, activeSessionId, allEmployees, openCollaborationCanvas, setActiveSessionIdSafe, setMessages]);
 
-  // Phase 2 Upload-Real：上传文件/图片
-  const handleFileSelected = useCallback(async (file: File) => {
+  const handleNewCollaborationPlan = useCallback(async () => {
+    setWarRoomMenuOpen(false);
+    await handleOpenCustomOrchestration();
+  }, [handleOpenCustomOrchestration]);
+
+  const uploadPendingFiles = useCallback(async (filesInput: Iterable<File>) => {
+    const filesToUpload = Array.from(filesInput).filter(Boolean);
+    if (filesToUpload.length === 0) return;
+
     setUploading(true);
-    try {
-      const result = await uploadFile(file);
-      setPendingAttachments((prev: Attachment[]) => [...prev, result]);
-    } catch (e) {
-      console.error('Upload failed:', e);
-      message.error(`上传失败: ${e instanceof Error ? e.message : '未知错误'}`);
-    } finally {
-      setUploading(false);
+    const uploaded: Attachment[] = [];
+    const failed: string[] = [];
+    for (const file of filesToUpload) {
+      try {
+        const result = await uploadFile(file);
+        uploaded.push(result);
+      } catch (e) {
+        console.error('Upload failed:', e);
+        failed.push(file.name || '剪贴板文件');
+      }
     }
+    if (uploaded.length > 0) {
+      setPendingAttachments((prev: Attachment[]) => [...prev, ...uploaded]);
+      if (filesToUpload.length > 1) {
+        message.success(`已上传 ${uploaded.length} 个文件`);
+      }
+    }
+    if (failed.length > 0) {
+      message.error(`上传失败: ${failed.slice(0, 3).join('、')}${failed.length > 3 ? ' 等' : ''}`);
+    }
+    setUploading(false);
+  }, []);
+
+  // Phase 2 Upload-Real：上传文件/图片
+  const handleFileSelected = useCallback((file: File) => {
+    void uploadPendingFiles([file]);
+  }, [uploadPendingFiles]);
+
+  const handlePasteUpload = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const clipboardFiles = filesFromClipboardData(e.clipboardData);
+    if (clipboardFiles.length === 0) return;
+    e.preventDefault();
+    if (uploading) {
+      message.warning('正在上传文件，请稍后再粘贴');
+      return;
+    }
+    void uploadPendingFiles(clipboardFiles);
+  }, [uploadPendingFiles, uploading]);
+
+  const handleCompositionStart = useCallback(() => {
+    imeComposingRef.current = true;
+  }, []);
+
+  const handleCompositionEnd = useCallback(() => {
+    window.setTimeout(() => {
+      imeComposingRef.current = false;
+    }, 0);
   }, []);
 
   // Phase 2 Upload-Real：移除待发附件
@@ -1757,20 +3228,60 @@ export default function CommandCenter() {
     setPendingAttachments(prev => prev.filter(a => (a.url || a.id) !== key));
   }, []);
 
-  const handleAbortCurrentRun = useCallback(async () => {
-    const runIds = Array.from(activeHermesRunIdsRef.current);
-    if (streamAbortRef.current) {
-      try { streamAbortRef.current.abort(); } catch { /* ignore */ }
-      streamAbortRef.current = null;
+  const handleAbortCurrentRun = useCallback(async (sidOverride?: string | null) => {
+    const sid = typeof sidOverride === 'string' ? sidOverride : activeSessionId;
+    const runtime = sid ? runRuntimeBySessionRef.current[sid] : null;
+    const runIds = sid ? getSessionHermesRunIds(sid) : Array.from(activeHermesRunIdsRef.current);
+    const abortController = runtime?.abortController || streamAbortRef.current;
+    if (abortController) {
+      try { abortController.abort(); } catch { /* ignore */ }
+      if (streamAbortRef.current === abortController) streamAbortRef.current = null;
+    }
+    if (sid) {
+      setSessionRunState(sid, {
+        isProcessing: false,
+        status: 'stopped',
+        reason: '用户已停止当前任务。',
+      });
+      mergeTaskState(sid, {
+        task_status: 'stopped',
+        reason: '用户已停止当前任务。',
+        openatlas_session_id: sid,
+      });
+      setSessionMetaById((prev) => ({
+        ...prev,
+        [sid]: {
+          ...(prev[sid] || {}),
+          id: sid,
+          task_status: 'stopped',
+          task_summary: '用户已停止当前任务。',
+        },
+      }));
+      appendProgressStage(sid, {
+        role: activeEmployee ? String(activeEmployee.id) : 'atlas',
+        sender: activeEmployee?.name || 'Atlas',
+        avatar: activeEmployee?.avatar || 'A',
+        color: activeEmployee?.color || '#4F46E5',
+      }, {
+        id: `runtime:stopped:${Date.now()}`,
+        kind: 'runtime',
+        status: 'failed',
+        title: '已停止当前任务',
+        detail: runIds.length > 0 ? `已向 Hermes 发送停止请求（${runIds.length} 个 run）。` : '已停止前端等待，当前会话状态已更新。',
+        meta: '停止',
+      });
+      patchSessionTaskStatus(sid, 'stopped').catch((e) => {
+        console.warn('[Hermes Stop] failed to patch session task status', e);
+      });
     }
     if (runIds.length > 0) {
+      if (sid) clearSessionRuntime(sid);
       activeHermesRunIdsRef.current.clear();
-      Promise.allSettled(runIds.map((runId) => stopHermesRun(runId, 'user_clicked_stop'))).then((results) => {
-        const failed = results.filter((r) => r.status === 'rejected').length;
-        if (failed > 0) {
-          console.warn('[Hermes Stop] failed to stop some runs', results);
-        }
-      });
+      const results = await Promise.allSettled(runIds.map((runId) => stopHermesRun(runId, 'user_clicked_stop')));
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      if (failed > 0) {
+        console.warn('[Hermes Stop] failed to stop some runs', results);
+      }
     }
     setTunnels(prev => prev.map(t => t.isComplete ? t : {
       ...t,
@@ -1780,7 +3291,8 @@ export default function CommandCenter() {
     }));
     setOrbState('idle');
     setIsProcessing(false);
-  }, []);
+    message.info(runIds.length > 0 ? '已停止当前任务，正在同步 Hermes 状态。' : '已停止当前等待。');
+  }, [activeEmployee, activeSessionId, appendProgressStage, clearSessionRuntime, getSessionHermesRunIds, mergeTaskState, setSessionRunState]);
 
   const handleResumeActiveTask = useCallback(async () => {
     if (!activeSessionId) return;
@@ -1806,7 +3318,10 @@ export default function CommandCenter() {
     return hasWrite ? 'normal' : 'read-only';
   }, [activeEmployee]);
 
-  const simulateDispatch = useCallback(async (userInput: string) => {
+  const simulateDispatch = useCallback(async (
+    userInput: string,
+    options?: { attachments?: Attachment[]; targetSessionId?: string | null },
+  ) => {
     // Bug A 修复：已预选员工时直接锁定，不再走 LLM router
     let employee: { id: number; uuid?: string; name: string; avatar: string; color: string };
     if (activeEmployee) {
@@ -1834,11 +3349,13 @@ export default function CommandCenter() {
     setTunnels(prev => prev.map(t => t.id === employee.id.toString() ? { ...t, outputLines: ['接收问题...', '分析意图...'] } : t));
 
     // 取出待发附件（snapshot 当前值，然后清空）
-    const attachmentsToSend = pendingAttachments;
-    setPendingAttachments([]);
+    const attachmentsToSend = options?.attachments ?? pendingAttachments;
+    if (!options?.attachments) setPendingAttachments([]);
 
     // P3.12 3.4.3: 新建 AbortController 接管流, 切会话自动 abort
     const ac = new AbortController();
+    let stopHeartbeat: (() => void) | null = null;
+    let targetSessionId: string | null = options?.targetSessionId ?? activeSessionId;
 
     try {
       setOrbState('dispatch');
@@ -1846,6 +3363,7 @@ export default function CommandCenter() {
 
       let fullResponse = '';
       let wasAborted = false;
+      let wasQuotaWaiting = false;
       const toolCalls: ToolCall[] = [];
       let assistantUsage: Partial<Msg> = {};
       // 真 UUID: 优先用 employee.uuid, 兜底 allEmployees.find().__id
@@ -1854,7 +3372,7 @@ export default function CommandCenter() {
         const realEmp = allEmployees.find((e) => e.id === employee.id);
         if (realEmp && (realEmp as any).__id) realEmpId = (realEmp as any).__id;
       }
-      let targetSessionId = activeSessionId;
+      targetSessionId = targetSessionId || activeSessionId;
       if (!targetSessionId) {
         const conv = await createConversation(realEmpId, userInput);
         targetSessionId = realSessionId(conv);
@@ -1871,6 +3389,12 @@ export default function CommandCenter() {
         }], targetSessionId);
       }
       streamSessionIdRef.current = targetSessionId;
+      setSessionRunState(targetSessionId, {
+        isProcessing: true,
+        status: 'running',
+        reason: `${employee.name} 正在执行任务。`,
+      });
+      setSessionAbortController(targetSessionId, ac);
       streamAbortRef.current = ac;
       const stream = chatWithEmployeeStream(realEmpId, userInput, {
         sessionId: targetSessionId,
@@ -1878,8 +3402,27 @@ export default function CommandCenter() {
         reasoningEffort,
         signal: ac.signal,
       });
+      let lastStreamEventAt = Date.now();
+      const singleSpeaker = () => ({
+        role: employee.id.toString(),
+        sender: employee.name,
+        avatar: employee.avatar,
+        color: employee.color,
+      });
+      appendProgressStage(targetSessionId, singleSpeaker(), {
+        id: 'runtime:accepted',
+        kind: 'runtime',
+        status: 'running',
+        title: `${employee.name} 已接管任务`,
+        detail: attachmentsToSend.length > 0
+          ? `正在注入 ${attachmentsToSend.length} 个附件并启动 Hermes。`
+          : '正在启动 Hermes，并准备会话上下文。',
+        meta: '开始',
+      });
+      stopHeartbeat = startProgressHeartbeat(() => targetSessionId, singleSpeaker, () => lastStreamEventAt);
 
       for await (const chunk of stream) {
+        lastStreamEventAt = Date.now();
         if (chunk._origin === 'openatlas' && chunk.conversation_id) {
           // openatlas session uuid — 用来串后续 message
           targetSessionId = String(chunk.conversation_id);
@@ -1899,10 +3442,34 @@ export default function CommandCenter() {
             : t));
           break;
         }
+        if (chunk.event_type === 'openatlas.capability_plan' || chunk.capability_plan) {
+          const plan = chunk.capability_plan || {};
+          const policy = chunk.collaboration_policy || {};
+          mergeTaskState(targetSessionId, {
+            task_status: 'running',
+            reason: plan.summary || '能力清单已生成',
+            capability_plan: plan,
+            collaboration_policy: policy,
+          });
+          appendProgressStage(targetSessionId, singleSpeaker(), capabilityPlanStage(plan, policy));
+          setTunnels(prev => prev.map(t => t.id === employee.id.toString()
+            ? { ...t, outputLines: appendTraceLine(t.outputLines, plan.summary || '能力清单已生成') }
+            : t));
+          continue;
+        }
         if (chunk.event_type === 'run.started') {
           const runId = chunk.hermes_run_id || chunk.run_id;
           if (runId) {
+            addSessionHermesRunId(targetSessionId, String(runId));
             activeHermesRunIdsRef.current.add(String(runId));
+            appendProgressStage(targetSessionId, singleSpeaker(), {
+              id: `runtime:run:${runId}`,
+              kind: 'runtime',
+              status: 'running',
+              title: '执行已启动',
+              detail: '已进入执行链路，正在接收模型、工具和文件事件。',
+              meta: '执行',
+            });
             setTunnels(prev => prev.map(t => t.id === employee.id.toString()
               ? { ...t, outputLines: appendTraceLine(t.outputLines, `Hermes run started · ${String(runId).slice(0, 12)}`) }
               : t));
@@ -1910,53 +3477,177 @@ export default function CommandCenter() {
           continue;
         }
         if (chunk.event_type === 'openatlas.run_idle' || chunk.event_type === 'openatlas.run_detached') {
-          const line = chunk.message || (chunk.detached ? 'Hermes 后台继续运行，稍后自动补同步' : 'Hermes 暂无新事件，继续等待');
+          const line = chunk.message || (chunk.detached ? 'Hermes 后台继续运行，Atlas 会自动同步' : 'Hermes 暂无新事件，继续等待');
+          const idleMs = Number(chunk.idle_seconds || 0) > 0 ? Number(chunk.idle_seconds) * 1000 : Date.now() - lastStreamEventAt;
+          markSessionBackgroundSync(targetSessionId);
+          setSessionRunState(targetSessionId, {
+            isProcessing: !chunk.detached,
+            status: chunk.detached ? 'stalled' : 'running',
+            reason: line,
+          });
+          mergeTaskState(targetSessionId, {
+            task_status: chunk.detached ? 'stalled' : 'running',
+            reason: line,
+          });
+          appendProgressStage(targetSessionId, singleSpeaker(), waitStage(idleMs, !!chunk.detached));
           setTunnels(prev => prev.map(t => t.id === employee.id.toString()
             ? { ...t, status: chunk.detached ? '后台运行' : '运行中', outputLines: appendTraceLine(t.outputLines, line), isComplete: !!chunk.detached }
             : t));
           continue;
         }
         if (chunk.task_state?.task_status) {
+          setSessionRunState(targetSessionId, {
+            isProcessing: !SESSION_TERMINAL_STATUSES.has(String(chunk.task_state.task_status)) && !['needs_input', 'waiting_input', 'waiting_approval', 'quota_waiting', 'stalled'].includes(String(chunk.task_state.task_status)),
+            status: String(chunk.task_state.task_status),
+            reason: chunk.task_state.reason || chunk.task_state.task_summary,
+            needsInput: ['needs_input', 'waiting_input'].includes(String(chunk.task_state.task_status)),
+          });
+          if (chunk.task_state.task_status === 'quota_waiting') {
+            wasQuotaWaiting = true;
+            const reason = safeStageText(chunk.task_state.reason || '模型服务限流等待，可稍后继续。');
+            setTunnels(prev => prev.map(t => t.id === employee.id.toString()
+              ? { ...t, status: '限流等待', outputLines: appendTraceLine(t.outputLines, reason), isComplete: true }
+              : t));
+            setOrbState('idle');
+          }
           mergeTaskState(targetSessionId, chunk.task_state);
+          appendProgressStage(targetSessionId, singleSpeaker(), taskStateStage(chunk.task_state));
           continue;
         }
         if (chunk.event_type === 'openatlas.trace' || chunk.trace) {
           const line = formatTraceLine(chunk.trace || chunk);
+          appendProgressStage(targetSessionId, singleSpeaker(), traceStage(chunk.trace || chunk));
           setTunnels(prev => prev.map(t => t.id === employee.id.toString()
             ? { ...t, outputLines: appendTraceLine(t.outputLines, line) }
+            : t));
+          continue;
+        }
+        if (chunk.event_type === 'openatlas.tool_blocked' || chunk.blocked === true) {
+          const reason = safeStageText(chunk.reason || chunk.blocked_reason || '该工具不在当前员工授权范围内。');
+          appendProgressStage(targetSessionId, singleSpeaker(), {
+            id: `tool-blocked:${chunk.tool_name || chunk.name || chunk.command || Date.now()}`,
+            kind: 'tool',
+            status: 'failed',
+            title: '工具被权限策略阻断',
+            detail: reason,
+            meta: '权限',
+          });
+          setTunnels(prev => prev.map(t => t.id === employee.id.toString()
+            ? { ...t, status: '权限阻断', outputLines: appendTraceLine(t.outputLines, reason) }
             : t));
           continue;
         }
         if (chunk.approval_required) {
           const approval = chunk.approval_required;
           const runId = approval.hermes_run_id || approval.run_id;
+          if (!isActionableHermesApproval(approval)) {
+            appendProgressStage(targetSessionId, singleSpeaker(), {
+              id: `approval-diagnostic:${Date.now()}`,
+              kind: 'info',
+              status: 'running',
+              title: '运行诊断',
+              detail: approval.description || approval.command || '收到非 Hermes 原生审批信号，已忽略。',
+              meta: '诊断',
+            });
+            continue;
+          }
+          setSessionRunState(targetSessionId, {
+            isProcessing: false,
+            status: 'waiting_approval',
+            pendingApproval: { ...approval, session_id: targetSessionId || undefined },
+            reason: approval.description || approval.command || 'Hermes 请求人工确认。',
+          });
+          if (targetSessionId) {
+            enqueueSessionTodo({
+              id: `approval:${approval.approval_id || runId || approval.command || targetSessionId}`,
+              sid: targetSessionId,
+              type: 'approval',
+              title: '等待人工确认',
+              detail: approval.description || approval.command || 'Hermes 请求确认高风险或不确定操作。',
+              approval: { ...approval, session_id: targetSessionId },
+              createdAt: Date.now(),
+            });
+          }
+          appendProgressStage(targetSessionId, singleSpeaker(), {
+            id: `approval:${approval.approval_id || runId || approval.command || 'pending'}`,
+            kind: 'approval',
+            status: 'waiting',
+            title: '等待人工确认',
+            detail: approval.description || approval.command || 'Hermes 请求确认高风险或不确定操作。',
+            meta: '审批',
+          });
           setTunnels(prev => prev.map(t => t.id === employee.id.toString()
             ? { ...t, status: '等待确认', outputLines: appendTraceLine(t.outputLines, `等待人工确认 · ${approval.description || approval.command || '高风险操作'}`) }
             : t));
-          const choice = await requestApprovalChoiceInline(approval);
+          const choice = await requestApprovalChoiceInline(approval, targetSessionId);
           if (runId) {
             try {
               await approveHermesRun(String(runId), choice, choice === 'always', approval.approval_id);
+              if (targetSessionId) removeSessionTodo(targetSessionId, `approval:${approval.approval_id || runId || approval.command || targetSessionId}`);
+              setSessionRunState(targetSessionId, {
+                isProcessing: choice !== 'deny',
+                status: choice === 'deny' ? 'failed' : 'running',
+                pendingApproval: null,
+                reason: approvalChoiceText(choice),
+              });
               setTunnels(prev => prev.map(t => t.id === employee.id.toString()
                 ? { ...t, status: choice === 'deny' ? '已拒绝' : '继续执行', outputLines: appendTraceLine(t.outputLines, approvalChoiceText(choice)) }
                 : t));
+              appendProgressStage(targetSessionId, singleSpeaker(), {
+                id: `approval:${approval.approval_id || runId || approval.command || 'pending'}`,
+                kind: 'approval',
+                status: choice === 'deny' ? 'failed' : 'completed',
+                title: choice === 'deny' ? '审批已拒绝' : '审批已通过',
+                detail: approvalChoiceText(choice),
+                meta: '审批',
+              });
             } catch (err: any) {
-              setTunnels(prev => prev.map(t => t.id === employee.id.toString()
-                ? { ...t, status: '审批失败', outputLines: appendTraceLine(t.outputLines, `审批提交失败 · ${err?.message || err}`) }
-                : t));
+              if (isStaleApprovalError(err)) {
+                if (targetSessionId) removeSessionTodo(targetSessionId, `approval:${approval.approval_id || runId || approval.command || targetSessionId}`);
+                setPendingApproval(null);
+                setSessionRunState(targetSessionId, {
+                  isProcessing: true,
+                  status: 'running',
+                  pendingApproval: null,
+                  reason: '审批已不再等待，正在同步最新状态。',
+                });
+                message.info('审批已过期或已被 Hermes 处理，正在同步最新状态。');
+              } else {
+                setTunnels(prev => prev.map(t => t.id === employee.id.toString()
+                  ? { ...t, status: '审批失败', outputLines: appendTraceLine(t.outputLines, `审批提交失败 · ${err?.message || err}`) }
+                  : t));
+              }
             }
           }
           continue;
         }
         if (chunk.approval_responded) {
           const choice = chunk.approval_responded.choice || '';
+          const reason = safeStageText(chunk.approval_responded.reason || '');
+          const policyBlocked = choice === 'deny' && /blocked_by_employee_toolsets|权限|toolsets|not allowed/i.test(reason);
+          appendProgressStage(targetSessionId, singleSpeaker(), {
+            id: `approval:responded:${choice}`,
+            kind: policyBlocked ? 'tool' : 'approval',
+            status: choice === 'deny' ? 'failed' : 'completed',
+            title: policyBlocked ? '工具权限策略已执行' : '审批响应已同步',
+            detail: policyBlocked ? reason : `审批选择：${choice}`,
+            meta: policyBlocked ? '权限' : '审批',
+          });
           setTunnels(prev => prev.map(t => t.id === employee.id.toString()
-            ? { ...t, outputLines: appendTraceLine(t.outputLines, `审批响应 · ${choice}`) }
+            ? { ...t, outputLines: appendTraceLine(t.outputLines, policyBlocked ? `权限策略阻断 · ${reason}` : `审批响应 · ${choice}`) }
             : t));
           continue;
         }
         if (chunk.reasoning?.text) {
           const reasoningText = String(chunk.reasoning.text);
+          appendProgressStage(targetSessionId, singleSpeaker(), {
+            id: `reasoning:${reasoningText.slice(0, 60)}`,
+            kind: 'reasoning',
+            status: 'completed',
+            title: '思考摘要已更新',
+            detail: reasoningText.slice(0, 140),
+            meta: '思考',
+          });
           setTunnels(prev => prev.map(t => t.id === employee.id.toString()
             ? { ...t, outputLines: appendTraceLine(t.outputLines, `思考摘要 · ${reasoningText.slice(0, 80)}`) }
             : t));
@@ -1971,10 +3662,32 @@ export default function CommandCenter() {
         }
         if (chunk.event_type === 'openatlas.artifacts' || chunk.artifacts?.length) {
           mergeLiveArtifacts(targetSessionId, chunk.artifacts || chunk.items || []);
+          const count = (chunk.artifacts || chunk.items || []).length;
+          appendProgressStage(targetSessionId, singleSpeaker(), {
+            id: `artifact:${count}:${Date.now()}`,
+            kind: 'artifact',
+            status: 'completed',
+            title: '交付物已入库',
+            detail: count > 0 ? `本轮新增 ${count} 个交付物，可在右侧总结/交付物区域查看。` : '检测到新的交付物事件。',
+            meta: '输出',
+            action: 'outputs',
+            actionLabel: '查看',
+          });
           continue;
         }
         if (chunk.event_type === 'openatlas.context' || chunk.skills || chunk.memories) {
           mergeLiveContext(targetSessionId, chunk);
+          const skillCount = Array.isArray(chunk.skills) ? chunk.skills.length : 0;
+          const memoryCount = Array.isArray(chunk.memories) ? chunk.memories.length : 0;
+          const fileCount = Array.isArray(chunk.files) ? chunk.files.length : 0;
+          appendProgressStage(targetSessionId, singleSpeaker(), {
+            id: `context:${skillCount}:${memoryCount}:${fileCount}`,
+            kind: 'context',
+            status: 'completed',
+            title: '上下文已注入',
+            detail: `Skill ${skillCount} 个，记忆 ${memoryCount} 条，文件 ${fileCount} 个。`,
+            meta: '输入',
+          });
           if (chunk.files) {
             const injected = (chunk.files || []).map((f: any) => ({
               id: f.id,
@@ -1998,6 +3711,14 @@ export default function CommandCenter() {
             extracted_chars: f.extracted_chars || 0,
           })) as Attachment[];
           markInjectedFiles(targetSessionId, injected);
+          appendProgressStage(targetSessionId, singleSpeaker(), {
+            id: `files:${injected.map((f) => f.id || f.name).join('|')}`,
+            kind: 'context',
+            status: 'completed',
+            title: '附件内容已准备',
+            detail: injected.map((f) => `${f.name || '文件'}${f.extracted_chars ? ` · ${f.extracted_chars} 字` : ''}`).join('\n'),
+            meta: '文件',
+          });
           continue;
         }
         if (chunk.usage) {
@@ -2021,6 +3742,7 @@ export default function CommandCenter() {
           const t = chunk.tool;
           const merged = mergeToolCall(toolCalls, t);
           toolCalls.splice(0, toolCalls.length, ...merged);
+          appendProgressStage(targetSessionId, singleSpeaker(), toolStage(t));
           setTunnels(prev => prev.map(tn => tn.id === employee.id.toString()
             ? { ...tn, outputLines: [
               ...(tn.outputLines || []),
@@ -2046,6 +3768,16 @@ export default function CommandCenter() {
         // chunk.content 是 undefined 时 fullResponse += undefined → "undefined"
         // 字面量拼到末尾, 显示 "AI 回复先 undefined 再 LLM".  现在跳过.
         if (typeof chunk.content !== 'string' || chunk.content.length === 0) continue;
+        if (!fullResponse) {
+          appendProgressStage(targetSessionId, singleSpeaker(), {
+            id: 'runtime:first-token',
+            kind: 'runtime',
+            status: 'running',
+            title: '开始生成回复',
+            detail: '已收到模型输出，正在流式渲染。',
+            meta: '输出',
+          });
+        }
         fullResponse += chunk.content;
         setMessages((prev: Msg[]) => {
           const lastMsg = prev[prev.length - 1];
@@ -2056,13 +3788,31 @@ export default function CommandCenter() {
         }, targetSessionId);
       }
 
-      if (!wasAborted) {
+      if (!wasAborted && !wasQuotaWaiting) {
+        appendProgressStage(targetSessionId, singleSpeaker(), {
+          id: 'runtime:done',
+          kind: 'done',
+          status: 'completed',
+          title: '本轮任务完成',
+          detail: fullResponse.length > 0 ? `已生成 ${fullResponse.length} 字回复。` : 'Hermes 已结束本轮运行。',
+          meta: '完成',
+          action: 'outputs',
+          actionLabel: '交付物',
+        });
+        setMessages((prev: Msg[]) => prev.map((m) => (
+          m.role === employee.id.toString() ? { ...m, progressStages: settleProgressStages(m.progressStages) } : m
+        )), targetSessionId);
         setTunnels(prev => prev.map(t => t.id === employee.id.toString()
           ? { ...t, status: '完成', outputLines: appendTraceLine(t.outputLines, `生成回复完成 · ${fullResponse.length} 字`), isComplete: true }
           : t));
         setOrbState('speaking');
         await new Promise(r => setTimeout(r, 300));
       }
+      setSessionRunState(targetSessionId, {
+        isProcessing: false,
+        status: wasAborted ? 'stopped' : wasQuotaWaiting ? 'quota_waiting' : 'completed',
+        reason: wasAborted ? '用户已停止当前任务。' : wasQuotaWaiting ? '模型服务限流等待。' : '本轮任务完成。',
+      });
       // Bug #1 修复 (2026-06-03):显示"工作成果" — 真实产出的长度 + 摘要进 conclusions,
       // 不再在完成后立即清空 files;如果本次有 markdown/文件产出,通过 conclusions 告知。
       // 占位策略:把"回复内容"视为隐式产出,文件名格式:"回复-{employee}-{timestamp}.md"
@@ -2074,23 +3824,25 @@ export default function CommandCenter() {
       if (streamAbortRef.current === ac) {
         streamAbortRef.current = null;
       }
+      clearSessionRuntime(targetSessionId);
       setOrbState('idle');
       setIsProcessing(false);
 
       // 刷新会话列表（让新建的/更新的会话标题/时间排到最前）
       await loadConversations();
       if (targetSessionId) {
-        fetchConversationDetail(targetSessionId).then((detail) => rememberSessionMeta(detail, targetSessionId)).catch(() => {});
+        fetchConversationDetail(targetSessionId).then((detail) => hydrateSessionFromDetail(detail, targetSessionId)).catch(() => {});
       }
 
     } catch (error: any) {
       if (error?.name === 'AbortError') {
-        // P3.12 3.4.3: 用户切会话/点新消息主动 abort — 静默
-        console.debug('[Chat] aborted by user/session-switch');
+        console.debug('[Chat] aborted by explicit stop');
       } else {
         console.error('Chat error:', error);
-        setActiveSessionIdSafe(null);
-        setDispatchCid(null); // Bug #2 修复:chat 失败清 dispatch
+        if (!targetSessionId) {
+          setActiveSessionIdSafe(null);
+          setDispatchCid(null); // Bug #2 修复:chat 失败清 dispatch
+        }
         const errorMessage = error instanceof Error ? error.message : '未知错误';
         setMessages((prev: Msg[]) => [...prev, {
           role: 'atlas',
@@ -2098,32 +3850,65 @@ export default function CommandCenter() {
           avatar: 'A',
           color: '#EF4444',
           text: `抱歉，处理您的请求时出现错误：${errorMessage}`
-        }], activeSessionId);
+        }], targetSessionId || activeSessionId);
+        appendProgressStage(targetSessionId || activeSessionId, {
+          role: employee.id.toString(),
+          sender: employee.name,
+          avatar: employee.avatar,
+          color: employee.color,
+        }, {
+          id: `runtime:error:${Date.now()}`,
+          kind: 'runtime',
+          status: 'failed',
+          title: '运行失败',
+          detail: errorMessage,
+          meta: '错误',
+          action: 'replay',
+          actionLabel: '回放',
+        });
         setTunnels(prev => prev.map(t => t.id === employee.id.toString() ? { ...t, status: '失败', isComplete: true } : t));
+        setSessionRunState(targetSessionId || activeSessionId, {
+          isProcessing: false,
+          status: 'failed',
+          reason: errorMessage,
+        });
       }
     }
 
+    stopHeartbeat?.();
     if (streamAbortRef.current === ac) {
       streamAbortRef.current = null;
+    }
+    if (targetSessionId) {
+      clearSessionRuntime(targetSessionId);
+      const queuedSid = targetSessionId;
+      window.setTimeout(() => drainQueuedRunRef.current?.(queuedSid), 300);
     }
     activeHermesRunIdsRef.current.clear();
     setOrbState('idle');
     setIsProcessing(false);
-  }, [activeEmployee, pendingAttachments, loadConversations, user, activeSessionId, allEmployees, markInjectedFiles, mergeLiveArtifacts, mergeLiveContext, mergeTaskState, rememberSessionMeta, reasoningEffort, requestApprovalChoiceInline]);
+  }, [activeEmployee, pendingAttachments, loadConversations, user, activeSessionId, allEmployees, markInjectedFiles, mergeLiveArtifacts, mergeLiveContext, mergeTaskState, markSessionBackgroundSync, rememberSessionMeta, hydrateSessionFromDetail, reasoningEffort, requestApprovalChoiceInline, appendProgressStage, startProgressHeartbeat, setSessionRunState, setSessionAbortController, addSessionHermesRunId, clearSessionRuntime, enqueueSessionTodo, removeSessionTodo]);
 
   // ─────────────────────────────────────────────────────────────────────
   // M4.2 (Group Chat): 群聊 dispatch — 用 conversationChatStream 替代 chatWithEmployeeStream
   // 接力员工循环:每个员工独立 stream + 写新 Message
   // ─────────────────────────────────────────────────────────────────────
-  const simulateGroupDispatch = useCallback(async (userInput: string, primaryEmp: typeof activeEmployee, relays: Employee[]) => {
+  const simulateGroupDispatch = useCallback(async (
+    userInput: string,
+    primaryEmp: typeof activeEmployee,
+    relays: Employee[],
+    options?: { attachments?: Attachment[]; targetSessionId?: string | null },
+  ) => {
     if (!primaryEmp) return;
 
     setOrbState('thinking');
-    const attachmentsToSend = pendingAttachments;
-    setPendingAttachments([]);
+    const attachmentsToSend = options?.attachments ?? pendingAttachments;
+    if (!options?.attachments) setPendingAttachments([]);
 
     // P3.12 3.4.3: 新建 AbortController 接管流, 切会话自动 abort
     const ac = new AbortController();
+    let stopHeartbeat: (() => void) | null = null;
+    let convId: string | null = options?.targetSessionId ?? activeSessionId;
 
     // 显示所有接力员工的 tunnel
     const newTunnels: Tunnel[] = [primaryEmp, ...relays].map((emp, i) => ({
@@ -2142,14 +3927,16 @@ export default function CommandCenter() {
     try {
       setOrbState('dispatch');
 
-      // 群聊/接力:已有会话内的 @员工 是本轮接力, 不新开窗口; 没有会话时才创建群聊草稿.
-      let convId = activeSessionId;
-      if (!convId) {
-        const group = await createGroupConversation(
-          primaryEmp.id,
-          relays.map(r => r.id),
-          userInput.slice(0, 50),
-        );
+	      // 群聊/接力:已有会话内的 @员工 是本轮接力, 不新开窗口; 没有会话时才创建群聊草稿.
+	      convId = convId || activeSessionId;
+	      const primaryRealId = (primaryEmp as any).uuid || String(primaryEmp.id);
+	      const relayRealIds = relays.map((r: any) => r.__id || r.uuid || String(r.id));
+	      if (!convId) {
+	        const group = await createGroupConversation(
+	          primaryRealId,
+	          relayRealIds,
+	          userInput.slice(0, 50),
+	        );
         convId = realSessionId(group);
         setActiveSessionIdSafe(convId);
         setDispatchCid(convId);
@@ -2168,17 +3955,23 @@ export default function CommandCenter() {
         if (last?.role === 'user' && last.text === userInput) return prev;
         return [...prev, groupUserMsg];
       }, convId);
+      setSessionRunState(convId, {
+        isProcessing: true,
+        status: 'running',
+        reason: `${primaryEmp.name} 正在组织 ${relays.length + 1} 位员工接力。`,
+      });
+      setSessionAbortController(convId, ac);
       streamAbortRef.current = ac;
 
       // 调会话级流式端点
-      const stream = conversationChatStream(
-        primaryEmp.id,
-        userInput,
-        {
-          sessionId: convId,
-          relayEmployeeIds: relays.map(r => r.id),
-          attachmentIds: attachmentsToSend?.map((a: any) => a.id) || [],
-          reasoningEffort,
+	      const stream = conversationChatStream(
+	        primaryRealId,
+	        userInput,
+	        {
+	          sessionId: convId,
+	          relayEmployeeIds: relayRealIds,
+	          attachmentIds: attachmentsToSend?.map((a: any) => a.id) || [],
+	          reasoningEffort,
           signal: ac.signal,
         },
       );
@@ -2190,8 +3983,31 @@ export default function CommandCenter() {
       let activeAgentId: string = String(primaryEmp.uuid || primaryEmp.id);  // 当前正在发言的员工
       let activeSpeakerName = primaryEmp.name;
       let wasAborted = false;
+      let wasQuotaWaiting = false;
+      let lastStreamEventAt = Date.now();
+      const stageSpeakerFor = () => {
+        const activeEmp = employeeForSpeaker(activeAgentId, activeSpeakerName);
+        return {
+          role: String(activeAgentId),
+          sender: activeEmp.name,
+          avatar: activeEmp.avatar,
+          color: activeEmp.color,
+        };
+      };
+      appendProgressStage(convId, stageSpeakerFor(), {
+        id: 'runtime:group-accepted',
+        kind: 'handoff',
+        status: 'running',
+        title: `${primaryEmp.name} 已接管群聊任务`,
+        detail: relays.length > 0
+          ? `准备接力 ${relays.map((r) => r.name).join('、')}。`
+          : '正在启动 Hermes 群聊执行。',
+        meta: '接力',
+      });
+      stopHeartbeat = startProgressHeartbeat(() => convId, stageSpeakerFor, () => lastStreamEventAt);
 
       for await (const chunk of stream) {
+        lastStreamEventAt = Date.now();
         if (chunk.error) throw new Error(chunk.error);
         if (chunk.aborted) {
           wasAborted = true;
@@ -2203,6 +4019,22 @@ export default function CommandCenter() {
           }));
           break;
         }
+        if (chunk.event_type === 'openatlas.capability_plan' || chunk.capability_plan) {
+          const plan = chunk.capability_plan || {};
+          const policy = chunk.collaboration_policy || {};
+          mergeTaskState(convId, {
+            task_status: 'running',
+            reason: plan.summary || '能力清单已生成',
+            capability_plan: plan,
+            collaboration_policy: policy,
+          });
+          appendProgressStage(convId, stageSpeakerFor(), capabilityPlanStage(plan, policy));
+          setTunnels(prev => prev.map(t => t.isComplete ? t : {
+            ...t,
+            outputLines: appendTraceLine(t.outputLines, plan.summary || '能力清单已生成'),
+          }));
+          continue;
+        }
         if (chunk.event_type === 'run.started') {
           const runId = chunk.hermes_run_id || chunk.run_id;
           const runSpeakerId = String(chunk.speaker_employee_id || activeAgentId);
@@ -2211,8 +4043,17 @@ export default function CommandCenter() {
             activeSpeakerName = chunk.speaker_name || activeSpeakerName;
           }
           if (runId) {
+            addSessionHermesRunId(convId, String(runId));
             activeHermesRunIdsRef.current.add(String(runId));
             const activeEmp = employeeForSpeaker(runSpeakerId, chunk.speaker_name || activeSpeakerName);
+            appendProgressStage(convId, stageSpeakerFor(), {
+              id: `runtime:run:${runId}`,
+              kind: 'runtime',
+              status: 'running',
+              title: `${activeEmp.name} 开始执行`,
+              detail: '已进入执行链路，正在接收模型、工具和文件事件。',
+              meta: '执行',
+            });
             setTunnels(prev => prev.map(t =>
               t.id === String(activeEmp.id) || t.name === activeEmp.name
                 ? { ...t, outputLines: appendTraceLine(t.outputLines, `Hermes run started · ${String(runId).slice(0, 12)}`) }
@@ -2223,8 +4064,22 @@ export default function CommandCenter() {
         }
         if (chunk.event_type === 'openatlas.run_idle' || chunk.event_type === 'openatlas.run_detached') {
           const idleSpeakerId = String(chunk.speaker_employee_id || activeAgentId);
+          if (idleSpeakerId) activeAgentId = idleSpeakerId;
+          activeSpeakerName = chunk.speaker_name || activeSpeakerName;
           const idleEmp = employeeForSpeaker(idleSpeakerId, chunk.speaker_name || activeSpeakerName);
-          const line = chunk.message || (chunk.detached ? 'Hermes 后台继续运行，稍后自动补同步' : 'Hermes 暂无新事件，继续等待');
+          const line = chunk.message || (chunk.detached ? 'Hermes 后台继续运行，Atlas 会自动同步' : 'Hermes 暂无新事件，继续等待');
+          const idleMs = Number(chunk.idle_seconds || 0) > 0 ? Number(chunk.idle_seconds) * 1000 : Date.now() - lastStreamEventAt;
+          markSessionBackgroundSync(convId);
+          setSessionRunState(convId, {
+            isProcessing: !chunk.detached,
+            status: chunk.detached ? 'stalled' : 'running',
+            reason: line,
+          });
+          mergeTaskState(convId, {
+            task_status: chunk.detached ? 'stalled' : 'running',
+            reason: line,
+          });
+          appendProgressStage(convId, stageSpeakerFor(), waitStage(idleMs, !!chunk.detached));
           setTunnels(prev => prev.map(t =>
             t.id === String(idleEmp.id) || t.name === idleEmp.name
               ? { ...t, status: chunk.detached ? '后台运行' : '运行中', outputLines: appendTraceLine(t.outputLines, line), isComplete: !!chunk.detached }
@@ -2233,7 +4088,24 @@ export default function CommandCenter() {
           continue;
         }
         if (chunk.task_state?.task_status) {
+          setSessionRunState(convId, {
+            isProcessing: !SESSION_TERMINAL_STATUSES.has(String(chunk.task_state.task_status)) && !['needs_input', 'waiting_input', 'waiting_approval', 'quota_waiting', 'stalled'].includes(String(chunk.task_state.task_status)),
+            status: String(chunk.task_state.task_status),
+            reason: chunk.task_state.reason || chunk.task_state.task_summary,
+            needsInput: ['needs_input', 'waiting_input'].includes(String(chunk.task_state.task_status)),
+          });
+          if (chunk.task_state.task_status === 'quota_waiting') {
+            wasQuotaWaiting = true;
+            const reason = safeStageText(chunk.task_state.reason || '模型服务限流等待，可稍后继续。');
+            setTunnels(prev => prev.map(t =>
+              t.id === String(activeAgentId) || t.name === activeSpeakerName
+                ? { ...t, status: '限流等待', outputLines: appendTraceLine(t.outputLines, reason), isComplete: true }
+                : t
+            ));
+            setOrbState('idle');
+          }
           mergeTaskState(convId, chunk.task_state);
+          appendProgressStage(convId, stageSpeakerFor(), taskStateStage(chunk.task_state));
           continue;
         }
         if (chunk.conversation_id) {
@@ -2242,10 +4114,32 @@ export default function CommandCenter() {
         }
         if (chunk.event_type === 'openatlas.artifacts' || chunk.artifacts?.length) {
           mergeLiveArtifacts(convId, chunk.artifacts || chunk.items || []);
+          const count = (chunk.artifacts || chunk.items || []).length;
+          appendProgressStage(convId, stageSpeakerFor(), {
+            id: `artifact:${count}:${Date.now()}`,
+            kind: 'artifact',
+            status: 'completed',
+            title: '交付物已入库',
+            detail: count > 0 ? `本轮新增 ${count} 个交付物，可在右侧总结/交付物区域查看。` : '检测到新的交付物事件。',
+            meta: '输出',
+            action: 'outputs',
+            actionLabel: '查看',
+          });
           continue;
         }
         if (chunk.event_type === 'openatlas.context' || chunk.skills || chunk.memories) {
           mergeLiveContext(convId, chunk);
+          const skillCount = Array.isArray(chunk.skills) ? chunk.skills.length : 0;
+          const memoryCount = Array.isArray(chunk.memories) ? chunk.memories.length : 0;
+          const fileCount = Array.isArray(chunk.files) ? chunk.files.length : 0;
+          appendProgressStage(convId, stageSpeakerFor(), {
+            id: `context:${skillCount}:${memoryCount}:${fileCount}`,
+            kind: 'context',
+            status: 'completed',
+            title: '上下文已注入',
+            detail: `Skill ${skillCount} 个，记忆 ${memoryCount} 条，文件 ${fileCount} 个。`,
+            meta: '输入',
+          });
           if (chunk.files) {
             const injected = (chunk.files || []).map((f: any) => ({
               id: f.id,
@@ -2269,22 +4163,61 @@ export default function CommandCenter() {
             extracted_chars: f.extracted_chars || 0,
           })) as Attachment[];
           markInjectedFiles(convId, injected);
+          appendProgressStage(convId, stageSpeakerFor(), {
+            id: `files:${injected.map((f) => f.id || f.name).join('|')}`,
+            kind: 'context',
+            status: 'completed',
+            title: '附件内容已准备',
+            detail: injected.map((f) => `${f.name || '文件'}${f.extracted_chars ? ` · ${f.extracted_chars} 字` : ''}`).join('\n'),
+            meta: '文件',
+          });
           continue;
         }
 
         // 切发言员工
-        const chunkSpeakerId = chunk.speaker_employee_id || chunk.agent_id;
+        const chunkSpeakerId = chunk.speaker_employee_id || chunk.agent_id || chunk.employee_id || chunk.speaker?.employee_id || chunk.speaker?.id;
+        const chunkSpeakerName = chunk.speaker_name || chunk.agent_name || chunk.employee_name || chunk.speaker?.name;
         if (chunkSpeakerId && String(chunkSpeakerId) !== activeAgentId) {
           activeAgentId = String(chunkSpeakerId);
-          activeSpeakerName = chunk.speaker_name || activeSpeakerName;
+          activeSpeakerName = chunkSpeakerName || activeSpeakerName;
+          const activeEmp = employeeForSpeaker(activeAgentId, activeSpeakerName);
+          ensureSpeakerMessage(convId, {
+            role: activeAgentId,
+            sender: activeEmp.name,
+            avatar: activeEmp.avatar,
+            color: activeEmp.color,
+          }, {
+            text: fullByAgent.get(activeAgentId) || '',
+            tools: toolByAgent.get(activeAgentId),
+            ...usageByAgent.get(activeAgentId),
+          });
         }
 
         if (chunk.event_type === 'openatlas.trace' || chunk.trace) {
           const activeEmp = employeeForSpeaker(activeAgentId, activeSpeakerName);
           const line = formatTraceLine(chunk.trace || chunk);
+          appendProgressStage(convId, stageSpeakerFor(), traceStage(chunk.trace || chunk));
           setTunnels(prev => prev.map(t =>
             t.id === String(activeEmp.id) || t.name === activeEmp.name
               ? { ...t, outputLines: appendTraceLine(t.outputLines, line) }
+              : t
+          ));
+          continue;
+        }
+        if (chunk.event_type === 'openatlas.tool_blocked' || chunk.blocked === true) {
+          const activeEmp = employeeForSpeaker(activeAgentId, activeSpeakerName);
+          const reason = safeStageText(chunk.reason || chunk.blocked_reason || '该工具不在当前员工授权范围内。');
+          appendProgressStage(convId, stageSpeakerFor(), {
+            id: `tool-blocked:${chunk.tool_name || chunk.name || chunk.command || Date.now()}`,
+            kind: 'tool',
+            status: 'failed',
+            title: '工具被权限策略阻断',
+            detail: reason,
+            meta: '权限',
+          });
+          setTunnels(prev => prev.map(t =>
+            t.id === String(activeEmp.id) || t.name === activeEmp.name
+              ? { ...t, status: '权限阻断', outputLines: appendTraceLine(t.outputLines, reason) }
               : t
           ));
           continue;
@@ -2294,26 +4227,89 @@ export default function CommandCenter() {
           const activeEmp = employeeForSpeaker(activeAgentId, activeSpeakerName);
           const approval = chunk.approval_required;
           const runId = approval.hermes_run_id || approval.run_id;
+          if (!isActionableHermesApproval(approval)) {
+            appendProgressStage(convId, stageSpeakerFor(), {
+              id: `approval-diagnostic:${Date.now()}`,
+              kind: 'info',
+              status: 'running',
+              title: '运行诊断',
+              detail: approval.description || approval.command || '收到非 Hermes 原生审批信号，已忽略。',
+              meta: '诊断',
+            });
+            continue;
+          }
+          setSessionRunState(convId, {
+            isProcessing: false,
+            status: 'waiting_approval',
+            pendingApproval: { ...approval, session_id: convId || undefined },
+            reason: approval.description || approval.command || 'Hermes 请求人工确认。',
+          });
+          if (convId) {
+            enqueueSessionTodo({
+              id: `approval:${approval.approval_id || runId || approval.command || convId}`,
+              sid: convId,
+              type: 'approval',
+              title: '等待人工确认',
+              detail: approval.description || approval.command || 'Hermes 请求确认高风险或不确定操作。',
+              approval: { ...approval, session_id: convId },
+              createdAt: Date.now(),
+            });
+          }
+          appendProgressStage(convId, stageSpeakerFor(), {
+            id: `approval:${approval.approval_id || runId || approval.command || 'pending'}`,
+            kind: 'approval',
+            status: 'waiting',
+            title: '等待人工确认',
+            detail: approval.description || approval.command || 'Hermes 请求确认高风险或不确定操作。',
+            meta: '审批',
+          });
           setTunnels(prev => prev.map(t =>
             t.id === String(activeEmp.id) || t.name === activeEmp.name
               ? { ...t, status: '等待确认', outputLines: appendTraceLine(t.outputLines, `等待人工确认 · ${approval.description || approval.command || '高风险操作'}`) }
               : t
           ));
-          const choice = await requestApprovalChoiceInline(approval);
+          const choice = await requestApprovalChoiceInline(approval, convId);
           if (runId) {
             try {
-              await approveHermesRun(String(runId), choice, choice === 'always', approval.approval_id);
-              setTunnels(prev => prev.map(t =>
+                await approveHermesRun(String(runId), choice, choice === 'always', approval.approval_id);
+                if (convId) removeSessionTodo(convId, `approval:${approval.approval_id || runId || approval.command || convId}`);
+                setSessionRunState(convId, {
+                  isProcessing: choice !== 'deny',
+                  status: choice === 'deny' ? 'failed' : 'running',
+                  pendingApproval: null,
+                  reason: approvalChoiceText(choice),
+                });
+                setTunnels(prev => prev.map(t =>
                 t.id === String(activeEmp.id) || t.name === activeEmp.name
                   ? { ...t, status: choice === 'deny' ? '已拒绝' : '继续执行', outputLines: appendTraceLine(t.outputLines, approvalChoiceText(choice)) }
                   : t
               ));
+              appendProgressStage(convId, stageSpeakerFor(), {
+                id: `approval:${approval.approval_id || runId || approval.command || 'pending'}`,
+                kind: 'approval',
+                status: choice === 'deny' ? 'failed' : 'completed',
+                title: choice === 'deny' ? '审批已拒绝' : '审批已通过',
+                detail: approvalChoiceText(choice),
+                meta: '审批',
+              });
             } catch (err: any) {
-              setTunnels(prev => prev.map(t =>
-                t.id === String(activeEmp.id) || t.name === activeEmp.name
-                  ? { ...t, status: '审批失败', outputLines: appendTraceLine(t.outputLines, `审批提交失败 · ${err?.message || err}`) }
-                  : t
-              ));
+              if (isStaleApprovalError(err)) {
+                if (convId) removeSessionTodo(convId, `approval:${approval.approval_id || runId || approval.command || convId}`);
+                setPendingApproval(null);
+                setSessionRunState(convId, {
+                  isProcessing: true,
+                  status: 'running',
+                  pendingApproval: null,
+                  reason: '审批已不再等待，正在同步最新状态。',
+                });
+                message.info('审批已过期或已被 Hermes 处理，正在同步最新状态。');
+              } else {
+                setTunnels(prev => prev.map(t =>
+                  t.id === String(activeEmp.id) || t.name === activeEmp.name
+                    ? { ...t, status: '审批失败', outputLines: appendTraceLine(t.outputLines, `审批提交失败 · ${err?.message || err}`) }
+                    : t
+                ));
+              }
             }
           }
           continue;
@@ -2322,9 +4318,19 @@ export default function CommandCenter() {
         if (chunk.approval_responded) {
           const activeEmp = employeeForSpeaker(activeAgentId, activeSpeakerName);
           const choice = chunk.approval_responded.choice || '';
+          const reason = safeStageText(chunk.approval_responded.reason || '');
+          const policyBlocked = choice === 'deny' && /blocked_by_employee_toolsets|权限|toolsets|not allowed/i.test(reason);
+          appendProgressStage(convId, stageSpeakerFor(), {
+            id: `approval:responded:${choice}`,
+            kind: policyBlocked ? 'tool' : 'approval',
+            status: choice === 'deny' ? 'failed' : 'completed',
+            title: policyBlocked ? '工具权限策略已执行' : '审批响应已同步',
+            detail: policyBlocked ? reason : `审批选择：${choice}`,
+            meta: policyBlocked ? '权限' : '审批',
+          });
           setTunnels(prev => prev.map(t =>
             t.id === String(activeEmp.id) || t.name === activeEmp.name
-              ? { ...t, outputLines: appendTraceLine(t.outputLines, `审批响应 · ${choice}`) }
+              ? { ...t, outputLines: appendTraceLine(t.outputLines, policyBlocked ? `权限策略阻断 · ${reason}` : `审批响应 · ${choice}`) }
               : t
           ));
           continue;
@@ -2333,6 +4339,14 @@ export default function CommandCenter() {
         if (chunk.reasoning?.text) {
           const activeEmp = employeeForSpeaker(activeAgentId, activeSpeakerName);
           const reasoningText = String(chunk.reasoning.text);
+          appendProgressStage(convId, stageSpeakerFor(), {
+            id: `reasoning:${reasoningText.slice(0, 60)}`,
+            kind: 'reasoning',
+            status: 'completed',
+            title: '思考摘要已更新',
+            detail: reasoningText.slice(0, 140),
+            meta: '思考',
+          });
           setTunnels(prev => prev.map(t =>
             t.id === String(activeEmp.id) || t.name === activeEmp.name
               ? { ...t, outputLines: appendTraceLine(t.outputLines, `思考摘要 · ${reasoningText.slice(0, 80)}`) }
@@ -2359,18 +4373,45 @@ export default function CommandCenter() {
 
         if (chunk.event_type === 'agent_join') {
           if (chunkSpeakerId) activeAgentId = String(chunkSpeakerId);
-          activeSpeakerName = chunk.speaker_name || activeSpeakerName;
+          activeSpeakerName = chunkSpeakerName || activeSpeakerName;
           setOrbState('thinking');
           const activeEmp = employeeForSpeaker(activeAgentId, activeSpeakerName);
+          ensureSpeakerMessage(convId, {
+            role: activeAgentId,
+            sender: activeEmp.name,
+            avatar: activeEmp.avatar,
+            color: activeEmp.color,
+          }, {
+            text: fullByAgent.get(activeAgentId) || '',
+            tools: toolByAgent.get(activeAgentId),
+            ...usageByAgent.get(activeAgentId),
+          });
+          appendProgressStage(convId, stageSpeakerFor(), {
+            id: `agent:${activeAgentId}:join`,
+            kind: 'handoff',
+            status: 'running',
+            title: `${activeEmp.name} 开始接力`,
+            detail: '上一位员工的上下文已传入，当前员工开始处理自己的部分。',
+            meta: '接力',
+          });
           setTunnels(prev => prev.map(t =>
             t.id === String(activeEmp.id) || t.name === activeEmp.name
               ? { ...t, status: '思考中', outputLines: appendTraceLine(t.outputLines, '接收问题...') }
               : t
           ));
+          continue;
         }
         if (chunk.event_type === 'agent_leave') {
           const txt = fullByAgent.get(activeAgentId) || '';
           const activeEmp = employeeForSpeaker(activeAgentId, activeSpeakerName);
+          appendProgressStage(convId, stageSpeakerFor(), {
+            id: `agent:${activeAgentId}:leave`,
+            kind: 'handoff',
+            status: 'completed',
+            title: `${activeEmp.name} 已完成本棒`,
+            detail: txt.length > 0 ? `本棒已输出 ${txt.length} 字。` : '已交棒给下一位员工。',
+            meta: '接力',
+          });
           setTunnels(prev => prev.map(t =>
             t.id === String(activeEmp.id) || t.name === activeEmp.name ? {
               ...t, status: '完成',
@@ -2378,6 +4419,7 @@ export default function CommandCenter() {
               isComplete: true,
             } : t
           ));
+          continue;
         }
 
         if (chunk.usage) {
@@ -2402,6 +4444,7 @@ export default function CommandCenter() {
           toolByAgent.set(activeAgentId, arr);
           const activeEmp = employeeForSpeaker(activeAgentId, activeSpeakerName);
           const toolLine = `[tool] ${chunk.tool.name}${chunk.tool.label ? ' · ' + chunk.tool.label : ''} (${chunk.tool.status || ''})`;
+          appendProgressStage(convId, stageSpeakerFor(), toolStage(chunk.tool));
           setTunnels(prev => prev.map(t =>
             t.id === String(activeEmp.id) || t.name === activeEmp.name
               ? { ...t, outputLines: appendTraceLine(t.outputLines, toolLine) }
@@ -2427,6 +4470,16 @@ export default function CommandCenter() {
         if (chunk.done) break;
 
         if (chunk.content) {
+          if (!fullByAgent.get(activeAgentId)) {
+            appendProgressStage(convId, stageSpeakerFor(), {
+              id: `runtime:first-token:${activeAgentId}`,
+              kind: 'runtime',
+              status: 'running',
+              title: `${activeSpeakerName} 开始生成回复`,
+              detail: '已收到模型输出，正在流式渲染。',
+              meta: '输出',
+            });
+          }
           const cur = (fullByAgent.get(activeAgentId) ?? '') + chunk.content;
           fullByAgent.set(activeAgentId, cur);
 
@@ -2450,28 +4503,72 @@ export default function CommandCenter() {
         }
       }
 
-      if (!wasAborted) {
+      if (!wasAborted && !wasQuotaWaiting) {
+        appendProgressStage(convId, stageSpeakerFor(), {
+          id: 'runtime:group-done',
+          kind: 'done',
+          status: 'completed',
+          title: '群聊接力完成',
+          detail: `本轮共有 ${1 + relays.length} 位员工参与。`,
+          meta: '完成',
+          action: 'outputs',
+          actionLabel: '交付物',
+        });
+        setMessages((prev: Msg[]) => prev.map((m) => (
+          m.role !== 'user' ? { ...m, progressStages: settleProgressStages(m.progressStages) } : m
+        )), convId);
         setOrbState('speaking');
         await new Promise(r => setTimeout(r, 300));
       }
+      setSessionRunState(convId, {
+        isProcessing: false,
+        status: wasAborted ? 'stopped' : wasQuotaWaiting ? 'quota_waiting' : 'completed',
+        reason: wasAborted ? '用户已停止当前任务。' : wasQuotaWaiting ? '模型服务限流等待。' : '群聊接力完成。',
+      });
       setOrbState('idle');
 
       // 收尾:刷新会话列表(因为新群聊会话已建)
       await loadConversations();
       if (convId) {
-        fetchConversationDetail(convId).then((detail) => rememberSessionMeta(detail, convId)).catch(() => {});
+        fetchConversationDetail(convId).then((detail) => hydrateSessionFromDetail(detail, convId)).catch(() => {});
       }
     } catch (e: any) {
       if (e?.name === 'AbortError') {
-        console.debug('[M4.2] group chat aborted by user/session-switch');
+        console.debug('[M4.2] group chat aborted by explicit stop');
       } else {
         console.error('[M4.2] group chat error:', e);
         message.error(`群聊失败: ${e instanceof Error ? e.message : '未知错误'}`);
+        appendProgressStage(convId || activeSessionId, {
+          role: String(primaryEmp.id),
+          sender: primaryEmp.name,
+          avatar: primaryEmp.avatar,
+          color: primaryEmp.color,
+        }, {
+          id: `runtime:group-error:${Date.now()}`,
+          kind: 'runtime',
+          status: 'failed',
+          title: '群聊接力失败',
+          detail: e instanceof Error ? e.message : '未知错误',
+          meta: '错误',
+          action: 'replay',
+          actionLabel: '回放',
+        });
+        setSessionRunState(convId || activeSessionId, {
+          isProcessing: false,
+          status: 'failed',
+          reason: e instanceof Error ? e.message : '未知错误',
+        });
       }
       setOrbState('idle');
     } finally {
+      stopHeartbeat?.();
       if (streamAbortRef.current === ac) {
         streamAbortRef.current = null;
+      }
+      if (convId) {
+        clearSessionRuntime(convId);
+        const queuedSid = convId;
+        window.setTimeout(() => drainQueuedRunRef.current?.(queuedSid), 300);
       }
       activeHermesRunIdsRef.current.clear();
       // 清空接力 chips
@@ -2479,12 +4576,36 @@ export default function CommandCenter() {
       setRelayChips([]);
       setIsProcessing(false);
     }
-  }, [pendingAttachments, loadConversations, user, employeeForSpeaker, activeSessionId, markInjectedFiles, mergeLiveArtifacts, mergeLiveContext, mergeTaskState, rememberSessionMeta, reasoningEffort, requestApprovalChoiceInline]);
+  }, [pendingAttachments, loadConversations, user, employeeForSpeaker, activeSessionId, markInjectedFiles, mergeLiveArtifacts, mergeLiveContext, mergeTaskState, markSessionBackgroundSync, rememberSessionMeta, hydrateSessionFromDetail, reasoningEffort, requestApprovalChoiceInline, appendProgressStage, startProgressHeartbeat, setSessionRunState, setSessionAbortController, addSessionHermesRunId, clearSessionRuntime, enqueueSessionTodo, removeSessionTodo]);
 
-  const handleSend = useCallback(() => {
+  const handleSend = useCallback(async () => {
     const text = input.trim();
-    if (!text || isProcessing) return;
+    if (!text) return;
+    let sessionBusy = activeSessionId ? isSessionBusy(activeSessionId) : false;
+    if (activeSessionId && !sessionBusy && !getKnownSessionStatus(activeSessionId)) {
+      try {
+        const detail = await fetchConversationDetail(activeSessionId);
+        const realSid = realSessionId(detail) || activeSessionId;
+        rememberSessionMeta(detail, realSid);
+        syncSessionRunStateFromDetail(detail, realSid);
+        const nextStatus = String(detail?.progress?.status || detail?.task_status || '');
+        sessionBusy = SESSION_BUSY_STATUSES.has(nextStatus);
+      } catch (e) {
+        console.warn('[send guard] failed to refresh session status before send:', e);
+      }
+    }
+    if (activeSessionId && sessionBusy) {
+      setRunConflictDraft({
+        sid: activeSessionId,
+        text,
+        attachments: [...pendingAttachments],
+        primaryEmployee: relayChips.length > 0 ? toEmployeeChip(relayChips[0]) : activeEmployee,
+        relayEmployees: relayChips.length > 0 ? relayChips.slice(1) : [],
+      });
+      return;
+    }
     const displayName = user?.username || '用户';
+    const attachmentsSnapshot = [...pendingAttachments];
     // Phase 2 Upload-Real：user message 带上 pending attachments
     const userMsg: Msg = {
       role: 'user',
@@ -2492,22 +4613,176 @@ export default function CommandCenter() {
       avatar: displayName[0],
       color: '#6B7280',
       text,
-      attachments: pendingAttachments.length > 0 ? pendingAttachments : undefined,
+      attachments: attachmentsSnapshot.length > 0 ? attachmentsSnapshot : undefined,
     };
     setMessages((prev: Msg[]) => [...prev, userMsg]);
     setInput('');
+    setPendingAttachments([]);
     setIsProcessing(true);
 
-    // M4.2: @员工 = 当前会话内本轮接力, 不再把第一个 @ 员工提升成新窗口主员工.
+    // M4.2 / Hermes-web-ui parity: first @mention owns this turn; remaining mentions relay.
     if (relayChips.length > 0) {
-      const primaryEmp = activeEmployee || toEmployeeChip(relayChips[0]);
-      const relays = activeEmployee ? relayChips : relayChips.slice(1);
-      simulateGroupDispatch(text, primaryEmp, relays);
+      const primaryEmp = toEmployeeChip(relayChips[0]);
+      const relays = relayChips.slice(1);
+      simulateGroupDispatch(text, primaryEmp, relays, { attachments: attachmentsSnapshot, targetSessionId: activeSessionId });
     } else {
       // 单聊兼容 M1-M3.5
-      simulateDispatch(text);
+      simulateDispatch(text, { attachments: attachmentsSnapshot, targetSessionId: activeSessionId });
     }
-  }, [input, isProcessing, simulateDispatch, simulateGroupDispatch, user, pendingAttachments, relayEmployeeIds, relayChips, activeEmployee]);
+  }, [input, activeSessionId, isSessionBusy, getKnownSessionStatus, rememberSessionMeta, syncSessionRunStateFromDetail, simulateDispatch, simulateGroupDispatch, user, pendingAttachments, relayChips, activeEmployee]);
+
+  const dispatchQueuedRunItem = useCallback((item: QueuedRunItem) => {
+    const displayName = user?.username || '用户';
+    const text = item.text;
+    setActiveSessionIdSafe(item.sid);
+    setDispatchCid(item.sid);
+    setMessages((prev: Msg[]) => [...prev, {
+      role: 'user',
+      sender: displayName,
+      avatar: displayName[0],
+      color: '#6B7280',
+      text,
+      attachments: item.attachments && item.attachments.length > 0 ? item.attachments : undefined,
+    }], item.sid);
+    setSessionRunState(item.sid, {
+      isProcessing: true,
+      status: 'running',
+      reason: '正在执行排队任务。',
+    });
+    setIsProcessing(true);
+    if (item.relayEmployees && item.relayEmployees.length > 0) {
+      simulateGroupDispatch(text, item.primaryEmployee || activeEmployee, item.relayEmployees, {
+        attachments: item.attachments || [],
+        targetSessionId: item.sid,
+      });
+    } else {
+      simulateDispatch(text, {
+        attachments: item.attachments || [],
+        targetSessionId: item.sid,
+      });
+    }
+  }, [activeEmployee, setActiveSessionIdSafe, setMessages, setSessionRunState, simulateDispatch, simulateGroupDispatch, user]);
+
+  useEffect(() => {
+    drainQueuedRunRef.current = (sid: string) => {
+      const state = runStateBySessionRef.current[sid];
+      const nextItem = state?.queue?.[0];
+      if (!nextItem) return;
+      if (isSessionBusy(sid)) return;
+      setSessionRunState(sid, (prev) => ({
+        ...prev,
+        queue: (prev.queue || []).slice(1),
+        status: 'running',
+        isProcessing: true,
+        reason: '正在处理排队输入。',
+      }));
+      window.setTimeout(() => dispatchQueuedRunItem(nextItem), 250);
+    };
+    return () => {
+      drainQueuedRunRef.current = null;
+    };
+  }, [dispatchQueuedRunItem, isSessionBusy, setSessionRunState]);
+
+  const enqueueConflictDraft = useCallback((intent: QueuedRunIntent) => {
+    if (!runConflictDraft) return;
+    const item: QueuedRunItem = {
+      id: `queued:${runConflictDraft.sid}:${Date.now()}`,
+      sid: runConflictDraft.sid,
+      text: runConflictDraft.text,
+      intent,
+      attachments: runConflictDraft.attachments,
+      primaryEmployee: runConflictDraft.primaryEmployee,
+      relayEmployees: runConflictDraft.relayEmployees,
+      createdAt: Date.now(),
+    };
+    setSessionRunState(runConflictDraft.sid, (prev) => ({
+      ...prev,
+      status: prev.status || 'queued',
+      reason: '输入已排队，当前任务完成后继续执行。',
+      queue: [...(prev.queue || []), item],
+    }));
+    setMessages((prev: Msg[]) => [...prev, {
+      role: 'atlas',
+      sender: 'Atlas',
+      avatar: 'A',
+      color: '#4F46E5',
+      text: '已加入当前会话队列。当前任务完成后会自动继续处理这条输入。',
+    }], runConflictDraft.sid);
+    setInput('');
+    setPendingAttachments([]);
+    setRunConflictDraft(null);
+    message.success('已加入会话队列');
+  }, [runConflictDraft, setMessages, setSessionRunState]);
+
+  const stopAndRerunConflictDraft = useCallback(async () => {
+    if (!runConflictDraft) return;
+    const item: QueuedRunItem = {
+      id: `rerun:${runConflictDraft.sid}:${Date.now()}`,
+      sid: runConflictDraft.sid,
+      text: runConflictDraft.text,
+      intent: 'queue',
+      attachments: runConflictDraft.attachments,
+      primaryEmployee: runConflictDraft.primaryEmployee,
+      relayEmployees: runConflictDraft.relayEmployees,
+      createdAt: Date.now(),
+    };
+    setRunConflictDraft(null);
+    setInput('');
+    setPendingAttachments([]);
+    await handleAbortCurrentRun(runConflictDraft.sid);
+    window.setTimeout(() => dispatchQueuedRunItem(item), 500);
+  }, [dispatchQueuedRunItem, handleAbortCurrentRun, runConflictDraft]);
+
+  const pendingGlobalTodos = SHOW_GLOBAL_SESSION_TODOS ? Object.values(sessionTodos).flat() : [];
+
+  const openTodoSession = useCallback((todo: SessionTodo) => {
+    const conv = conversations.find((item) => realSessionId(item) === todo.sid);
+    if (conv) {
+      void switchToConversation(conv);
+    } else {
+      void handleSwitchConversation(todo.sid);
+    }
+  }, [conversations, handleSwitchConversation, switchToConversation]);
+
+  const approveTodo = useCallback(async (todo: SessionTodo, choice: ApprovalChoice) => {
+    const approval = todo.approval;
+    const runId = approval?.hermes_run_id || approval?.run_id;
+    if (!runId) {
+      message.warning('这个审批缺少 Hermes run id，请打开会话同步最新状态。');
+      openTodoSession(todo);
+      return;
+    }
+    try {
+      await approveHermesRun(String(runId), choice, choice === 'always', approval?.approval_id);
+      removeSessionTodo(todo.sid, todo.id);
+      setSessionRunState(todo.sid, {
+        isProcessing: choice !== 'deny',
+        status: choice === 'deny' ? 'failed' : 'running',
+        pendingApproval: null,
+        reason: approvalChoiceText(choice),
+      });
+      message.success(choice === 'deny' ? '已拒绝后台审批' : '已通过后台审批，任务将继续执行');
+      fetchConversationDetail(todo.sid)
+        .then((detail) => hydrateSessionFromDetail(detail, realSessionId(detail) || todo.sid))
+        .catch(() => {});
+    } catch (e: any) {
+      if (isStaleApprovalError(e)) {
+        removeSessionTodo(todo.sid, todo.id);
+        setSessionRunState(todo.sid, {
+          isProcessing: true,
+          status: 'running',
+          pendingApproval: null,
+          reason: '审批已不再等待，正在同步最新状态。',
+        });
+        message.info('审批已过期或已被 Hermes 处理，正在同步最新状态。');
+        fetchConversationDetail(todo.sid)
+          .then((detail) => hydrateSessionFromDetail(detail, realSessionId(detail) || todo.sid))
+          .catch(() => {});
+      } else {
+        message.error(`审批提交失败：${e?.message || e}`);
+      }
+    }
+  }, [hydrateSessionFromDetail, openTodoSession, removeSessionTodo, setSessionRunState]);
 
   const handlePrompt = (prompt: string) => {
     const fullText = prompt === '检查围标' ? '该批采购是否存在围标串标迹象？请启动全面检测。'
@@ -2520,15 +4795,44 @@ export default function CommandCenter() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+    const key = e.key.toLowerCase();
+    const commandLike = e.metaKey || e.ctrlKey;
+    if (commandLike && e.shiftKey && key === 'u') {
+      e.preventDefault();
+      if (!uploading) fileInputRef.current?.click();
+      return;
+    }
+    if (commandLike && e.shiftKey && key === 'p') {
+      e.preventDefault();
+      if (!uploading) imageInputRef.current?.click();
+      return;
+    }
+    if (isImeComposingEvent(e) || imeComposingRef.current) return;
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
   };
 
   const employeePool = (allEmployeesForMention.length > 0 ? allEmployeesForMention : allEmployees as any) as Employee[];
   const getEmployeeDockKey = (emp: Employee) => String((emp as any).__id || emp.id);
-  const selectedDockSet = new Set(employeeDockIds);
-  const configuredDockEmployees = employeePool.filter((emp) => selectedDockSet.has(getEmployeeDockKey(emp)));
-  const launchEmployees = (employeeDockIds.length > 0 ? configuredDockEmployees : employeePool).slice(0, 6);
+  const configuredDockEmployees = employeeDockIds
+    .map((id) => employeePool.find((emp) => getEmployeeDockKey(emp) === id))
+    .filter(Boolean) as Employee[];
+  const commonDockEmployees = [...employeePool].sort((a: any, b: any) => {
+    const score = (emp: any) =>
+      Number(emp.conversation_count || 0) * 4
+      + Number(emp.today_conversation_count || 0) * 8
+      + Number(emp.total_messages || 0)
+      + Number(emp.total_tokens || 0) / 1000;
+    return score(b) - score(a);
+  });
+  const launchEmployees = (employeeDockIds.length > 0 ? configuredDockEmployees : commonDockEmployees).slice(0, 5);
   const userDisplayName = user?.username || user?.email?.split('@')[0] || '用户';
+  const homeComposerPlaceholder = '输入需求，试试 @行政小六 帮你分诊，或直接 @投资研究分析师 开始任务...';
+  const chatComposerPlaceholder = activeEmployee
+    ? `给 ${activeEmployee.name} 发任务，也可以 @其他员工加入接力...`
+    : '输入需求，试试 @行政小六 或 @市场竞品研究员...';
   const continuationConversations = [...conversations]
     .sort((a, b) => {
       if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
@@ -2552,7 +4856,7 @@ export default function CommandCenter() {
     >
       <div className="atlas-dock-settings">
         <div className="atlas-dock-settings-note">
-          选择首页 Dock 展示的员工，最多展示 6 个。未选择时自动展示前 6 个常用员工。
+          选择首页 Dock 展示的员工，最多展示 5 个。未选择时自动展示前 5 个常用员工。
         </div>
         <div className="atlas-dock-settings-list">
           {employeePool.map((emp, index) => {
@@ -2567,7 +4871,7 @@ export default function CommandCenter() {
                   onChange={(e) => {
                     setEmployeeDockIds((prev) => {
                       if (e.target.checked) {
-                        return prev.includes(key) ? prev : [...prev, key].slice(0, 6);
+                        return prev.includes(key) ? prev : [...prev, key].slice(0, 5);
                       }
                       return prev.filter((id) => id !== key);
                     });
@@ -2703,8 +5007,18 @@ export default function CommandCenter() {
         </div>
       )}
       {!loadingTemplates && collabTemplates.length === 0 && (
-        <div style={{ padding: '32px 0', textAlign: 'center', color: 'var(--text-tertiary)' }}>
-          暂无协作方案。先进入会话，打开协作画布并点击“保存为方案”。
+        <div style={{ padding: '34px 0', textAlign: 'center', color: 'var(--text-tertiary)', display: 'grid', gap: 14, justifyItems: 'center' }}>
+          <div>
+            <strong style={{ display: 'block', color: 'var(--text-primary)', fontSize: 15, marginBottom: 6 }}>还没有协作方案</strong>
+            <span>先新建一个协作方案，添加员工节点并点击画布右上角“保存/另存为方案”。</span>
+          </div>
+          <button
+            type="button"
+            className="atlas-template-empty-action"
+            onClick={handleNewCollaborationPlan}
+          >
+            新建协作方案
+          </button>
         </div>
       )}
       {!loadingTemplates && collabTemplates.length > 0 && (
@@ -2756,7 +5070,7 @@ export default function CommandCenter() {
                       fontWeight: 700,
                     }}
                   >
-                    {usingTemplateId === tpl.id ? '创建中…' : '使用方案'}
+                    {usingTemplateId === tpl.id ? '创建中…' : '使用方案创建作战室'}
                   </button>
                 </div>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 11, color: 'var(--text-tertiary)' }}>
@@ -2804,32 +5118,30 @@ export default function CommandCenter() {
       className={`atlas-canvas-hub ${canvasHubOpen ? 'is-open' : ''}`}
       style={{ left: canvasHubPos.x, top: canvasHubPos.y }}
     >
-      <button
-        className="atlas-canvas-hub-action atlas-canvas-hub-action--template"
-        onClick={() => { setCanvasHubOpen(false); void handleOpenTemplateLibrary(); }}
-        title="协作方案库"
-        aria-label="打开协作方案库"
-        data-collab-template-hub-action="true"
-        disabled={!canvasHubOpen}
-        aria-hidden={!canvasHubOpen}
-        tabIndex={canvasHubOpen ? 0 : -1}
-      >
-        <ApartmentOutlined />
-        <span>方案库</span>
-      </button>
-      <button
-        className="atlas-canvas-hub-action atlas-canvas-hub-action--replay"
-        onClick={() => { setCanvasHubOpen(false); void handleReplayEvents(); }}
-        title="事件流回放"
-        aria-label="回放当前会话事件流"
-        data-m5-replay-trigger="true"
-        disabled={!canvasHubOpen}
-        aria-hidden={!canvasHubOpen}
-        tabIndex={canvasHubOpen ? 0 : -1}
-      >
-        <HistoryOutlined />
-        <span>回放</span>
-      </button>
+      {canvasHubOpen && (
+        <>
+          <button
+            className="atlas-canvas-hub-action atlas-canvas-hub-action--template"
+            onClick={() => { setCanvasHubOpen(false); void handleOpenTemplateLibrary(); }}
+            title="协作方案库"
+            aria-label="打开协作方案库"
+            data-collab-template-hub-action="true"
+          >
+            <ApartmentOutlined />
+            <span>方案库</span>
+          </button>
+          <button
+            className="atlas-canvas-hub-action atlas-canvas-hub-action--replay"
+            onClick={() => { setCanvasHubOpen(false); void handleReplayEvents(); }}
+            title="事件流回放"
+            aria-label="回放当前会话事件流"
+            data-m5-replay-trigger="true"
+          >
+            <HistoryOutlined />
+            <span>回放</span>
+          </button>
+        </>
+      )}
       <button
         ref={canvasBtnRef}
         className="atlas-canvas-hub-main"
@@ -2867,6 +5179,57 @@ export default function CommandCenter() {
     </Suspense>
   );
 
+  const homeConversationRail = (
+    <div
+      className={`atlas-home-conversation-rail ${homeConversationRailOpen ? 'is-expanded' : 'is-collapsed'}`}
+      style={{ '--home-rail-width': `${railPrefs.leftWidth}px` } as CSSProperties}
+    >
+      {!homeConversationRailOpen ? (
+        <button
+          type="button"
+          className="atlas-home-rail-tab"
+          onClick={() => setHomeConversationRailOpen(true)}
+          aria-label="展开会话列表"
+          title="展开会话列表"
+        >
+          <IconHistory size={15} />
+          <span>会话</span>
+        </button>
+      ) : (
+        <>
+          <LeftAside
+            conversations={conversations}
+            loading={loadingConvs}
+            activeId={activeSessionId}
+            onNew={handleNewConversation}
+            onNewGroup={handleNewGroupConversation}
+            onSelect={switchToConversation}
+            onDelete={handleDeleteConversation}
+            onPatch={handlePatchConversation}
+          />
+          <button
+            type="button"
+            className="atlas-home-rail-close"
+            onClick={() => setHomeConversationRailOpen(false)}
+            aria-label="收起会话列表"
+            title="收起会话列表"
+          >
+            ‹
+          </button>
+          <div
+            className="atlas-home-rail-resizer"
+            onPointerDown={(e) => beginCommandRailResize('left', e)}
+            onDoubleClick={() => resetCommandRailWidth('left')}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="拖拽调整会话列表宽度，双击恢复默认"
+            title="拖拽调整会话列表宽度，双击恢复默认"
+          />
+        </>
+      )}
+    </div>
+  );
+
   // =============== SCENE 1: Focus Mode (no messages) ===============
   if (!isWarRoom) {
     return (
@@ -2874,8 +5237,9 @@ export default function CommandCenter() {
         {promptsModal}
         {shortcutSettingsModal}
         {templateLibraryModal}
-        {canvasHubLayer}
         {collaborationCanvasLayer}
+        {canvasHubLayer}
+        {homeConversationRail}
         <div className="atlas-home-ambient" />
 
         <section className="atlas-home-hero">
@@ -2907,15 +5271,23 @@ export default function CommandCenter() {
               </div>
             )}
 
-            <div className="atlas-command-composer" style={{
-              display: 'flex', alignItems: 'flex-end', gap: 10,
-              padding: '12px 14px',
-              background: 'var(--bg-elevated)',
-              border: '1px solid var(--border-default)',
-              borderRadius: 'var(--radius-lg)',
-              boxShadow: 'var(--elev-2)',
-              transition: 'border-color 0.2s ease, box-shadow 0.2s ease',
-            }}>
+            <div className="atlas-home-mention-wrap" style={{ position: 'relative' }}>
+              <MentionPopover
+                input={input}
+                employees={allEmployeesForMention}
+                selectedIds={relayEmployeeIds}
+                onPick={handleMentionPick}
+                onClose={handleMentionClose}
+              />
+              <div className="atlas-command-composer" style={{
+                display: 'flex', alignItems: 'flex-end', gap: 10,
+                padding: '12px 14px',
+                background: 'var(--bg-elevated)',
+                border: '1px solid var(--border-default)',
+                borderRadius: 'var(--radius-lg)',
+                boxShadow: 'var(--elev-2)',
+                transition: 'border-color 0.2s ease, box-shadow 0.2s ease',
+              }}>
               {/* 隐藏 file inputs */}
               <input ref={fileInputRef} type="file" style={{ display: 'none' }} onChange={e => {
                 const f = e.target.files?.[0]; if (f) handleFileSelected(f);
@@ -2926,13 +5298,13 @@ export default function CommandCenter() {
                 e.target.value = '';
               }} />
               {/* 附件按钮：真实 onClick */}
-              <button title="附件" disabled={uploading} onClick={() => fileInputRef.current?.click()}
+              <button title="附件 · ⌘/Ctrl+Shift+U" disabled={uploading} onClick={() => fileInputRef.current?.click()}
                 style={{ width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', borderRadius: 6, transition: 'all 0.15s ease', opacity: uploading ? 0.4 : 1 }}
                 onMouseEnter={e => { (e.target as HTMLElement).closest('button')!.style.color = 'var(--accent)'; (e.target as HTMLElement).closest('button')!.style.background = 'var(--accent-soft)'; }}
                 onMouseLeave={e => { (e.target as HTMLElement).closest('button')!.style.color = 'var(--text-tertiary)'; (e.target as HTMLElement).closest('button')!.style.background = 'transparent'; }}
               ><IconPaperclip size={18} /></button>
               {/* 图片按钮：真实 onClick */}
-              <button title="图片" disabled={uploading} onClick={() => imageInputRef.current?.click()}
+              <button title="图片 · ⌘/Ctrl+Shift+P" disabled={uploading} onClick={() => imageInputRef.current?.click()}
                 style={{ width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', borderRadius: 6, transition: 'all 0.15s ease', opacity: uploading ? 0.4 : 1 }}
                 onMouseEnter={e => { (e.target as HTMLElement).closest('button')!.style.color = 'var(--accent)'; (e.target as HTMLElement).closest('button')!.style.background = 'var(--accent-soft)'; }}
                 onMouseLeave={e => { (e.target as HTMLElement).closest('button')!.style.color = 'var(--text-tertiary)'; (e.target as HTMLElement).closest('button')!.style.background = 'transparent'; }}
@@ -2942,49 +5314,60 @@ export default function CommandCenter() {
                 style={{ width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', borderRadius: 6, transition: 'all 0.15s ease', opacity: 0.3, cursor: 'not-allowed' }}
               ><IconMic size={18} /></button>
               <textarea ref={inputRef} value={input} onChange={e => setInput(e.target.value)}
-                onKeyDown={handleKeyDown} placeholder="跟 Atlas 说点什么…" disabled={isProcessing} rows={1}
+                onKeyDown={handleKeyDown}
+                onCompositionStart={handleCompositionStart}
+                onCompositionEnd={handleCompositionEnd}
+                onPaste={handlePasteUpload} placeholder={homeComposerPlaceholder} disabled={activeIsProcessing} rows={1}
                 style={{ flex: 1, border: 'none', outline: 'none', resize: 'none', fontSize: 15, fontFamily: 'var(--font-family)', color: 'var(--text-primary)', background: 'transparent', lineHeight: 1.5, maxHeight: 140, minHeight: 24, padding: '6px 4px' }}
               />
-              <button onClick={handleSend} disabled={!input.trim() || isProcessing}
+              <button onClick={handleSend} disabled={!input.trim() || activeIsProcessing}
                 style={{
                   width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center',
                   borderRadius: 8,
-                  color: input.trim() && !isProcessing ? '#fff' : 'var(--text-tertiary)',
-                  background: input.trim() && !isProcessing ? 'var(--accent)' : 'transparent',
-                  cursor: input.trim() && !isProcessing ? 'pointer' : 'default',
-                  opacity: input.trim() && !isProcessing ? 1 : 0.5,
+                  color: input.trim() && !activeIsProcessing ? '#fff' : 'var(--text-tertiary)',
+                  background: input.trim() && !activeIsProcessing ? 'var(--accent)' : 'transparent',
+                  cursor: input.trim() && !activeIsProcessing ? 'pointer' : 'default',
+                  opacity: input.trim() && !activeIsProcessing ? 1 : 0.5,
                   transition: 'all 0.15s ease',
                 }}
               ><IconSend size={17} /></button>
+              </div>
             </div>
             <div style={{ textAlign: 'center', marginTop: 14, fontSize: 11, color: 'var(--text-tertiary)', letterSpacing: '0.04em' }}>
-              回车发送 · Shift+回车换行 · Atlas 遵循企业权限与审计策略
+              Enter 发送 · Shift+Enter 换行 · 输入法确认不误发 · ⌘/Ctrl+V 粘贴上传 · ⌘/Ctrl+Shift+U 附件 · ⌘/Ctrl+Shift+P 图片
             </div>
 
             <section className="atlas-continuation-strip">
               <div className="atlas-continuation-head">
                 <span><IconHistory size={12} /> 继续任务</span>
-                <button
-                  type="button"
-                  onClick={() => navigate('/history')}
-                  style={{
-                    minHeight: 30,
-                    padding: '0 12px',
-                    borderRadius: 999,
-                    border: '1px solid rgba(124, 119, 255, 0.18)',
-                    background: 'rgba(255,255,255,0.58)',
-                    color: 'var(--text-secondary)',
-                    fontSize: 12,
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                  }}
-                >
-                  全部历史
-                </button>
+                <div className="atlas-continuation-actions">
+                  <button
+                    type="button"
+                    className="atlas-continuation-history-btn"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setHomeConversationRailOpen((open) => !open);
+                    }}
+                  >
+                    {homeConversationRailOpen ? '收起会话栏' : '展开会话栏'}
+                  </button>
+                  <button
+                    type="button"
+                    className="atlas-continuation-history-btn"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      navigate('/history');
+                    }}
+                  >
+                    全部历史
+                  </button>
+                </div>
               </div>
               <div className="atlas-continuation-list">
                 {continuationConversations.length > 0 ? continuationConversations.map((c) => (
-                  <button key={c.id} className="atlas-continuation-pill" onClick={() => handleSwitchConversation(c.id)} title={c.title || '新会话'}>
+                  <button key={c.id} className="atlas-continuation-pill" onClick={() => switchToConversation(c)} title={c.title || '新会话'}>
                     <span className={`atlas-continuation-dot atlas-continuation-dot--${c.task_status || 'draft'}`} />
                     <span className="atlas-continuation-title">{c.pinned ? '置顶 · ' : ''}{c.title || '新会话'}</span>
                     <span className="atlas-continuation-meta">{c.message_count || 0} 条</span>
@@ -3003,21 +5386,24 @@ export default function CommandCenter() {
                   <button
                     className="atlas-launchpad-link"
                     onClick={() => navigate('/workforce')}
-                    disabled={isProcessing}
+                    disabled={activeIsProcessing}
                   >
                     全部员工
                   </button>
                   <button
                     className="atlas-launchpad-link"
                     onClick={() => setDockSettingsOpen(true)}
-                    disabled={isProcessing}
+                    disabled={activeIsProcessing}
                   >
                     自定义 Dock
                   </button>
                 </div>
               </div>
 
-              <div className="atlas-agent-grid">
+              <div
+                className="atlas-agent-grid"
+                style={{ '--dock-count': Math.max(1, launchEmployees.length + 1) } as CSSProperties}
+              >
                 {launchEmployees.map((emp: Employee, index: number) => {
                   const color = emp.department?.color || ['#4F46E5', '#0EA5E9', '#10B981', '#F59E0B', '#EC4899', '#6366F1'][index % 6];
                   const skills = Array.isArray(emp.toolsets) ? emp.toolsets.slice(0, 1) : [];
@@ -3026,7 +5412,7 @@ export default function CommandCenter() {
                       key={(emp as any).__id || emp.id}
                       className="atlas-agent-card"
                       onClick={() => handleEmployeeShortcut(emp)}
-                      disabled={isProcessing}
+                      disabled={activeIsProcessing}
                       title={`和 ${emp.name} 开始对话`}
                       style={{ '--agent-color': color, '--agent-index': `"${String(index + 1).padStart(2, '0')}"` } as any}
                     >
@@ -3052,67 +5438,51 @@ export default function CommandCenter() {
                     </button>
                   );
                 })}
-                <button
-                  className="atlas-agent-card atlas-agent-card--action"
-                  onClick={handleNewGroupConversation}
-                  disabled={isProcessing}
-                  title="创建多员工群聊"
-                >
-                  <span className="atlas-agent-card-glow" />
-                  <div className="atlas-agent-card-main">
-                    <span className="atlas-action-icon"><IconUsers size={20} /></span>
-                    <span className="atlas-agent-copy">
-                      <span className="atlas-agent-name">多员工群聊</span>
-                      <span className="atlas-agent-role">Relay · @ 召唤</span>
-                    </span>
-                  </div>
-                  <div className="atlas-agent-description">先创建协作会话，再用 @ 选择员工进行接力回答。</div>
-                  <div className="atlas-agent-skill-row">
-                    <span className="atlas-agent-skill">group</span>
-                    <span className="atlas-agent-skill">relay</span>
-                  </div>
-                </button>
-                <button
-                  className="atlas-agent-card atlas-agent-card--action atlas-agent-card--orchestrate"
-                  onClick={handleOpenCustomOrchestration}
-                  disabled={isProcessing}
-                  title="编排数智员工"
-                >
-                  <span className="atlas-agent-card-glow" />
-                  <div className="atlas-agent-card-main">
-                    <span className="atlas-action-icon"><ApartmentOutlined /></span>
-                    <span className="atlas-agent-copy">
-                      <span className="atlas-agent-name">自定义编排</span>
-                      <span className="atlas-agent-role">Canvas · Relay · Template</span>
-                    </span>
-                  </div>
-                  <div className="atlas-agent-description">拖拽员工节点，配置角色、Skill、输出类型与失败策略。</div>
-                  <div className="atlas-agent-skill-row">
-                    <span className="atlas-agent-skill">orchestration</span>
-                    <span className="atlas-agent-skill">canvas</span>
-                  </div>
-                </button>
-                <button
-                  className="atlas-agent-card atlas-agent-card--action atlas-agent-card--template"
-                  onClick={handleOpenTemplateLibrary}
-                  disabled={isProcessing}
-                  title="编排模板库"
-                  data-collab-template-trigger="true"
-                >
-                  <span className="atlas-agent-card-glow" />
-                  <div className="atlas-agent-card-main">
-                    <span className="atlas-action-icon"><HistoryOutlined /></span>
-                    <span className="atlas-agent-copy">
-                      <span className="atlas-agent-name">模板库</span>
-                      <span className="atlas-agent-role">Multi-agent Demos</span>
-                    </span>
-                  </div>
-                  <div className="atlas-agent-description">从经营分析、合同评审、市场方案等固定编排快速开始。</div>
-                  <div className="atlas-agent-skill-row">
-                    <span className="atlas-agent-skill">5 demos</span>
-                    <span className="atlas-agent-skill">relay</span>
-                  </div>
-                </button>
+                <div className="atlas-war-room-launch">
+                  <button
+                    className="atlas-agent-card atlas-agent-card--action"
+                    onClick={() => {
+                      setHomeConversationRailOpen(false);
+                      setWarRoomMenuOpen((v) => !v);
+                    }}
+                    disabled={activeIsProcessing}
+                    title="新建对话或作战室"
+                  >
+                    <span className="atlas-agent-card-glow" />
+                    <div className="atlas-agent-card-main">
+                      <span className="atlas-action-icon"><IconUsers size={20} /></span>
+                      <span className="atlas-agent-copy">
+                        <span className="atlas-agent-name">创建会话</span>
+                        <span className="atlas-agent-role">单聊 · 作战室 · 方案</span>
+                      </span>
+                    </div>
+                    <div className="atlas-agent-description">选择单聊、作战室，或从协作方案创建任务。</div>
+                    <div className="atlas-agent-skill-row">
+                      <span className="atlas-agent-skill">chat</span>
+                      <span className="atlas-agent-skill">relay</span>
+                    </div>
+                  </button>
+                  {warRoomMenuOpen && (
+                    <div className="atlas-war-room-menu" role="menu">
+                      <button type="button" onClick={handleWarRoomMenuSingle}>
+                        <strong>新建单聊</strong>
+                        <span>选择一个数智员工，进入专属会话。</span>
+                      </button>
+                      <button type="button" onClick={handleNewGroupConversation}>
+                        <strong>新建群聊 / 作战室</strong>
+                        <span>先开空作战室，再用 @ 选择多名员工接力。</span>
+                      </button>
+                      <button type="button" onClick={handleNewCollaborationPlan}>
+                        <strong>新建协作方案</strong>
+                        <span>打开画布编排员工节点，并保存为可复用方案。</span>
+                      </button>
+                      <button type="button" onClick={handleWarRoomMenuPlan}>
+                        <strong>从方案库创建</strong>
+                        <span>选择已保存方案，一键生成新的作战室。</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             </section>
           </div>
@@ -3147,62 +5517,161 @@ export default function CommandCenter() {
   const lastPetMessage = messages[messages.length - 1];
   const petAwakeSignal = [
     input.trim().length > 0 ? `input:${input.length}` : 'input:0',
-    isProcessing ? 'processing' : 'idle',
+    activeIsProcessing ? 'processing' : 'idle',
     `messages:${messages.length}`,
     `last:${lastPetMessage?.role ?? 'none'}:${lastPetMessage?.text?.length ?? 0}`,
   ].join('|');
+  const activeSessionMeta = activeSessionId ? sessionMetaById[activeSessionId] : undefined;
+  const latestUserTask = [...messages].reverse().find((m) => m.role === 'user' && m.text.trim())?.text || '';
+  const taskActivity = buildTaskActivity(activeSessionMeta, activeIsProcessing, latestUserTask, activeEmployee);
 
   return (
-    <div style={{ height: '100%', display: 'grid', gridTemplateColumns: 'var(--sider-width, 240px) 1fr var(--workspace-width, 280px)', overflow: 'hidden' }}>
+    <div className="atlas-command-center-layout" style={commandLayoutStyle}>
       {promptsModal}
       {templateLibraryModal}
 
       {/* ============================================================
           LEFT — Phase B 拆分:LeftAside (token --sider-width 控制宽度)
           ============================================================ */}
-      <LeftAside
-        conversations={conversations}
-        loading={loadingConvs}
-        activeId={activeSessionId}
-        onNew={handleNewConversation}
-        onNewGroup={handleNewGroupConversation}
-        onSelect={switchToConversation}
-        onDelete={handleDeleteConversation}
-        onPatch={handlePatchConversation}
-      />
+      <div className={`atlas-conversation-rail ${railPrefs.leftCollapsed ? 'is-collapsed' : ''}`}>
+        {railPrefs.leftCollapsed ? (
+          <button
+            type="button"
+            className="atlas-rail-collapsed-tab atlas-rail-collapsed-tab--left"
+            onClick={() => toggleCommandRail('left')}
+            aria-label="展开会话列表"
+            title="展开会话列表"
+          >
+            会话
+          </button>
+        ) : (
+          <>
+            <LeftAside
+              conversations={conversations}
+              loading={loadingConvs}
+              activeId={activeSessionId}
+              onNew={handleNewConversation}
+              onSelect={switchToConversation}
+              onDelete={handleDeleteConversation}
+              onPatch={handlePatchConversation}
+            />
+            <button
+              type="button"
+              className="atlas-rail-toggle atlas-rail-toggle--left"
+              onClick={() => toggleCommandRail('left')}
+              aria-label="收起会话列表"
+              title="收起会话列表"
+            >
+              ‹
+            </button>
+            <div
+              className="atlas-rail-resizer atlas-rail-resizer--left"
+              onPointerDown={(e) => beginCommandRailResize('left', e)}
+              onDoubleClick={() => resetCommandRailWidth('left')}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="拖拽调整会话列表宽度，双击恢复默认"
+              title="拖拽调整会话列表宽度，双击恢复默认"
+            />
+          </>
+        )}
+      </div>
 
       {/* ============================================================
           CENTER — Phase B 拆分:CenterMain (含 ChatHeader + messages + Composer)
           ============================================================ */}
-      <CenterMain
-        messages={messages}
-        isProcessing={isProcessing}
-        input={input} setInput={setInput}
-        pendingAttachments={pendingAttachments}
-        uploading={uploading}
-        onSend={handleSend}
-        onAbort={handleAbortCurrentRun}
-        onKeyDown={handleKeyDown}
-        onFileSelect={handleFileSelected}
-        onRemoveAttachment={removePendingAttachment}
-        reasoningEffort={reasoningEffort}
-        onReasoningEffortChange={setReasoningEffort}
-        relayChips={relayChips}
-        onRemoveRelay={handleRemoveRelay}
-        mentionEmployees={allEmployeesForMention}
-        mentionSelectedIds={relayEmployeeIds}
-        onMentionPick={handleMentionPick}
-        onMentionClose={() => {/* MentionPopover 通过 input 变化自动隐藏,这里 noop */}}
-        orbState={orbState}
-        headerStyle={headerStyle}
-        onStyleChange={handleStyleChange}
-        pet={pet}
-        onPetChange={handlePetChange}
-        petAwakeSignal={petAwakeSignal}
-        profile={getProfileMode()}
-        activeEmployee={activeEmployee}
-        onSwitchEmployee={() => { setAllEmployees(employeesCache); setShowSwitcher(true); }}
-      />
+      <div className="atlas-command-main">
+        <CenterMain
+          messages={messages}
+          artifacts={activeSessionMeta?.artifacts || []}
+          isProcessing={activeIsProcessing}
+          input={input} setInput={setInput}
+          pendingAttachments={pendingAttachments}
+          uploading={uploading}
+          onSend={handleSend}
+          onAbort={handleAbortCurrentRun}
+          onKeyDown={handleKeyDown}
+          onCompositionStart={handleCompositionStart}
+          onCompositionEnd={handleCompositionEnd}
+          onPasteUpload={handlePasteUpload}
+          onFileSelect={handleFileSelected}
+          onRemoveAttachment={removePendingAttachment}
+          reasoningEffort={reasoningEffort}
+          onReasoningEffortChange={setReasoningEffort}
+          relayChips={relayChips}
+          onRemoveRelay={handleRemoveRelay}
+	          mentionEmployees={allEmployeesForMention}
+	          mentionSelectedIds={relayEmployeeIds}
+	          onMentionPick={handleMentionPick}
+	          onMentionClose={handleMentionClose}
+	          composerPlaceholder={chatComposerPlaceholder}
+	          orbState={orbState}
+          headerStyle={headerStyle}
+          onStyleChange={handleStyleChange}
+          pet={pet}
+          onPetChange={handlePetChange}
+          petAwakeSignal={petAwakeSignal}
+          profile={getProfileMode()}
+          activeEmployee={activeEmployee}
+          onSwitchEmployee={() => { setAllEmployees(employeesCache); setShowSwitcher(true); }}
+          taskActivity={taskActivity}
+        />
+      </div>
+
+      <Modal
+        open={Boolean(runConflictDraft)}
+        title="当前会话仍在执行"
+        onCancel={() => setRunConflictDraft(null)}
+        footer={null}
+        width={520}
+      >
+        <div style={{ display: 'grid', gap: 14 }}>
+          <p style={{ margin: 0, color: 'var(--text-secondary)', lineHeight: 1.7 }}>
+            这条输入要如何处理？你可以排队等当前任务结束后继续执行，或停止当前任务并重新执行。
+          </p>
+          <div style={{
+            padding: 12,
+            borderRadius: 8,
+            background: 'var(--bg-secondary)',
+            border: '1px solid var(--border-subtle)',
+            color: 'var(--text-primary)',
+            lineHeight: 1.6,
+          }}>
+            {runConflictDraft?.text}
+          </div>
+          <Space wrap>
+            <Button type="primary" onClick={() => enqueueConflictDraft('queue')}>
+              排队执行
+            </Button>
+            <Button danger onClick={stopAndRerunConflictDraft}>
+              停止当前并重跑
+            </Button>
+          </Space>
+        </div>
+      </Modal>
+
+      {SHOW_GLOBAL_SESSION_TODOS && pendingGlobalTodos.length > 0 && (
+        <div className="atlas-session-todos-panel">
+          <div className="atlas-session-todos-head">
+            <strong>全局待办</strong>
+            <span>{pendingGlobalTodos.length} 项</span>
+          </div>
+          {pendingGlobalTodos.slice(0, 4).map((todo) => (
+            <div key={todo.id} className="atlas-session-todo-card">
+              <button type="button" className="atlas-session-todo-main" onClick={() => openTodoSession(todo)}>
+                <span>{todo.title}</span>
+                <small>{todo.detail || '打开会话处理'}</small>
+              </button>
+              {todo.type === 'approval' && (
+                <div className="atlas-session-todo-actions">
+                  <Button size="small" type="primary" onClick={() => approveTodo(todo, 'once')}>允许</Button>
+                  <Button size="small" danger onClick={() => approveTodo(todo, 'deny')}>拒绝</Button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
 
       {pendingApproval && (
         <div className="atlas-approval-panel">
@@ -3240,25 +5709,60 @@ export default function CommandCenter() {
       {/* ============================================================
           RIGHT — Phase B 拆分:RightAside (内部调 <DispatchPanel />)
           ============================================================ */}
-      <RightAside
-        tunnels={tunnels}
-        conclusions={conclusions}
-        files={files}
-        isProcessing={isProcessing}
-        messages={messages}
-        activeEmployee={activeEmployee}
-        activeSessionId={activeSessionId}
-        sessionMeta={activeSessionId ? sessionMetaById[activeSessionId] : undefined}
-        runQueue={runQueue}
-        onOpenRun={(sid) => handleSwitchConversation(sid)}
-        onResumeTask={handleResumeActiveTask}
-        onRecoverSession={recoverActiveSession}
-        onPatchTaskStatus={patchActiveTaskStatus}
-        onRefreshSummary={refreshActiveSummary}
-        onArchiveArtifact={archiveActiveArtifact}
-        onUpdateArtifact={updateActiveArtifact}
-        refreshingSummary={refreshingSummary}
-      />
+      <div className={`atlas-workspace-rail ${railPrefs.rightCollapsed ? 'is-collapsed' : ''}`}>
+        {railPrefs.rightCollapsed ? (
+          <button
+            type="button"
+            className="atlas-rail-collapsed-tab atlas-rail-collapsed-tab--right"
+            onClick={() => toggleCommandRail('right')}
+            aria-label="展开任务进展"
+            title="展开任务进展"
+          >
+            进展
+          </button>
+        ) : (
+          <>
+            <div
+              className="atlas-rail-resizer atlas-rail-resizer--right"
+              onPointerDown={(e) => beginCommandRailResize('right', e)}
+              onDoubleClick={() => resetCommandRailWidth('right')}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="拖拽调整右侧栏宽度，双击恢复默认"
+              title="拖拽调整右侧栏宽度，双击恢复默认"
+            />
+            <button
+              type="button"
+              className="atlas-rail-toggle atlas-rail-toggle--right"
+              onClick={() => toggleCommandRail('right')}
+              aria-label="收起任务进展"
+              title="收起任务进展"
+            >
+              ›
+            </button>
+            <RightAside
+              tunnels={tunnels}
+              conclusions={conclusions}
+              files={files}
+              isProcessing={activeIsProcessing}
+              messages={messages}
+              activeEmployee={activeEmployee}
+              activeSessionId={activeSessionId}
+              sessionMeta={activeSessionMeta}
+              runQueue={runQueue}
+              onOpenRun={(sid) => handleSwitchConversation(sid)}
+              onResumeTask={handleResumeActiveTask}
+              onRecoverSession={recoverActiveSession}
+              onOpenReplay={handleReplayEvents}
+              onPatchTaskStatus={patchActiveTaskStatus}
+              onRefreshSummary={refreshActiveSummary}
+              onArchiveArtifact={archiveActiveArtifact}
+              onUpdateArtifact={updateActiveArtifact}
+              refreshingSummary={refreshingSummary}
+            />
+          </>
+        )}
+      </div>
 
       {/* Phase 2 E：员工切换器 modal (war room 也用同一个) */}
       {showSwitcher && (
@@ -3283,59 +5787,8 @@ export default function CommandCenter() {
         </div>
       )}
 
-      {/* M4.3/M5: 可拖拽协作入口 Hub。默认只露一个按钮，展开后给 Replay 与模板库。 */}
-      <div
-        className={`atlas-canvas-hub ${canvasHubOpen ? 'is-open' : ''}`}
-        style={{ left: canvasHubPos.x, top: canvasHubPos.y }}
-      >
-        <button
-          className="atlas-canvas-hub-action atlas-canvas-hub-action--template"
-          onClick={() => { setCanvasHubOpen(false); void handleOpenTemplateLibrary(); }}
-          title="编排模板库"
-          aria-label="打开协作方案库"
-          data-collab-template-hub-action="true"
-          disabled={!canvasHubOpen}
-          aria-hidden={!canvasHubOpen}
-          tabIndex={canvasHubOpen ? 0 : -1}
-        >
-          <ApartmentOutlined />
-          <span>方案库</span>
-        </button>
-        <button
-          className="atlas-canvas-hub-action atlas-canvas-hub-action--replay"
-          onClick={() => { setCanvasHubOpen(false); void handleReplayEvents(); }}
-          title="事件流 Replay (M5)"
-          aria-label="回放当前会话事件流"
-          data-m5-replay-trigger="true"
-          disabled={!canvasHubOpen}
-          aria-hidden={!canvasHubOpen}
-          tabIndex={canvasHubOpen ? 0 : -1}
-        >
-          <HistoryOutlined />
-          <span>回放</span>
-        </button>
-        <button
-          ref={canvasBtnRef}
-          className="atlas-canvas-hub-main"
-          onPointerDown={handleCanvasHubPointerDown}
-          onPointerMove={handleCanvasHubPointerMove}
-          onPointerUp={handleCanvasHubPointerUp}
-          onPointerCancel={handleCanvasHubPointerUp}
-          onClick={() => { void handleCanvasHubMainClick(); }}
-          title={canvasHubOpen ? '打开协作画布；拖拽可移动' : '展开协作入口；拖拽可移动'}
-          data-m43-toggle="true"
-          data-m44-canvas-trigger="true"
-          aria-expanded={canvasHubOpen}
-          aria-label={canvasHubOpen ? '打开协作画布' : '展开协作入口'}
-        >
-          <ApartmentOutlined />
-          {canvasBadge.total > 0 && (
-            <span className="atlas-canvas-hub-badge" data-m44-canvas-badge>
-              {canvasBadge.done}/{canvasBadge.total}
-            </span>
-          )}
-        </button>
-      </div>
+      {collaborationCanvasLayer}
+      {canvasHubLayer}
 
       {false && <Modal
         title="协作方案库"
@@ -3461,7 +5914,7 @@ export default function CommandCenter() {
               节点执行
             </div>
             <div style={{ display: 'grid', gap: 8 }}>
-              {replayData.workflow_run.nodes.map((node: any) => (
+              {replayData?.workflow_run?.nodes.map((node: any) => (
                 <div key={node.id} style={{
                   padding: '10px 12px',
                   borderRadius: 10,
@@ -3760,18 +6213,25 @@ export default function CommandCenter() {
         )}
       </Modal>
 
-      {/* M4.3 + M4.4: 协作画布全屏 Modal — ref 暴露 imperative API 给 canvasApi */}
-      <Suspense fallback={null}>
-        <CollaborationCanvas
-          ref={canvasRef}
-          open={canvasOpen}
-          onClose={() => setCanvasOpen(false)}
-          // M4.5.1: 注入 conversationId + initialCanvasState (debounce 写后端 + 回访恢复)
-          conversationId={activeSessionId}
-          initialCanvasState={initialCanvasState}
-          sessionParticipants={canvasSessionParticipants}
-        />
-      </Suspense>
     </div>
   );
+}
+
+function isTaskDeliverableArtifact(a: any) {
+  const kind = String(a?.kind || '').toLowerCase();
+  const name = String(a?.name || '').toLowerCase();
+  const source = String(a?.source || '').toLowerCase();
+  const status = String(a?.status || '').toLowerCase();
+  const content = String(a?.content || '');
+  if (a?.source_path) return true;
+  if (status === 'final' || status === 'approved') return true;
+  if (source.includes('tool') || source.includes('path') || source.includes('file')) return true;
+  if (['html', 'md', 'markdown', 'json', 'csv', 'xlsx', 'docx', 'pptx', 'pdf', 'mermaid', 'mmd'].includes(kind)) return true;
+  if (/\.(html|md|markdown|json|csv|xlsx|docx|pptx|pdf|mmd)$/i.test(name)) return true;
+  const looksLikeReplyBackup = source === 'assistant' && /(?:回复|reply)-\d+\.(md|txt)$/i.test(name);
+  if (looksLikeReplyBackup) {
+    return /```(?:html|csv|json|mermaid)\b/i.test(content)
+      || /(?:交付物|终稿|报告已生成|文件已保存|保存到|下载|归档|HTML\s*PPT|投资尽调|管理层看板)/i.test(content);
+  }
+  return /(?:交付物|终稿|报告|看板|PPT|尽调)\.(md|txt)$/i.test(name);
 }

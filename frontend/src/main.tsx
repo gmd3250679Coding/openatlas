@@ -19,18 +19,36 @@ export const useTheme = () => useContext(ThemeContext);
 
 const STORAGE_KEY = 'atlas-theme';
 
-function Root() {
-  const [isDark, setIsDark] = useState<boolean>(() => {
+function readStoredTheme(): 'light' | 'dark' {
+  try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved === 'dark') return true;
-    if (saved === 'light') return false;
-    // Default: light (matches the Apple WWDC enterprise feel)
-    return false;
-  });
+    if (saved === 'dark' || saved === 'light') return saved;
+  } catch {
+    // Safari private browsing and restricted contexts can throw here.
+  }
+  return 'light';
+}
+
+function applyDocumentTheme(theme: 'light' | 'dark') {
+  document.documentElement.setAttribute('data-theme', theme);
+  document.documentElement.style.colorScheme = theme;
+}
+
+function persistTheme(theme: 'light' | 'dark') {
+  try {
+    localStorage.setItem(STORAGE_KEY, theme);
+  } catch {
+    // Non-persistent browsing should still render with the requested theme.
+  }
+}
+
+function Root() {
+  const [isDark, setIsDark] = useState<boolean>(() => readStoredTheme() === 'dark');
 
   useEffect(() => {
-    document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
-    localStorage.setItem(STORAGE_KEY, isDark ? 'dark' : 'light');
+    const theme = isDark ? 'dark' : 'light';
+    applyDocumentTheme(theme);
+    persistTheme(theme);
   }, [isDark]);
 
   const toggle = () => setIsDark(prev => !prev);

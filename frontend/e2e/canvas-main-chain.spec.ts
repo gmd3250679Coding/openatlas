@@ -31,9 +31,9 @@ async function loginApi(request: APIRequestContext) {
 
 async function loginUi(page: Page) {
   await page.goto('/login');
-  await page.getByPlaceholder('用户名').fill(EMAIL);
-  await page.getByPlaceholder('密码').fill(PASSWORD);
-  await page.getByRole('button', { name: /登\s*录/ }).click();
+  await page.locator('#atlas-auth_username').fill(EMAIL);
+  await page.locator('#atlas-auth_password').fill(PASSWORD);
+  await page.getByRole('button', { name: /进入 Atlas/ }).click();
   await expect(page).toHaveURL(/\/overview/);
 }
 
@@ -60,6 +60,95 @@ function writeReport(lines: string[]) {
 }
 
 test.describe('Collaboration canvas main chain', () => {
+  test('home workbench exposes conversation rail and collaboration plan entry points', async ({ page, request }) => {
+    test.setTimeout(120_000);
+    const token = await loginApi(request);
+    const cleanupSessions: string[] = [];
+    const cleanupTemplates: string[] = [];
+
+    try {
+      const [primary, relay] = await ensureEmployees(request, token);
+      const source = await api<any>(request, 'POST', '/sessions', token, {
+        employee_id: primary.id,
+        participant_ids: [relay.id],
+        title: `E2E Home Plan Source ${Date.now()}`,
+      });
+      cleanupSessions.push(source.id);
+      await api(request, 'PATCH', `/sessions/${source.id}/canvas-state`, token, {
+        version: 1,
+        nodes: [
+          { id: 'user', type: 'agent', position: { x: 0, y: 0 }, data: { role: 'user', label: '用户' } },
+          { id: `employee-${primary.id}`, type: 'agent', position: { x: 240, y: 0 }, data: { role: 'employee', label: primary.display_name, employeeId: primary.id, outputType: 'markdown' } },
+          { id: `employee-${relay.id}`, type: 'agent', position: { x: 480, y: 0 }, data: { role: 'employee', label: relay.display_name, employeeId: relay.id, outputType: 'markdown' } },
+        ],
+        edges: [
+          { id: 'e-user-primary', source: 'user', target: `employee-${primary.id}`, mode: 'relay' },
+          { id: 'e-primary-relay', source: `employee-${primary.id}`, target: `employee-${relay.id}`, mode: 'relay' },
+        ],
+      });
+
+      const planName = `E2E 首页协作方案 ${Date.now()}`;
+      const template = await api<any>(request, 'POST', `/sessions/${source.id}/save-template`, token, {
+        name: planName,
+        description: 'E2E verifies homepage plan entry points.',
+        category: 'e2e',
+        visibility: 'private',
+      });
+      cleanupTemplates.push(template.id);
+
+      await loginUi(page);
+      await page.goto('/overview');
+      await expect(page.getByRole('button', { name: '展开会话列表' })).toBeVisible();
+      await page.getByRole('button', { name: '展开会话栏' }).click();
+      await expect(page.getByRole('complementary').filter({ hasText: '会话' }).first()).toBeVisible();
+      await expect(page.getByRole('button', { name: '新建' })).toBeVisible();
+      await expect(page.getByRole('button', { name: '群聊' })).toBeVisible();
+      await page.getByRole('button', { name: '收起会话栏' }).click();
+
+      await page.getByRole('button', { name: /创建会话/ }).click();
+      await expect(page.getByRole('button', { name: /新建单聊/ })).toBeVisible();
+      await expect(page.getByRole('button', { name: /新建群聊 \/ 作战室/ })).toBeVisible();
+      await expect(page.getByRole('button', { name: /新建协作方案/ })).toBeVisible();
+      await expect(page.getByRole('button', { name: /从方案库创建/ })).toBeVisible();
+
+      await page.getByRole('button', { name: /从方案库创建/ }).click();
+      const templateDialog = page.getByRole('dialog', { name: '协作方案库' });
+      await expect(templateDialog).toBeVisible();
+      const card = page.locator('[data-collab-template-card]').filter({ hasText: planName });
+      await expect(card).toBeVisible();
+      const useResponse = page.waitForResponse((response) => (
+        response.url().includes(`/api/collaboration-templates/${template.id}/sessions`)
+        && response.request().method() === 'POST'
+      ));
+      await card.getByRole('button', { name: '使用方案创建作战室' }).click();
+      const createdFromTemplate = await (await useResponse).json();
+      cleanupSessions.push(createdFromTemplate.id);
+      await expect(page.getByText(`已载入协作方案「${planName}」`)).toBeVisible();
+      await expect(page.getByText('协作画布').first()).toBeVisible();
+      await expect(page.getByRole('button', { name: '保存为协作方案' })).toBeVisible();
+
+      await page.reload();
+      await expect(page).toHaveURL(/\/overview/);
+      await page.getByRole('button', { name: /创建会话/ }).click();
+      const draftResponse = page.waitForResponse((response) => (
+        response.url().endsWith('/api/sessions') && response.request().method() === 'POST'
+      ));
+      await page.getByRole('button', { name: /新建协作方案/ }).click();
+      const draft = await (await draftResponse).json();
+      cleanupSessions.push(draft.id);
+      await expect(page.getByText('已创建自定义编排草稿')).toBeVisible();
+      await expect(page.getByText('协作画布').first()).toBeVisible();
+      await expect(page.getByRole('button', { name: '保存为协作方案' })).toBeVisible();
+    } finally {
+      for (const tid of cleanupTemplates.reverse()) {
+        await api(request, 'DELETE', `/collaboration-templates/${tid}`, token).catch(() => undefined);
+      }
+      for (const sid of cleanupSessions.reverse()) {
+        await api(request, 'DELETE', `/sessions/${sid}`, token).catch(() => undefined);
+      }
+    }
+  });
+
   test('open hub, configure node, save reusable collaboration plan, and verify persistence', async ({ page, request }) => {
     test.setTimeout(120_000);
     const report: string[] = [
@@ -114,11 +203,11 @@ test.describe('Collaboration canvas main chain', () => {
 
     const planName = `E2E 协作方案 ${Date.now()}`;
     await page.getByRole('button', { name: '保存为协作方案' }).click();
-    const dialog = page.getByRole('dialog', { name: '保存为可复用协作方案' });
+    const dialog = page.getByRole('dialog', { name: '保存/另存为可复用协作方案' });
     await expect(dialog).toBeVisible();
     await dialog.getByPlaceholder('例如：标书评审三员工接力').fill(planName);
     await dialog.getByPlaceholder('说明这个编排适合复用在哪些场景').fill('E2E 验证协作画布保存为可复用方案。');
-    await dialog.getByRole('button', { name: '保存方案' }).click();
+    await dialog.getByRole('button', { name: '保存为方案' }).click();
     await expect(dialog).toBeHidden({ timeout: 15_000 });
 
     await expect.poll(async () => {

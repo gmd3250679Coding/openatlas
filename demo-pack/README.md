@@ -21,8 +21,8 @@ demo-pack/
 ## 初始化
 
 ```bash
-cd /Users/macbook/Desktop/Atlasagent/openatlas
-OPENATLAS_API_BASE=http://127.0.0.1:58103/api \
+cd /path/to/openatlas
+OPENATLAS_API_BASE=http://127.0.0.1:58003/api \
 python3 backend/scripts/seed_product_demo.py
 ```
 
@@ -31,16 +31,16 @@ python3 backend/scripts/seed_product_demo.py
 如果本地 demo 租户里残留了 smoke/e2e/zip-test 技能或旧模板, 使用显式 cleanup 模式整理。默认 seed 不会删除或归档已有内容。
 
 ```bash
-cd /Users/macbook/Desktop/Atlasagent/openatlas
-OPENATLAS_API_BASE=http://127.0.0.1:58103/api \
+cd /path/to/openatlas
+OPENATLAS_API_BASE=http://127.0.0.1:58003/api \
 OPENATLAS_DEMO_CLEANUP=1 \
 python3 backend/scripts/seed_product_demo.py
 ```
 
 ## 推荐演示顺序
 
-1. 工作台: 选择“财务经营分析师”, 上传 `channel-q2-brief.docx` 和 `sales-pipeline-q2.csv`。
-2. 用 `docs/product/DEMO-RUNBOOK.md` 中 Demo 1 的提示词发起群聊接力。
+1. 工作台: 选择“投资研究分析师”, 上传一份简短尽调材料, 生成 HTML 投资尽调摘要。
+2. 模板库: 选择“A股投资尽调作战室”, 跑三员工短接力, 验证投资研究、财务、市场员工分工。
 3. 打开右侧“证据”, 证明本轮注入了文件、Skill、记忆。
 4. 打开右侧“总结”, 生成总结, 下载并归档交付物。
 5. 进入技能市场和 Dashboard, 展示 Skill 可管、Runtime 健康和审计能力。

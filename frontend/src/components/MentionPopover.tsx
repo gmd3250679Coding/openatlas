@@ -56,15 +56,14 @@ export default function MentionPopover({
       const deptName = e.department?.name ?? '';
       const haystack = `${e.name} ${deptName}`.toLowerCase();
       return haystack.includes(q);
-    })
-    .slice(0, 6);  // 最多 6 个候选
+    });
 
   if (filtered.length === 0) return null;
 
   return (
     <div className="mention-popover" role="listbox" onMouseDown={e => e.preventDefault()}>
       <div className="mention-popover-header">
-        <span>选择员工加入群聊</span>
+        <span>选择员工加入对话 · {filtered.length} 位可用</span>
         <button className="mention-popover-close" onClick={onClose} title="关闭">×</button>
       </div>
       {filtered.map(emp => {

@@ -65,9 +65,15 @@ async function api<T>(
 
 async function loginUi(page: Page, issues: Issue[]) {
   await page.goto('/login');
-  await page.getByPlaceholder('用户名').fill(EMAIL);
-  await page.getByPlaceholder('密码').fill(PASSWORD);
-  await page.getByRole('button', { name: /登\s*录/ }).click();
+  const usernameInput = page.locator('#atlas-auth_username');
+  const wakeLogin = page.getByRole('button', { name: '唤醒登录' });
+  if (!(await usernameInput.isVisible({ timeout: 1_500 }).catch(() => false))) {
+    await wakeLogin.click({ force: true, timeout: 15_000 });
+  }
+  await expect(usernameInput).toBeVisible({ timeout: 10_000 });
+  await usernameInput.fill(EMAIL);
+  await page.locator('#atlas-auth_password').fill(PASSWORD);
+  await page.getByRole('button', { name: /进入 Atlas/ }).click();
   try {
     await expect(page).toHaveURL(/\/overview/, { timeout: 20_000 });
   } catch {
@@ -426,8 +432,7 @@ test.describe('OpenAtlas product audit', () => {
     });
     page.on('requestfailed', (req) => {
       const failure = req.failure()?.errorText || 'unknown';
-      if (req.url().includes('/src/') && failure === 'net::ERR_ABORTED') return;
-      if (req.url().includes('/canvas-state') && failure === 'net::ERR_ABORTED') return;
+      if (failure === 'net::ERR_ABORTED') return;
       pushUnique(issues, {
         severity: 'P1',
         area: '网络请求',

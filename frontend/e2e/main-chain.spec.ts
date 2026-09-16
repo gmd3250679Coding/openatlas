@@ -26,16 +26,17 @@ async function loginApi(request: APIRequestContext) {
 
 async function ensureEmployees(request: APIRequestContext, token: string) {
   const current = await api<{ items: any[] }>(request, 'GET', '/employees', token);
-  if (current.items.length >= 2) return current.items.slice(0, 2);
-  const created = [...current.items];
+  const existing = current.items.filter((item: any) => String(item.display_name || '').startsWith('E2E Stable Employee'));
+  if (existing.length >= 2) return existing.slice(0, 2);
+  const created = [...existing];
   while (created.length < 2) {
     const suffix = Date.now().toString().slice(-6) + created.length;
     created.push(await api<any>(request, 'POST', '/employees', token, {
-      display_name: `E2E Employee ${suffix}`,
+      display_name: `E2E Stable Employee ${suffix}`,
       avatar: created.length === 0 ? 'E' : 'R',
-      description: 'Playwright E2E employee',
-      system_prompt: 'You are a concise E2E employee.',
-      toolsets: ['hermes-cli'],
+      description: 'Playwright-owned deterministic employee for core UI regression.',
+      system_prompt: 'You are a concise E2E employee. Answer directly from the provided conversation and uploaded file context.',
+      toolsets: [],
     }));
   }
   return created.slice(0, 2);
@@ -43,9 +44,15 @@ async function ensureEmployees(request: APIRequestContext, token: string) {
 
 async function loginUi(page: Page) {
   await page.goto('/login');
-  await page.getByPlaceholder('用户名').fill(EMAIL);
-  await page.getByPlaceholder('密码').fill(PASSWORD);
-  await page.getByRole('button', { name: /登\s*录/ }).click();
+  const usernameInput = page.locator('#atlas-auth_username');
+  const wakeLogin = page.getByRole('button', { name: '唤醒登录' });
+  if (!(await usernameInput.isVisible({ timeout: 1_500 }).catch(() => false))) {
+    await wakeLogin.click({ force: true, timeout: 15_000 });
+  }
+  await expect(usernameInput).toBeVisible({ timeout: 10_000 });
+  await usernameInput.fill(EMAIL);
+  await page.locator('#atlas-auth_password').fill(PASSWORD);
+  await page.getByRole('button', { name: /进入 Atlas/ }).click();
   await expect(page).toHaveURL(/\/overview/);
 }
 
@@ -70,6 +77,20 @@ async function createTemplate(request: APIRequestContext, token: string, employe
   });
 }
 
+async function createBindableSkill(request: APIRequestContext, token: string) {
+  const suffix = Date.now().toString(36);
+  return api<any>(request, 'POST', '/skill-market', token, {
+    name: `E2E Bindable Skill ${suffix}`,
+    slug: `e2e-bindable-skill-${suffix}`,
+    description: 'Playwright-owned fixture skill for employee binding regression.',
+    category: 'e2e',
+    version: '1.0.0',
+    scope: 'tenant',
+    visibility: 'tenant',
+    mutable: true,
+  });
+}
+
 test.describe('OpenAtlas main chain', () => {
   test('login, workbench message, DOCX upload, history restore, group relay, Skill binding, template reuse', async ({ page, request }) => {
     test.setTimeout(180_000);
@@ -83,11 +104,12 @@ test.describe('OpenAtlas main chain', () => {
       const [primary, relay] = await ensureEmployees(request, token);
       const template = await createTemplate(request, token, primary);
       cleanupTemplates.push(template.id);
+      const bindableSkill = await createBindableSkill(request, token);
 
       await loginUi(page);
 
       await page.goto(`/overview?employee=${primary.id}`);
-      const workbenchComposer = page.getByPlaceholder('跟 Atlas 说点什么…');
+      const workbenchComposer = page.getByPlaceholder(/输入需求|跟 Atlas 说点什么|给 .+ 发任务/).first();
       await expect(workbenchComposer).toBeVisible();
 
       const docx = Buffer.from(DOCX_BASE64, 'base64');
@@ -159,7 +181,14 @@ test.describe('OpenAtlas main chain', () => {
       await expect(page.getByText(primary.display_name).first()).toBeVisible();
       const beforeBindings = await api<{ items: any[] }>(request, 'GET', `/skill-bindings?target_type=employee&target_id=${primary.id}`, token);
       await page.getByRole('button', { name: '绑定 Skill' }).click();
-      await page.getByRole('dialog', { name: '绑定市场 Skill' }).getByRole('button', { name: /绑\s*定/ }).click();
+      const bindDialog = page.getByRole('dialog', { name: '绑定市场 Skill' });
+      await expect(bindDialog).toBeVisible();
+      await bindDialog.locator('.ant-select').first().click({ force: true });
+      await bindDialog.locator('input[aria-label="选择 Skill"]').fill(bindableSkill.name, { force: true });
+      const skillOption = page.locator('.ant-select-item-option-content').filter({ hasText: bindableSkill.name }).first();
+      await expect(skillOption).toBeVisible({ timeout: 15_000 });
+      await skillOption.click();
+      await bindDialog.getByRole('button', { name: /绑\s*定/ }).click();
       await expect.poll(async () => {
         const after = await api<{ items: any[] }>(request, 'GET', `/skill-bindings?target_type=employee&target_id=${primary.id}`, token);
         return after.items.length;

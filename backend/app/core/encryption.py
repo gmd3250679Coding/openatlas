@@ -24,12 +24,14 @@ from typing import Optional
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from app.core.config import DATA_DIR
+
 # All encrypted values are prefixed so we can distinguish from plaintext
 # (needed for one-shot migration of legacy rows).
 _PREFIX = "fernet:v1:"
 
 _KEY_PATH = Path(
-    os.environ.get("OPENATLAS_SECRETS_KEY_PATH", "/Users/macbook/.openatlas/backend-data/secrets.key")
+    os.environ.get("OPENATLAS_SECRETS_KEY_PATH", str(DATA_DIR / "secrets.key"))
 )
 _KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
 

@@ -1,190 +1,295 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Form, Input, Button, message } from 'antd';
-import { UserOutlined, LockOutlined } from '@ant-design/icons';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { Form, Input, Button, message, Select } from 'antd';
+import { ApartmentOutlined, LockOutlined, UserOutlined } from '@ant-design/icons';
 import { useAuth } from '../contexts/AuthContext';
 
-/* ── Styles ── */
+type AuthMode = 'login' | 'register';
+type AuthEntrance = 'landing' | 'credentials';
+type PetSpec = { src: string; large?: boolean };
 
-const styles: Record<string, React.CSSProperties> = {
-  wrapper: {
-    minHeight: '100vh',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    background: '#1a1a2e',
-    position: 'relative',
-    overflow: 'hidden',
-  },
-  glowTop: {
-    position: 'absolute',
-    top: '-30%',
-    left: '-10%',
-    width: '600px',
-    height: '600px',
-    borderRadius: '50%',
-    background: 'radial-gradient(circle, rgba(79,70,229,0.15) 0%, transparent 70%)',
-    pointerEvents: 'none',
-  },
-  glowBottom: {
-    position: 'absolute',
-    bottom: '-20%',
-    right: '-10%',
-    width: '500px',
-    height: '500px',
-    borderRadius: '50%',
-    background: 'radial-gradient(circle, rgba(139,127,232,0.10) 0%, transparent 70%)',
-    pointerEvents: 'none',
-  },
-  card: {
-    position: 'relative',
-    zIndex: 1,
-    width: 400,
-    padding: '48px 40px',
-    borderRadius: 16,
-    background: 'rgba(22, 33, 62, 0.65)',
-    backdropFilter: 'blur(24px)',
-    WebkitBackdropFilter: 'blur(24px)',
-    border: '1px solid rgba(255,255,255,0.08)',
-    boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
-  },
-  brand: {
-    textAlign: 'center' as const,
-    marginBottom: 40,
-  },
-  logo: {
-    fontSize: 36,
-    fontWeight: 700,
-    color: '#F5F5F7',
-    letterSpacing: 4,
-    margin: 0,
-    fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif',
-  },
-  subtitle: {
-    fontSize: 14,
-    color: '#98989E',
-    marginTop: 8,
-    letterSpacing: 2,
-    fontWeight: 400,
-  },
-  input: {
-    background: 'rgba(255,255,255,0.06)',
-    border: '1px solid rgba(255,255,255,0.10)',
-    borderRadius: 8,
-    height: 44,
-    color: '#F5F5F7',
-  },
-  button: {
-    width: '100%',
-    height: 44,
-    borderRadius: 8,
-    fontSize: 15,
-    fontWeight: 600,
-    background: 'linear-gradient(135deg, #4F46E5 0%, #8B7FE8 100%)',
-    border: 'none',
-    marginTop: 8,
-  },
-  error: {
-    textAlign: 'center' as const,
-    color: '#F87171',
-    fontSize: 13,
-    marginBottom: 16,
-    minHeight: 20,
-  },
-  demoHint: {
-    marginTop: 16,
-    textAlign: 'center' as const,
-    color: '#B6B6C2',
-    fontSize: 12,
-    lineHeight: 1.6,
-  },
-};
+const PET_BASE = '/assets/marmot-pet';
+const statePet = (name: string) => `${PET_BASE}/e_pet_v2_state_${name}.svg`;
+const animPet = (name: string) => `${PET_BASE}/v2_animation_states/transparent/e_pet_v2_anim_transparent_${name}.webp`;
 
-/* ── Component ── */
+const paradeRows: PetSpec[][] = [
+  [
+    { src: animPet('programmer'), large: true },
+    { src: animPet('document') },
+    { src: animPet('phd'), large: true },
+    { src: animPet('writer') },
+    { src: animPet('artist'), large: true },
+    { src: animPet('lecturer') },
+  ],
+  [
+    { src: animPet('writer') },
+    { src: animPet('artist'), large: true },
+    { src: animPet('lecturer') },
+    { src: animPet('programmer') },
+    { src: animPet('document'), large: true },
+    { src: animPet('phd') },
+  ],
+  [
+    { src: statePet('thinking') },
+    { src: statePet('money'), large: true },
+    { src: statePet('lovestruck') },
+    { src: statePet('talking_a'), large: true },
+    { src: statePet('blink') },
+    { src: statePet('happy') },
+  ],
+  [
+    { src: animPet('writer'), large: true },
+    { src: animPet('artist'), large: true },
+    { src: animPet('lecturer'), large: false },
+    { src: animPet('document') },
+    { src: animPet('phd'), large: true },
+    { src: animPet('programmer'), large: false },
+  ],
+  [
+    { src: statePet('sleeping') },
+    { src: statePet('thinking'), large: true },
+    { src: statePet('talking_b') },
+    { src: statePet('happy'), large: true },
+    { src: statePet('money') },
+    { src: statePet('breathing'), large: true },
+  ],
+];
+
+const tenantOptions = [
+  { value: 'demo', label: 'Demo Tenant' },
+];
+
+const TRIAL_GUIDE_PATH = '/openatlas-trial-guide-20260621/';
+
+function friendlyAuthError(err: unknown, mode: AuthMode) {
+  const raw = err && typeof err === 'object' && 'message' in err
+    ? String((err as { message?: string }).message || '')
+    : String(err || '');
+  const lower = raw.toLowerCase();
+  if (/api 暂时不可达|failed to fetch|load failed|networkerror|network request failed/.test(lower)) {
+    return '暂时连接不上 OpenAtlas 服务。请确认后端已启动，并使用可访问入口访问；如果当前是腾讯云域名被拦截，请先用公网 IP。';
+  }
+  if (/api 401|unauthorized|invalid credentials/.test(lower)) {
+    return '账号或密码不正确，请检查后重试。';
+  }
+  if (/api 403|user disabled/.test(lower)) {
+    return '该账号当前不可用，请联系管理员确认权限或账号状态。';
+  }
+  if (/api 409|already exists|duplicate|已注册/.test(lower)) {
+    return '该用户名或邮箱已注册，请直接登录或换一个账号。';
+  }
+  return mode === 'register' ? '注册失败，请换一个用户名或邮箱后重试。' : '登录失败，请检查用户名、密码和企业空间。';
+}
 
 export default function LoginPage() {
+  const [mode, setMode] = useState<AuthMode>('login');
+  const location = useLocation();
+  const returnPath = typeof location.state?.from === 'string' && location.state.from.startsWith('/')
+    ? location.state.from
+    : '/overview';
+  const [authEntrance, setAuthEntrance] = useState<AuthEntrance>(returnPath === '/overview' ? 'landing' : 'credentials');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const { login } = useAuth();
+  const { login, register } = useAuth();
   const navigate = useNavigate();
   const [messageApi, contextHolder] = message.useMessage();
 
-  const onFinish = async (values: { username: string; password: string }) => {
+  const onFinish = async (values: { username: string; password: string; tenant?: string }) => {
     setError('');
     setLoading(true);
+    const username = String(values.username || '').trim();
+    const password = String(values.password || '');
     try {
-      await login(values.username, values.password);
-      messageApi.success('登录成功');
-      navigate('/overview', { replace: true });
-    } catch (err: any) {
-      const msg = err?.message || '登录失败，请检查用户名和密码';
-      setError(msg);
+      if (mode === 'register') {
+        await register(username, password);
+        messageApi.success('注册成功，已进入工作台');
+      } else {
+        await login(username, password);
+        messageApi.success('登录成功');
+      }
+      navigate(returnPath, { replace: true });
+    } catch (err: unknown) {
+      setError(friendlyAuthError(err, mode));
     } finally {
       setLoading(false);
     }
   };
 
+  const isRegister = mode === 'register';
+  const awaken = () => setAuthEntrance('credentials');
+
   return (
-    <div style={styles.wrapper}>
-      <div style={styles.glowTop} />
-      <div style={styles.glowBottom} />
+    <div className={`atlas-auth-page ${authEntrance === 'credentials' ? 'is-login' : 'is-landing'}`}>
       {contextHolder}
-      <div style={styles.card}>
-        <div style={styles.brand}>
-          <h1 style={styles.logo}>ATLAS</h1>
-          <p style={styles.subtitle}>企业数智劳动力总调度</p>
-        </div>
-
-        <div style={styles.error}>{error}</div>
-
-        <Form
-          name="login"
-          onFinish={onFinish}
-          autoComplete="on"
-          layout="vertical"
-          requiredMark={false}
-        >
-          <Form.Item
-            name="username"
-            rules={[{ required: true, message: '请输入用户名' }]}
-          >
-            <Input
-              prefix={<UserOutlined style={{ color: '#6E6E73' }} />}
-              placeholder="用户名"
-              autoComplete="username"
-              style={styles.input}
-              size="large"
-            />
-          </Form.Item>
-
-          <Form.Item
-            name="password"
-            rules={[{ required: true, message: '请输入密码' }]}
-          >
-            <Input.Password
-              prefix={<LockOutlined style={{ color: '#6E6E73' }} />}
-              placeholder="密码"
-              autoComplete="current-password"
-              style={styles.input}
-              size="large"
-            />
-          </Form.Item>
-
-          <Form.Item style={{ marginBottom: 0 }}>
-            <Button
-              type="primary"
-              htmlType="submit"
-              loading={loading}
-              style={styles.button}
-            >
-              {loading ? '登录中...' : '登录'}
-            </Button>
-          </Form.Item>
-        </Form>
-        <div style={styles.demoHint}>
-          演示账号 admin@demo.openatlas / openatlas
-        </div>
+      <div className="atlas-auth-bg">
+        <div className="atlas-auth-grid" />
       </div>
+      <a
+        className="atlas-auth-guide-link"
+        href={TRIAL_GUIDE_PATH}
+        aria-label="打开 OpenAtlas 试用文档"
+      >
+        试用文档
+      </a>
+
+      {authEntrance === 'landing' ? (
+        <section
+          className="atlas-auth-landing-stage"
+          data-testid="auth-wake-login"
+          onClick={awaken}
+          onPointerUp={awaken}
+          onMouseUp={awaken}
+        >
+          <div className="atlas-auth-moon" aria-hidden="true" />
+          <div className="atlas-auth-moon-glow" aria-hidden="true" />
+          <section className="atlas-auth-marmot-desk" aria-hidden="true">
+            <img
+              className="atlas-auth-marmot"
+              src={statePet('sleeping')}
+              alt=""
+            />
+          </section>
+          <section className="atlas-auth-landing-copy">
+            <h2>编排、协作、交付</h2>
+            <p>高效管理数智团队，精准交付业务结果</p>
+            <button
+              type="button"
+              className="atlas-auth-enter-tip"
+              onClick={(event) => {
+                event.stopPropagation();
+                awaken();
+              }}
+              aria-label="唤醒登录"
+            >
+              点击任意处唤醒并登录
+            </button>
+          </section>
+        </section>
+      ) : (
+        <div className="atlas-auth-login-stage">
+          <div className="atlas-auth-login-parade-wrap" aria-hidden="true">
+            <div className="atlas-auth-parade" aria-hidden="true">
+              {paradeRows.map((row, rowIndex) => (
+                <div
+                  key={`row-${rowIndex}`}
+                  className={`atlas-auth-pet-lane ${rowIndex % 2 === 0 ? 'lane-left' : 'lane-right'}`}
+                >
+                  <div className="atlas-auth-pet-track">
+                    {[...row, ...row].map((pet, index) => (
+                      <span
+                        className={`atlas-auth-pet ${pet.large || index % 3 === 1 ? 'is-large' : ''}`}
+                        key={`${pet.src}-${index}`}
+                      >
+                        <img src={pet.src} alt="" />
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="atlas-auth-pet-ghost" aria-hidden="true">
+              <img src={statePet('thinking')} alt="" />
+            </div>
+          </div>
+          <div className="atlas-auth-orb" />
+          <section className="atlas-auth-hero atlas-auth-hero-hidden" aria-label="Atlas 登录">
+            <div className="atlas-auth-copy">
+              <h2>编排、协作、交付</h2>
+              <p>高效管理数智团队，精准交付业务结果</p>
+            </div>
+          </section>
+          <section className="atlas-auth-card-shell atlas-auth-card-shell-login" aria-label={isRegister ? '注册' : '登录'}>
+            <div className="atlas-auth-card">
+              <div className="atlas-auth-tabs">
+                <button
+                  type="button"
+                  className={mode === 'login' ? 'active' : ''}
+                  onClick={() => { setMode('login'); setError(''); }}
+                >
+                  登录
+                </button>
+                <button
+                  type="button"
+                  className={mode === 'register' ? 'active' : ''}
+                  onClick={() => { setMode('register'); setError(''); }}
+                >
+                  开放注册
+                </button>
+              </div>
+
+              <div className="atlas-auth-error">{error}</div>
+
+              <Form
+                name="atlas-auth"
+                onFinish={onFinish}
+                autoComplete="on"
+                layout="vertical"
+                requiredMark={false}
+                initialValues={{ tenant: 'demo' }}
+              >
+                <Form.Item
+                  name="tenant"
+                  label="企业空间"
+                  rules={[{ required: true, message: '请选择企业空间' }]}
+                >
+                  <Select
+                    className="atlas-auth-tenant-select"
+                    classNames={{ popup: { root: 'atlas-auth-tenant-popup' } }}
+                    prefix={<ApartmentOutlined />}
+                    size="large"
+                    options={tenantOptions}
+                  />
+                </Form.Item>
+
+                <Form.Item
+                  name="username"
+                  label="用户名 / 邮箱"
+                  rules={[{ required: true, message: '请输入用户名' }]}
+                >
+	                  <Input
+	                    id="atlas-auth_username"
+	                    prefix={<UserOutlined />}
+	                    placeholder="demo@demo.openatlas"
+                    autoComplete="username"
+                    size="large"
+                  />
+                </Form.Item>
+
+                <Form.Item
+                  name="password"
+                  label="密码"
+                  rules={[
+                    { required: true, message: '请输入密码' },
+                    { min: 4, message: '密码至少 4 位' },
+                  ]}
+                >
+                  <Input.Password
+                    id="atlas-auth_password"
+                    prefix={<LockOutlined />}
+                    placeholder="openatlas"
+                    autoComplete={isRegister ? 'new-password' : 'current-password'}
+                    size="large"
+                  />
+                </Form.Item>
+
+                <Button
+                  type="primary"
+                  htmlType="submit"
+                  loading={loading}
+                  className="atlas-auth-submit"
+                >
+                  {loading ? (isRegister ? '注册中...' : '登录中...') : (isRegister ? '注册并进入 Atlas' : '进入 Atlas')}
+                </Button>
+              </Form>
+
+	              <div className="atlas-auth-footnote">
+	                <span>演示账号</span>
+	                <strong>demo@demo.openatlas / openatlas</strong>
+	              </div>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

@@ -204,15 +204,19 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         chat_score += 2
     if grep(cmd, r"approval_required|pendingApproval|仅本次允许"):
         chat_score += 5
-    if grep(right, r"会话健康|补同步 / 恢复会话|输出物"):
+    if grep(right, r"会话健康|同步最新结果|输出物"):
         chat_score += 4
+    if grep(app_py, r"_session_progress_snapshot|phase_label|recovery_hint") and grep(right, r"当前任务驾驶舱|最近执行轨迹|原始任务"):
+        chat_score += 3
+    if grep("frontend/e2e/power-user-audit.spec.ts", r"power-long-task|openatlas.run_idle|workflow_checkpoints"):
+        chat_score += 2
     dimensions.append({
         "name": "主聊天链路",
         "weight": 15,
-        "score": cap(chat_score, 87),
-        "judgement": "单员工、文件、Skill、群聊接力和恢复入口已可用；已补会话运行状态机，但长任务续跑还需更多真实样本。",
+        "score": cap(chat_score, 90),
+        "judgement": "单员工、文件、Skill、群聊接力、任务驾驶舱和恢复入口已可用；长任务样本已进入回归，但真实 30 分钟业务样本仍需继续沉淀。",
         "evidence": ["main-chain E2E 覆盖登录、附件、历史、群聊、Skill、模板", "SessionRun 已记录 running/completed/waiting 等状态"],
-        "gaps": ["缺少长任务分段续跑与明确任务检查点", "审批状态机已起步，但还缺高危工具固定回归夹具"],
+        "gaps": ["真实 30 分钟多工具业务样本还不够多", "审批状态机已起步，但还缺高危工具固定回归夹具"],
     })
 
     hermes_score = 58
@@ -228,7 +232,7 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         "score": cap(hermes_score, 82),
         "judgement": "Gateway、Run Events、Skills、审批和工具事件都接进来了；但仍需要更强的 Hermes 行为兜底和事件一致性验证。",
         "evidence": [f"capabilities: {evidence['capability_features']}"],
-        "gaps": ["缺少真实高危工具审批的固定回归样例", "Run Events 空窗后的后台补同步还需要更多业务样本验证"],
+        "gaps": ["缺少真实高危工具审批的固定回归样例", "Run Events 空窗后的后台自动同步还需要更多业务样本验证"],
     })
 
     file_score = 60
@@ -304,13 +308,14 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     stability_score += 2 if grep("backend/scripts/api_smoke.py", r"workflow-nodes|node_action") else 0
     stability_score += 2 if grep("backend/scripts/api_smoke.py", r"workflow-steps|step_action_route") and grep(app_py, r"workflow_step_action") else 0
     stability_score += 3 if grep("backend/scripts/api_smoke.py", r"step_count|checkpoint_count|checkpoint_resume") and grep(app_py, r"status=\"stalled\"|checkpoint_type=\"stalled\"") else 0
+    stability_score += 3 if grep("backend/scripts/api_smoke.py", r"progress_phase|progress_actions") and grep("frontend/e2e/power-user-audit.spec.ts", r"后台处理中|同步最新|power-long-task") else 0
     dimensions.append({
         "name": "稳定性/鲁棒性",
         "weight": 13,
-        "score": cap(stability_score, 89),
-        "judgement": "自动化、隔离、健康检查、补同步和运行状态落库已经是明显进步；但异常矩阵和高危审批回归仍不够厚。",
+        "score": cap(stability_score, 91),
+        "judgement": "自动化、隔离、健康检查、后台自动同步、运行状态落库和长任务夹具已经明显增强；但异常矩阵和高危审批回归仍要继续加厚。",
         "evidence": [f"product audit issues: {product_issues}", f"power audit issues: {power_issues}"],
-        "gaps": ["缺少 chaos/fault injection", "缺少真实长任务多轮连续样本和高危工具授权回归夹具"],
+        "gaps": ["缺少 chaos/fault injection", "缺少高危工具授权固定回归夹具和更多真实长任务连续样本"],
     })
 
     ux_score = 58
@@ -320,11 +325,12 @@ def build_scores(token: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     ux_score += 3 if grep(right, r"当前会话进展|本轮上下文|输出物|员工详情") else 0
     ux_score += 2 if grep(cmd, r"协作执行回放|节点执行|任务运行状态") else 0
     ux_score += 2 if grep(cmd, r"从此继续|重试节点") and grep(right, r"标记为终稿|重命名交付物") else 0
+    ux_score += 4 if grep(right, r"当前任务驾驶舱|最近执行轨迹|原始任务|打开回放") and grep("frontend/e2e/power-user-audit.spec.ts", r"当前会话进展|长任务心智|长任务恢复") else 0
     dimensions.append({
         "name": "产品体验",
         "weight": 5,
-        "score": cap(ux_score, 79),
-        "judgement": "首页、右侧栏、画布、宠物和 Dock 有记忆点；协作回放增强了任务可解释性，但高级用户效率还没完全收敛。",
+        "score": cap(ux_score, 84),
+        "judgement": "首页、右侧栏、画布、宠物和 Dock 有记忆点；任务驾驶舱把进展、上下文、交付物、回放恢复串得更清楚，但高级用户效率还可继续收敛。",
         "evidence": ["产品巡检和重度用户巡检未发现规则内 P0/P1"],
         "gaps": ["需要更多真实用户任务走查", "首页、历史、工作区、任务队列的心智还需持续统一"],
     })

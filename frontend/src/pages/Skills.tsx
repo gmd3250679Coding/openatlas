@@ -79,14 +79,30 @@ export default function Skills() {
     const rawId = e.__id || String(e.id);
     return e.display_name || e.name || rawId.slice(0, 6);
   };
+  const enabledCount = skills.filter((s) => s.status === 'enabled').length;
+  const hermesCount = skills.filter((s) => String((s as any).source_ref || '').startsWith('hermes:')).length;
 
   return (
-    <div style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
-      <h2 style={{ marginTop: 0 }}>技能中心 Skills</h2>
-      <p style={{ color: 'var(--text-tertiary)' }}>
-        按 scope 浏览。global/tenant 来源只读,user/employee 可编辑。点 Bind 绑定到员工。
-      </p>
-      <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
+    <div className="admin-console">
+      <section className="admin-hero">
+        <div>
+          <div className="admin-kicker">Capability Control</div>
+          <h1 className="admin-title">技能中心 Skills</h1>
+          <p className="admin-subtitle">
+            浏览当前租户可用技能，并把 Hermes / OpenAtlas 技能绑定到具体数智员工。
+          </p>
+        </div>
+        <div className="admin-actions">
+          <Button onClick={load} loading={loading}>刷新</Button>
+        </div>
+      </section>
+      <div className="admin-stat-grid">
+        <div className="admin-stat-card"><div className="admin-stat-label">全部 Skill</div><div className="admin-stat-value">{skills.length}</div><div className="admin-stat-hint">当前可见能力包</div></div>
+        <div className="admin-stat-card"><div className="admin-stat-label">启用中</div><div className="admin-stat-value">{enabledCount}</div><div className="admin-stat-hint">可绑定到员工</div></div>
+        <div className="admin-stat-card"><div className="admin-stat-label">Hermes 来源</div><div className="admin-stat-value">{hermesCount}</div><div className="admin-stat-hint">运行时已同步</div></div>
+        <div className="admin-stat-card"><div className="admin-stat-label">绑定记录</div><div className="admin-stat-value">{bindings.length}</div><div className="admin-stat-hint">员工能力覆盖</div></div>
+      </div>
+      <div className="admin-toolbar">
         <Input.Search placeholder="按名称搜索" value={search} onChange={(e) => setSearch(e.target.value)} style={{ maxWidth: 300 }} />
         <Select
           allowClear placeholder="按 scope 过滤"
@@ -96,17 +112,13 @@ export default function Skills() {
             { value: 'user', label: 'user' }, { value: 'employee', label: 'employee' },
           ]}
         />
-        <Button onClick={load} loading={loading}>刷新</Button>
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 12 }}>
+      <div className="admin-card-grid">
         {filtered.length === 0 && !loading && (
-          <div style={{ padding: 24, color: 'var(--text-tertiary)' }}>无匹配技能</div>
+          <div className="admin-empty">无匹配技能</div>
         )}
         {filtered.map((s) => (
-          <div key={s.__id || s.id} style={{
-            background: 'var(--bg-secondary)', border: '1px solid var(--border-default)',
-            borderRadius: 8, padding: 12,
-          }}>
+          <div key={s.__id || s.id} className="admin-skill-card">
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <strong>{s.name}</strong>
               <Tag color={SCOPE_COLORS[s.scope] || 'default'}>{s.scope}</Tag>

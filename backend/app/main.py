@@ -4,7 +4,9 @@ from __future__ import annotations
 import io
 import asyncio
 import hashlib
+import html as _html
 import json
+import math
 import os
 import re
 import subprocess
@@ -13,23 +15,40 @@ import uuid as _uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 import mimetypes
+from urllib.parse import quote, unquote, urlencode, urlparse, parse_qs
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, or_
 from sqlalchemy.orm import Session
 
-from app.core.config import CORS_ORIGINS, HERMES_HOME, OPENATLAS_HOME, OPENATLAS_HERMES_AGENT_ROOT
+from app.core.config import (
+    CORS_ORIGINS,
+    DEFAULT_TENANT_NAME,
+    DEFAULT_TENANT_SLUG,
+    HERMES_HOME,
+    OPENATLAS_HOME,
+    OPENATLAS_HERMES_AGENT_ROOT,
+    OPENATLAS_MAX_ACTIVE_RUNS_PER_TENANT,
+    OPENATLAS_MAX_ACTIVE_RUNS_PER_USER,
+    OPENATLAS_PROJECT_ROOT,
+    OPENATLAS_QUOTA_RETRY_AFTER_SECONDS,
+)
 from app.core.encryption import decrypt, encrypt
 from app.core.security import decode_token, hash_password, issue_token, verify_password
 from app.db.models import (
     AuditLog,
     CanvasEvent,
     CollaborationTemplate,
+    ContractDocument,
+    ContractReviewIssue,
+    ContractVersion,
     ContextInjection,
     DigitalEmployee,
     EmployeeStatus,
@@ -40,13 +59,18 @@ from app.db.models import (
     MemoryBinding,
     MemoryEntry,
     MessageRecord,
+    OfficialDocument,
+    OfficialDocumentVersion,
     OrganizationUnit,
+    PresentationDeckDocument,
+    PresentationDeckVersion,
     RolePermissionOverride,
     RuntimeStatus,
     RuntimeType,
     Scope,
     SessionRecord,
     SessionRun,
+    SessionRunEvent,
     SkillBinding,
     SkillPackage,
     SkillRun,
@@ -55,6 +79,7 @@ from app.db.models import (
     TaskArtifact,
     User,
     UserRole,
+    WhiteboardDocument,
     WorkflowCheckpoint,
     WorkflowNodeRun,
     WorkflowRun,
@@ -67,7 +92,7 @@ from app.services.memory_resolver import resolve_effective_memories, build_conte
 
 
 # ── App ─────────────────────────────────────────────────────────────────────
-app = FastAPI(title="OpenAtlas Backend", version="0.1.0")
+app = FastAPI(title="OpenAtlas Backend", version="0.2.0-preview.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS + ["*"],
@@ -79,8 +104,56 @@ app.add_middleware(
 
 _PENDING_HERMES_RUNS: dict[str, dict[str, Any]] = {}
 _RUN_RECONCILE_TASKS: dict[str, asyncio.Task] = {}
+_SESSION_EVENT_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
 _JOB_SCHEDULER_TASK: asyncio.Task | None = None
 _RUNNING_JOB_IDS: set[str] = set()
+SESSION_EVENT_QUEUE_MAXSIZE = 100
+
+
+def _format_sse_event(event_type: str, payload: dict[str, Any]) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _session_update_event_payload(
+    db: Session,
+    rec: SessionRecord,
+    *,
+    source: str,
+    imported: int = 0,
+    hermes_run_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "session_id": rec.id,
+        "tenant_id": rec.tenant_id,
+        "user_id": rec.user_id,
+        "source": source,
+        "imported": imported,
+        "hermes_run_id": hermes_run_id,
+        "task_status": getattr(rec, "task_status", "draft") or "draft",
+        "task_summary": getattr(rec, "task_summary", "") or "",
+        "last_message": rec.last_message,
+        "message_count": _session_message_count(db, rec.id, rec.message_count),
+        "updated_at": rec.updated_at.isoformat() if rec.updated_at else None,
+    }
+
+
+def _publish_session_event(session_id: str, event_type: str, payload: dict[str, Any]) -> None:
+    subscribers = _SESSION_EVENT_SUBSCRIBERS.get(session_id)
+    if not subscribers:
+        return
+    event = {"event_type": event_type, **payload}
+    for queue in list(subscribers):
+        try:
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(event)
+        except asyncio.QueueEmpty:
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+        except asyncio.QueueFull:
+            pass
 
 
 def _remember_hermes_run(
@@ -130,6 +203,575 @@ async def _watch_detached_run(run_id: str) -> None:
     meta = _PENDING_HERMES_RUNS.get(run_id)
     if not meta:
         return
+
+    def latest_rows(db: Session, rec: SessionRecord) -> tuple[SessionRun | None, WorkflowRun | None, WorkflowNodeRun | None, DigitalEmployee | None]:
+        run_row = db.query(SessionRun).filter(
+            SessionRun.session_id == rec.id,
+            SessionRun.tenant_id == rec.tenant_id,
+            SessionRun.hermes_run_id == run_id,
+        ).order_by(SessionRun.created_at.desc()).first()
+        if not run_row:
+            run_row = db.query(SessionRun).filter(
+                SessionRun.session_id == rec.id,
+                SessionRun.tenant_id == rec.tenant_id,
+            ).order_by(SessionRun.created_at.desc()).first()
+        wf = db.query(WorkflowRun).filter(
+            WorkflowRun.session_id == rec.id,
+            WorkflowRun.tenant_id == rec.tenant_id,
+        ).order_by(WorkflowRun.created_at.desc()).first()
+        emp_id = str(meta.get("employee_id") or rec.employee_id or "")
+        node = None
+        if wf:
+            node = db.query(WorkflowNodeRun).filter(
+                WorkflowNodeRun.workflow_run_id == wf.id,
+                WorkflowNodeRun.tenant_id == rec.tenant_id,
+                WorkflowNodeRun.employee_id == emp_id,
+            ).order_by(WorkflowNodeRun.created_at.desc()).first()
+        emp = db.get(DigitalEmployee, emp_id) if emp_id else None
+        return run_row, wf, node, emp
+
+    def mark_runtime_state(
+        db: Session,
+        rec: SessionRecord,
+        *,
+        status: str,
+        stage: str,
+        reason: str,
+        event_type: str,
+        error: str | None = None,
+    ) -> None:
+        run_row, wf, node, _emp = latest_rows(db, rec)
+        rec.task_status = status
+        rec.task_summary = reason[:4000]
+        rec.updated_at = datetime.now(timezone.utc)
+        if run_row:
+            _update_session_run(
+                db,
+                run_row.id,
+                status=status,
+                stage=stage,
+                reason=reason,
+                event_type=event_type,
+                hermes_run_id=run_id,
+                payload_patch={"detached_watcher": True},
+            )
+        _record_session_run_event(
+            db,
+            tenant_id=rec.tenant_id,
+            user_id=rec.user_id,
+            session_id=rec.id,
+            run_id=run_row.id if run_row else None,
+            hermes_run_id=run_id,
+            event_type=event_type,
+            payload={
+                "status": status,
+                "stage": stage,
+                "reason": reason,
+                "error": error,
+                "detached_watcher": True,
+            },
+            source="detached_watcher",
+        )
+        if node:
+            node.status = "done" if status == "completed" else status
+            node.error = (error or "")[:4000] if error is not None else node.error
+            node.updated_at = datetime.now(timezone.utc)
+            if status in {"completed", "failed", "cancelled"}:
+                node.completed_at = datetime.now(timezone.utc)
+        if wf:
+            wf.status = "completed" if status == "completed" else status
+            wf.summary = reason[:1000]
+            wf.updated_at = datetime.now(timezone.utc)
+            if status in {"completed", "failed", "cancelled"}:
+                wf.completed_at = datetime.now(timezone.utc)
+
+    async def reconcile_transcript_once(db: Session, rec: SessionRecord) -> int:
+        target = await hermes_client.resolve_target(db, rec.tenant_id)
+        _run_row, _wf, _node, emp = latest_rows(db, rec)
+        imported = await _reconcile_hermes_session_transcript(
+            db,
+            target=target,
+            rec=rec,
+            tenant_id=rec.tenant_id,
+            user_id=rec.user_id,
+            employee_id=meta.get("employee_id") or rec.employee_id,
+            speaker_name=emp.display_name if emp else "",
+        )
+        if imported:
+            _sync_runtime_completion_from_reconcile(
+                db,
+                rec=rec,
+                employee_id=meta.get("employee_id") or rec.employee_id,
+            )
+            db.add(CanvasEvent(
+                tenant_id=rec.tenant_id,
+                user_id=rec.user_id,
+                session_id=rec.id,
+                employee_id=meta.get("employee_id") or rec.employee_id,
+                event_type="runtime.reconciled",
+                node_id=f"employee-{meta.get('employee_id') or rec.employee_id or ''}",
+                payload=json.dumps({"hermes_run_id": run_id, "imported": imported}, ensure_ascii=False),
+            ))
+        return imported
+
+    async def watch_run_events() -> bool:
+        """Return True when this watcher reached a terminal or approval boundary."""
+        try:
+            idle_timeout = max(15.0, float(os.environ.get("OPENATLAS_RUN_EVENT_IDLE_TIMEOUT_SECONDS", "60")))
+        except ValueError:
+            idle_timeout = 60.0
+        try:
+            detach_after = max(idle_timeout, float(os.environ.get("OPENATLAS_RUN_EVENT_DETACH_AFTER_SECONDS", "900")))
+        except ValueError:
+            detach_after = 900.0
+        target = None
+        with SessionLocal() as db:
+            rec = db.get(SessionRecord, meta.get("session_id"))
+            if not rec or rec.tenant_id != meta.get("tenant_id") or rec.archived:
+                return True
+            target = await hermes_client.resolve_target(db, rec.tenant_id)
+
+        stream = hermes_client.stream_run_events(target, run_id).__aiter__()
+        assistant_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_records: list[dict[str, Any]] = []
+        artifact_ids: list[str] = []
+        active_tool_payloads: dict[str, dict[str, Any]] = {}
+        pending_dangerous_tool: dict[str, Any] | None = None
+        last_event_at = datetime.now(timezone.utc)
+        while True:
+            try:
+                run_ev = await asyncio.wait_for(stream.__anext__(), timeout=idle_timeout)
+                last_event_at = datetime.now(timezone.utc)
+            except StopAsyncIteration:
+                return False
+            except asyncio.TimeoutError:
+                with SessionLocal() as db:
+                    rec = db.get(SessionRecord, meta.get("session_id"))
+                    if not rec or rec.tenant_id != meta.get("tenant_id") or rec.archived:
+                        return True
+                    run_row, wf, node, _emp = latest_rows(db, rec)
+                    if pending_dangerous_tool:
+                        mark_runtime_state(
+                            db,
+                            rec,
+                            status="stalled",
+                            stage="runtime",
+                            reason="执行型工具长时间没有返回新事件；Atlas 会继续后台同步，不再生成非 Hermes 原生审批。",
+                            event_type="openatlas.tool_waiting_diagnostic",
+                        )
+                        if wf:
+                            _record_workflow_step(
+                                db,
+                                tenant_id=rec.tenant_id,
+                                user_id=rec.user_id,
+                                session_id=rec.id,
+                                workflow_run_id=wf.id,
+                                workflow_node_run_id=node.id if node else None,
+                                employee_id=meta.get("employee_id") or rec.employee_id,
+                                event_type="openatlas.tool_waiting_diagnostic",
+                                title="工具长时间无新事件",
+                                summary="Hermes 未发出真实审批请求，Atlas 仅记录诊断并等待后台同步。",
+                                payload={**pending_dangerous_tool, "hermes_run_id": run_id},
+                                risk_level="medium",
+                                checkpoint_type="stalled",
+                                hermes_session_id=rec.hermes_session_id,
+                                hermes_run_id=run_id,
+                            )
+                        db.commit()
+                        _publish_session_event(rec.id, "session.updated", {
+                            "session_id": rec.id,
+                            "hermes_run_id": run_id,
+                            "diagnostic": "tool_waiting_without_hermes_approval",
+                        })
+                        return False
+                    idle_for = (datetime.now(timezone.utc) - last_event_at).total_seconds()
+                    if idle_for >= detach_after:
+                        mark_runtime_state(
+                            db,
+                            rec,
+                            status="stalled",
+                            stage="runtime",
+                            reason="Hermes 长时间未推送新事件，Atlas 正在后台同步最新结果。",
+                            event_type="openatlas.run_detached",
+                        )
+                        db.commit()
+                        return False
+                continue
+
+            ev_name = run_ev.get("event") or "message"
+            ev_data = run_ev.get("data") if isinstance(run_ev.get("data"), dict) else {"raw": run_ev.get("data")}
+            with SessionLocal() as db:
+                rec = db.get(SessionRecord, meta.get("session_id"))
+                if not rec or rec.tenant_id != meta.get("tenant_id") or rec.archived:
+                    return True
+                run_row, wf, node, emp = latest_rows(db, rec)
+                session_run_id = run_row.id if run_row else None
+
+                if _is_approval_event(ev_name, ev_data):
+                    pending_dangerous_tool = None
+                    approval_payload = _normalize_approval_payload(ev_name, ev_data, run_id, source="hermes")
+                    mark_runtime_state(
+                        db,
+                        rec,
+                        status="waiting_approval",
+                        stage="approval",
+                        reason="等待用户确认工具授权",
+                        event_type=ev_name,
+                    )
+                    if wf:
+                        _record_workflow_step(
+                            db,
+                            tenant_id=rec.tenant_id,
+                            user_id=rec.user_id,
+                            session_id=rec.id,
+                            workflow_run_id=wf.id,
+                            workflow_node_run_id=node.id if node else None,
+                            employee_id=meta.get("employee_id") or rec.employee_id,
+                            event_type="approval.required",
+                            title="等待人工确认",
+                            summary=str(approval_payload.get("description") or approval_payload.get("command") or "等待用户确认授权"),
+                            payload=approval_payload,
+                            risk_level="high",
+                            checkpoint_type="approval.required",
+                            hermes_session_id=rec.hermes_session_id,
+                            hermes_run_id=run_id,
+                        )
+                    db.commit()
+                    _publish_session_event(rec.id, "openatlas.approval_required", {
+                        **approval_payload,
+                        "approval_required": approval_payload,
+                        "session_id": rec.id,
+                        "hermes_run_id": run_id,
+                    })
+                    return True
+
+                if ev_name == "approval.responded":
+                    pending_dangerous_tool = None
+                    mark_runtime_state(
+                        db,
+                        rec,
+                        status="running",
+                        stage="runtime",
+                        reason="用户已确认工具授权，Hermes 正在继续执行。",
+                        event_type="approval.responded",
+                    )
+                    if wf:
+                        _record_workflow_step(
+                            db,
+                            tenant_id=rec.tenant_id,
+                            user_id=rec.user_id,
+                            session_id=rec.id,
+                            workflow_run_id=wf.id,
+                            workflow_node_run_id=node.id if node else None,
+                            employee_id=meta.get("employee_id") or rec.employee_id,
+                            event_type="approval.resolved",
+                            title="审批已处理",
+                            summary=str(ev_data.get("choice") or ev_data.get("status") or "用户已处理审批"),
+                            payload={**ev_data, "hermes_run_id": run_id},
+                            checkpoint_type="approval.resolved",
+                            hermes_session_id=rec.hermes_session_id,
+                            hermes_run_id=run_id,
+                        )
+                    db.commit()
+                    continue
+
+                if ev_name == "message.delta":
+                    delta = str(ev_data.get("delta") or ev_data.get("content") or ev_data.get("text") or "")
+                    if delta:
+                        assistant_parts.append(delta)
+                    continue
+                if ev_name == "reasoning.available":
+                    text = str(ev_data.get("text") or "").strip()
+                    if text:
+                        reasoning_parts.append(text)
+                        if wf:
+                            _record_workflow_step(
+                                db,
+                                tenant_id=rec.tenant_id,
+                                user_id=rec.user_id,
+                                session_id=rec.id,
+                                workflow_run_id=wf.id,
+                                workflow_node_run_id=node.id if node else None,
+                                employee_id=meta.get("employee_id") or rec.employee_id,
+                                event_type="reasoning.summary",
+                                title="思考摘要",
+                                summary=text[:1000],
+                                payload={**ev_data, "hermes_run_id": run_id},
+                                hermes_session_id=rec.hermes_session_id,
+                                hermes_run_id=run_id,
+                            )
+                            db.commit()
+                    continue
+                if ev_name == "tool.started":
+                    observed_started_at = datetime.now(timezone.utc)
+                    preview = str(ev_data.get("preview") or ev_data.get("command") or "")
+                    tool_name = str(ev_data.get("tool") or ev_data.get("tool_name") or "tool")
+                    tool_call_id = ev_data.get("tool_call_id") or ev_data.get("id")
+                    payload = {
+                        **ev_data,
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_call_id,
+                        "label": preview or ev_data.get("label") or tool_name,
+                        "command": ev_data.get("command") or preview,
+                        "preview": preview,
+                        "hermes_run_id": run_id,
+                        "started_at": observed_started_at.isoformat(),
+                    }
+                    if tool_call_id:
+                        active_tool_payloads[f"id:{tool_call_id}"] = payload
+                    active_tool_payloads[f"name:{tool_name}"] = payload
+                    tool_records.append({
+                        "name": tool_name,
+                        "status": "running",
+                        "payload": payload,
+                        "tool_call_id": tool_call_id,
+                        "label": payload.get("label"),
+                        "command": payload.get("command"),
+                        "preview": payload.get("preview"),
+                        "started_at": payload.get("started_at"),
+                    })
+                    if _is_approval_sensitive_tool(tool_name):
+                        pending_dangerous_tool = {
+                            "command": payload.get("command") or preview,
+                            "tool_name": tool_name,
+                            "tool_call_id": tool_call_id,
+                        }
+                    if wf:
+                        _record_workflow_step(
+                            db,
+                            tenant_id=rec.tenant_id,
+                            user_id=rec.user_id,
+                            session_id=rec.id,
+                            workflow_run_id=wf.id,
+                            workflow_node_run_id=node.id if node else None,
+                            employee_id=meta.get("employee_id") or rec.employee_id,
+                            event_type="tool.started",
+                            title=f"工具: {tool_name}",
+                            summary=preview or tool_name,
+                            payload=payload,
+                            risk_level="high" if _is_approval_sensitive_tool(tool_name) else "low",
+                            tool_name=tool_name,
+                            hermes_session_id=rec.hermes_session_id,
+                            hermes_run_id=run_id,
+                        )
+                        db.commit()
+                    continue
+                if ev_name == "tool.completed":
+                    observed_completed_at = datetime.now(timezone.utc)
+                    pending_dangerous_tool = None
+                    emitted_tool_name = str(ev_data.get("tool") or ev_data.get("tool_name") or "tool")
+                    completed_call_id = ev_data.get("tool_call_id") or ev_data.get("id")
+                    started_payload = (
+                        active_tool_payloads.get(f"id:{completed_call_id}")
+                        if completed_call_id else None
+                    ) or active_tool_payloads.get(f"name:{emitted_tool_name}") or {}
+                    payload = {**started_payload, **ev_data}
+                    for key in ("command", "preview", "label", "args"):
+                        if not payload.get(key) and started_payload.get(key):
+                            payload[key] = started_payload[key]
+                    payload["tool_name"] = emitted_tool_name
+                    payload["result"] = payload.get("result") or payload.get("output")
+                    payload["hermes_run_id"] = run_id
+                    payload["completed_at"] = observed_completed_at.isoformat()
+                    observed_started_at_raw = payload.get("started_at")
+                    if isinstance(observed_started_at_raw, str) and observed_started_at_raw:
+                        try:
+                            observed_started_at = datetime.fromisoformat(observed_started_at_raw.replace("Z", "+00:00"))
+                            payload["wait_duration_ms"] = max(0, int((observed_completed_at - observed_started_at).total_seconds() * 1000))
+                        except Exception:
+                            pass
+                    tool_error = _tool_error_text(payload) if payload.get("error") else None
+                    live_artifacts = _persist_tool_event_artifacts(
+                        tenant_id=rec.tenant_id,
+                        user_id=rec.user_id,
+                        session_id=rec.id,
+                        payload=payload,
+                        run_id=session_run_id,
+                        employee_id=meta.get("employee_id") or rec.employee_id,
+                        hermes_run_id=run_id,
+                    )
+                    new_artifact_ids = [str(a.get("id")) for a in live_artifacts if a.get("id")]
+                    artifact_ids.extend(new_artifact_ids)
+                    tool_records.append({
+                        "name": emitted_tool_name,
+                        "status": "completed" if not tool_error else "failed",
+                        "payload": payload,
+                        "tool_call_id": completed_call_id,
+                        "label": payload.get("label"),
+                        "command": payload.get("command"),
+                        "preview": payload.get("preview"),
+                        "duration": payload.get("duration"),
+                        "wait_duration_ms": payload.get("wait_duration_ms"),
+                        "started_at": payload.get("started_at"),
+                        "completed_at": payload.get("completed_at"),
+                    })
+                    mark_runtime_state(
+                        db,
+                        rec,
+                        status="running",
+                        stage="runtime",
+                        reason="Hermes 工具调用已完成，正在继续生成结果。",
+                        event_type="tool.failed" if tool_error else "tool.completed",
+                        error=tool_error,
+                    )
+                    if wf:
+                        _record_workflow_step(
+                            db,
+                            tenant_id=rec.tenant_id,
+                            user_id=rec.user_id,
+                            session_id=rec.id,
+                            workflow_run_id=wf.id,
+                            workflow_node_run_id=node.id if node else None,
+                            employee_id=meta.get("employee_id") or rec.employee_id,
+                            event_type="tool.failed" if tool_error else "tool.completed",
+                            title=f"工具: {emitted_tool_name}",
+                            summary=str(tool_error or payload.get("label") or emitted_tool_name),
+                            payload=payload,
+                            risk_level="high" if _is_approval_sensitive_tool(emitted_tool_name) else "low",
+                            tool_name=emitted_tool_name,
+                            artifact_ids=new_artifact_ids,
+                            checkpoint_type="tool.failed" if tool_error else "tool.completed",
+                            hermes_session_id=rec.hermes_session_id,
+                            hermes_run_id=run_id,
+                        )
+                    db.commit()
+                    continue
+                if ev_name == "run.completed":
+                    output = str(ev_data.get("output") or ev_data.get("final_response") or "")
+                    if output:
+                        assistant_parts.append(output)
+                    for msg_item in ev_data.get("messages") or []:
+                        if isinstance(msg_item, dict) and msg_item.get("role") == "assistant":
+                            content = msg_item.get("content") or ""
+                            if isinstance(content, str):
+                                assistant_parts.append(content)
+                    full = "".join(assistant_parts).strip()
+                    if full:
+                        msg_row = MessageRecord(
+                            session_id=rec.id,
+                            role="assistant",
+                            content=full,
+                            reasoning=json.dumps(reasoning_parts, ensure_ascii=False),
+                            tool_calls=json.dumps(tool_records, ensure_ascii=False),
+                            speaker_employee_id=meta.get("employee_id") or rec.employee_id,
+                            speaker_name=emp.display_name if emp else "",
+                        )
+                        db.add(msg_row)
+                        db.flush()
+                        for art in _extract_task_artifacts(full, prefix=f"{(emp.display_name if emp else '助手')}-回复"):
+                            row = TaskArtifact(
+                                tenant_id=rec.tenant_id,
+                                user_id=rec.user_id,
+                                session_id=rec.id,
+                                message_id=msg_row.id,
+                                kind=art["kind"],
+                                name=art["name"],
+                                mime_type=art["mime_type"],
+                                content=_artifact_inline_content_for_row(art),
+                                source="assistant",
+                                source_path=art.get("source_path") or "",
+                                run_id=session_run_id,
+                                employee_id=meta.get("employee_id") or rec.employee_id,
+                                version=_next_artifact_version(db, session_id=rec.id, name=art["name"]),
+                                provenance_payload=json.dumps({"origin": "detached_run_events", "hermes_run_id": run_id}, ensure_ascii=False),
+                            )
+                            db.add(row)
+                            db.flush()
+                            artifact_ids.append(row.id)
+                    mark_runtime_state(
+                        db,
+                        rec,
+                        status="completed" if full or artifact_ids or tool_records else "failed",
+                        stage="assistant",
+                        reason=(
+                            "后台监听到 Hermes 最终结果，已同步完成。"
+                            if full or artifact_ids else
+                            "Hermes run 已结束，仅收到工具事件，未返回最终文本。"
+                            if tool_records else
+                            "Hermes run 已结束但没有返回可见内容。"
+                        ),
+                        event_type="run.completed",
+                    )
+                    if node and full:
+                        node.output_summary = full[:4000]
+                        node.artifact_ids = json.dumps(list(dict.fromkeys(artifact_ids)), ensure_ascii=False)
+                    if wf:
+                        _record_workflow_step(
+                            db,
+                            tenant_id=rec.tenant_id,
+                            user_id=rec.user_id,
+                            session_id=rec.id,
+                            workflow_run_id=wf.id,
+                            workflow_node_run_id=node.id if node else None,
+                            employee_id=meta.get("employee_id") or rec.employee_id,
+                            event_type="node.completed",
+                            title="节点完成",
+                            summary="后台监听到 Hermes 最终结果，已同步完成。",
+                            output_summary=full[:1000],
+                            payload={**ev_data, "hermes_run_id": run_id},
+                            artifact_ids=list(dict.fromkeys(artifact_ids)),
+                            checkpoint_type="node.completed",
+                            hermes_session_id=rec.hermes_session_id,
+                            hermes_run_id=run_id,
+                        )
+                    db.commit()
+                    _publish_session_event(
+                        rec.id,
+                        "message.created" if full else "session.updated",
+                        _session_update_event_payload(
+                            db,
+                            rec,
+                            source="detached_run_events",
+                            imported=(1 if full else 0) + len(artifact_ids),
+                            hermes_run_id=run_id,
+                        ),
+                    )
+                    _PENDING_HERMES_RUNS.pop(run_id, None)
+                    return True
+                if ev_name == "run.failed" or ev_name == "error":
+                    message = str(ev_data.get("error") or ev_data.get("message") or "Hermes run failed")
+                    mark_runtime_state(
+                        db,
+                        rec,
+                        status="failed",
+                        stage="runtime",
+                        reason=message,
+                        event_type=ev_name,
+                        error=message,
+                    )
+                    if wf:
+                        _record_workflow_step(
+                            db,
+                            tenant_id=rec.tenant_id,
+                            user_id=rec.user_id,
+                            session_id=rec.id,
+                            workflow_run_id=wf.id,
+                            workflow_node_run_id=node.id if node else None,
+                            employee_id=meta.get("employee_id") or rec.employee_id,
+                            event_type="runtime.error",
+                            title="运行失败",
+                            summary=message,
+                            payload={**ev_data, "hermes_run_id": run_id},
+                            risk_level="high",
+                            checkpoint_type="runtime.error",
+                            hermes_session_id=rec.hermes_session_id,
+                            hermes_run_id=run_id,
+                        )
+                    db.commit()
+                    _PENDING_HERMES_RUNS.pop(run_id, None)
+                    return True
+                db.commit()
+
+    # Prefer the run-events stream: it is the only channel that can surface
+    # approval-after-approval chains. Transcript polling is a fallback for older
+    # Hermes gateways and terminal events that were persisted only as messages.
+    try:
+        if await watch_run_events():
+            return
+    except Exception:
+        pass
+
     # Keep this bounded. A front-end detach is not a license to poll forever.
     attempts = int(os.environ.get("OPENATLAS_RUN_RECONCILE_ATTEMPTS", "60"))
     interval = float(os.environ.get("OPENATLAS_RUN_RECONCILE_INTERVAL_SECONDS", "10"))
@@ -139,27 +781,8 @@ async def _watch_detached_run(run_id: str) -> None:
             rec = db.get(SessionRecord, meta.get("session_id"))
             if not rec or rec.tenant_id != meta.get("tenant_id") or rec.archived:
                 return
-            target = await hermes_client.resolve_target(db, rec.tenant_id)
-            emp = db.get(DigitalEmployee, meta.get("employee_id")) if meta.get("employee_id") else None
-            imported = await _reconcile_hermes_session_transcript(
-                db,
-                target=target,
-                rec=rec,
-                tenant_id=rec.tenant_id,
-                user_id=rec.user_id,
-                employee_id=meta.get("employee_id") or rec.employee_id,
-                speaker_name=emp.display_name if emp else "",
-            )
+            imported = await reconcile_transcript_once(db, rec)
             if imported:
-                db.add(CanvasEvent(
-                    tenant_id=rec.tenant_id,
-                    user_id=rec.user_id,
-                    session_id=rec.id,
-                    employee_id=meta.get("employee_id") or rec.employee_id,
-                    event_type="runtime.reconciled",
-                    node_id=f"employee-{meta.get('employee_id') or rec.employee_id or ''}",
-                    payload=json.dumps({"hermes_run_id": run_id, "imported": imported}, ensure_ascii=False),
-                ))
                 db.commit()
                 return
 
@@ -201,6 +824,13 @@ class Principal:
     def __init__(self, user: User, tenant: Tenant):
         self.user = user
         self.tenant = tenant
+
+
+ADMIN_ROLES = {UserRole.tenant_admin, UserRole.system_admin}
+
+
+def _is_admin_user(user: User | None) -> bool:
+    return bool(user and user.role in ADMIN_ROLES)
 
 
 def get_principal(
@@ -259,6 +889,106 @@ def db_query_tenant(tid: str):
         return db.get(Tenant, tid)
 
 
+def _admin_user_ids_for_tenant(db: Session, tenant_id: str) -> set[str]:
+    rows = db.query(User.id).filter(
+        User.tenant_id == tenant_id,
+        User.role.in_([UserRole.tenant_admin, UserRole.system_admin]),
+    ).all()
+    return {row[0] for row in rows}
+
+
+def _employee_visible_to_principal(db: Session, emp: DigitalEmployee | None, p: Principal) -> bool:
+    if not emp or emp.tenant_id != p.tenant.id or emp.status == EmployeeStatus.archived:
+        return False
+    if _is_admin_user(p.user) or emp.created_by == p.user.id:
+        return True
+    creator = db.get(User, emp.created_by) if emp.created_by else None
+    return bool(creator and creator.tenant_id == p.tenant.id and _is_admin_user(creator))
+
+
+def _employee_mutable_by_principal(emp: DigitalEmployee | None, p: Principal) -> bool:
+    if not emp or emp.tenant_id != p.tenant.id or emp.status == EmployeeStatus.archived:
+        return False
+    return _is_admin_user(p.user) or emp.created_by == p.user.id
+
+
+def _ensure_employee_visible(db: Session, emp: DigitalEmployee | None, p: Principal) -> DigitalEmployee:
+    if not _employee_visible_to_principal(db, emp, p):
+        raise HTTPException(404, "employee not found")
+    return emp
+
+
+def _ensure_employee_mutable(emp: DigitalEmployee | None, p: Principal) -> DigitalEmployee:
+    if not _employee_mutable_by_principal(emp, p):
+        raise HTTPException(403, "built-in employees are read-only; create your own employee to customize it")
+    return emp
+
+
+def _principal_capabilities(db: Session, p: Principal) -> list[str]:
+    role = p.user.role.value if hasattr(p.user.role, "value") else str(p.user.role)
+    allowed = set(ROLE_PERMISSION_DEFAULTS.get(role, set()))
+    overrides = db.query(RolePermissionOverride).filter(
+        or_(RolePermissionOverride.tenant_id.is_(None), RolePermissionOverride.tenant_id == p.tenant.id),
+        RolePermissionOverride.role == role,
+    ).all()
+    for row in overrides:
+        if row.allowed:
+            allowed.add(row.capability)
+        else:
+            allowed.discard(row.capability)
+    return sorted(allowed)
+
+
+def _auth_user_payload(db: Session, p: Principal) -> dict:
+    caps = _principal_capabilities(db, p)
+    return {
+        "id": p.user.id,
+        "email": p.user.email,
+        "username": p.user.username,
+        "role": p.user.role.value,
+        "tenant_id": p.tenant.id,
+        "is_active": p.user.is_active,
+        "is_admin": _is_admin_user(p.user),
+        "capabilities": caps,
+        "permissions": {"capabilities": caps},
+    }
+
+
+def _auth_tenant_payload(tenant: Tenant) -> dict:
+    return {"id": tenant.id, "slug": tenant.slug, "name": tenant.name}
+
+
+def _memory_readable_by_principal(db: Session, m: MemoryEntry | None, p: Principal) -> bool:
+    if not m or m.tenant_id != p.tenant.id:
+        return False
+    if _is_admin_user(p.user):
+        return True
+    if m.scope in (Scope.global_, Scope.tenant):
+        return True
+    if m.scope == Scope.user:
+        return m.owner_user_id == p.user.id or m.created_by == p.user.id
+    if m.scope == Scope.employee:
+        if m.created_by == p.user.id:
+            return True
+        emp = db.get(DigitalEmployee, m.employee_id) if m.employee_id else None
+        return m.visibility in {"public", "tenant"} and _employee_visible_to_principal(db, emp, p)
+    return False
+
+
+def _memory_mutable_by_principal(m: MemoryEntry | None, p: Principal) -> bool:
+    if not m or m.tenant_id != p.tenant.id:
+        return False
+    if m.scope == Scope.global_:
+        return p.user.role == UserRole.system_admin
+    if m.scope == Scope.tenant:
+        return p.user.role in ADMIN_ROLES
+    if m.scope == Scope.user:
+        return m.owner_user_id == p.user.id or m.created_by == p.user.id
+    if m.scope == Scope.employee:
+        return _is_admin_user(p.user) or m.created_by == p.user.id
+    return False
+
+
 def audit(
     db: Session, *, principal: Principal | None, action: str, resource_type: str,
     resource_id: str, request: Request | None = None, extra: dict | None = None,
@@ -283,6 +1013,12 @@ class LoginIn(BaseModel):
     password: str
 
 
+class RegisterIn(BaseModel):
+    email: str = Field(min_length=2, max_length=255)
+    password: str = Field(min_length=4, max_length=128)
+    username: str | None = Field(default=None, max_length=64)
+
+
 class LoginOut(BaseModel):
     access_token: str
     user: dict
@@ -293,6 +1029,8 @@ class EmployeeIn(BaseModel):
     display_name: str
     description: str = ""
     avatar: str = "A"
+    avatar_image_url: str | None = None
+    card_image_url: str | None = None
     model: str = "hermes-agent"
     provider: str = "hermes"
     temperature: float = 0.7
@@ -306,6 +1044,8 @@ class EmployeePatch(BaseModel):
     display_name: str | None = None
     description: str | None = None
     avatar: str | None = None
+    avatar_image_url: str | None = None
+    card_image_url: str | None = None
     model: str | None = None
     provider: str | None = None
     temperature: float | None = None
@@ -404,6 +1144,101 @@ class CanvasEventIn(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class WhiteboardSceneIn(BaseModel):
+    scene: dict[str, Any] = Field(default_factory=dict)
+
+
+class WhiteboardIn(BaseModel):
+    title: str = Field(default="未命名白板", max_length=160)
+    description: str = Field(default="", max_length=2000)
+    kind: str = Field(default="freeform", max_length=32)
+    scene: dict[str, Any] = Field(default_factory=dict)
+    summary: str = Field(default="", max_length=12000)
+
+
+class WhiteboardPatchIn(BaseModel):
+    title: str | None = Field(default=None, max_length=160)
+    description: str | None = Field(default=None, max_length=2000)
+    kind: str | None = Field(default=None, max_length=32)
+    scene: dict[str, Any] | None = None
+    summary: str | None = Field(default=None, max_length=12000)
+
+
+class WhiteboardGenerateIn(BaseModel):
+    kind: str = Field(default="flowchart", max_length=32)
+    prompt: str = Field(default="", max_length=8000)
+    title: str = Field(default="", max_length=160)
+    slide_count: int | None = Field(default=None, ge=1, le=12)
+
+
+class WhiteboardReadIn(BaseModel):
+    scene: dict[str, Any] = Field(default_factory=dict)
+    target: str = Field(default="方案", max_length=64)
+    title: str = Field(default="创意白板", max_length=160)
+
+
+class WhiteboardRefineIn(BaseModel):
+    scene: dict[str, Any] = Field(default_factory=dict)
+    instruction: str = Field(default="", max_length=8000)
+    mode: str = Field(default="append", max_length=32)
+    title: str = Field(default="创意白板", max_length=160)
+
+
+class OfficialDocumentIntentIn(BaseModel):
+    query: str = Field(default="", min_length=1, max_length=8000)
+
+
+class OfficialDocumentGenerateIn(BaseModel):
+    query: str = Field(default="", max_length=8000)
+    doc_type: str = Field(default="notice", max_length=48)
+    template_key: str = Field(default="gbt9704", max_length=80)
+    fields: dict[str, Any] = Field(default_factory=dict)
+
+
+class OfficialDocumentReviseIn(BaseModel):
+    instruction: str = Field(default="", min_length=1, max_length=8000)
+    fields: dict[str, Any] = Field(default_factory=dict)
+
+
+class PresentationDeckGenerateIn(BaseModel):
+    query: str = Field(default="", min_length=1, max_length=12000)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class PresentationDeckResearchIn(BaseModel):
+    query: str = Field(default="", max_length=12000)
+    config: dict[str, Any] = Field(default_factory=dict)
+    knowledge: dict[str, Any] = Field(default_factory=dict)
+    slide: dict[str, Any] = Field(default_factory=dict)
+
+
+class PresentationDeckSaveIn(BaseModel):
+    query: str = Field(default="", max_length=12000)
+    config: dict[str, Any] = Field(default_factory=dict)
+    plan: dict[str, Any] = Field(default_factory=dict)
+    status: str = Field(default="outline_review", max_length=32)
+    change_summary: str = Field(default="", max_length=1000)
+
+
+class PresentationDeckSlideActionIn(BaseModel):
+    action: str = Field(default="rewrite", max_length=40)
+    instruction: str = Field(default="", max_length=4000)
+    config: dict[str, Any] = Field(default_factory=dict)
+    plan: dict[str, Any] = Field(default_factory=dict)
+    slide: dict[str, Any] = Field(default_factory=dict)
+
+
+class ContractReviewRunIn(BaseModel):
+    contract_type: str = Field(default="general", max_length=64)
+    review_perspective: str = Field(default="balanced", max_length=32)
+    review_template: str = Field(default="standard", max_length=64)
+    focus: list[str] = Field(default_factory=list)
+
+
+class ContractIssuePatchIn(BaseModel):
+    status: str = Field(pattern="^(open|accepted|ignored)$")
+
+
 class TemplateUseIn(BaseModel):
     title: str = ""
 
@@ -444,6 +1279,10 @@ class SkillIn(BaseModel):
     scope: Scope = Scope.tenant
     visibility: str = "tenant"
     mutable: bool = True
+    system_prompt: str = ""
+    input_schema: str = "{}"
+    output_schema: str = "{}"
+    few_shot_examples: str = "[]"
 
 
 class HermesSkillInstallIn(BaseModel):
@@ -485,14 +1324,130 @@ def _slugify(name: str) -> str:
     return f"employee-{digest}"
 
 
-def _employee_to_dict(e: DigitalEmployee) -> dict:
+def _employee_runtime_stats(db: Session | None, e: DigitalEmployee) -> dict:
+    if db is None:
+        return {
+            "conversation_count": 0,
+            "today_conversation_count": 0,
+            "total_messages": 0,
+            "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "avg_response_ms": None,
+            "success_rate": None,
+            "run_count": 0,
+            "recent_activity": [],
+        }
+    shanghai_tz = timezone(timedelta(hours=8))
+    today_start_utc = datetime.now(shanghai_tz).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+
+    def aware_utc(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    sessions = db.query(SessionRecord).filter(
+        SessionRecord.tenant_id == e.tenant_id,
+        or_(
+            SessionRecord.employee_id == e.id,
+            SessionRecord.participant_ids.like(f'%"{e.id}"%'),
+        ),
+        SessionRecord.archived == False,  # noqa: E712
+    ).order_by(SessionRecord.updated_at.desc()).all()
+    session_ids = [s.id for s in sessions]
+    messages = db.query(MessageRecord).filter(MessageRecord.session_id.in_(session_ids)).all() if session_ids else []
+    runs = db.query(SessionRun).filter(
+        SessionRun.tenant_id == e.tenant_id,
+        SessionRun.employee_id == e.id,
+    ).order_by(SessionRun.updated_at.desc()).all()
+    completed_runs = [r for r in runs if r.started_at and r.completed_at]
+    durations = []
+    for r in completed_runs:
+        started = aware_utc(r.started_at)
+        completed = aware_utc(r.completed_at)
+        if started and completed:
+            durations.append(max(0, int((completed - started).total_seconds() * 1000)))
+    terminal_runs = [r for r in runs if r.status in {"completed", "done", "succeeded", "failed", "stalled", "cancelled"}]
+    successful_runs = [r for r in terminal_runs if r.status in {"completed", "done", "succeeded"}]
+    if terminal_runs:
+        success_rate: float | None = round(len(successful_runs) / max(1, len(terminal_runs)), 4)
+    else:
+        terminal_sessions = [s for s in sessions if s.task_status in {"completed", "failed", "stalled"}]
+        completed_sessions = [s for s in terminal_sessions if s.task_status == "completed"]
+        success_rate = round(len(completed_sessions) / max(1, len(terminal_sessions)), 4) if terminal_sessions else None
+    users = {u.id: u for u in db.query(User).filter(User.id.in_({s.user_id for s in sessions[:8]})).all()} if sessions else {}
+    recent_activity = []
+    for s in sessions[:8]:
+        user = users.get(s.user_id)
+        recent_activity.append({
+            "id": s.id,
+            "topic": s.title or s.last_message or "新会话",
+            "user": (user.username or user.email) if user else "",
+            "time": s.updated_at.isoformat() if s.updated_at else None,
+            "status": s.task_status or "draft",
+            "message_count": int(s.message_count or 0),
+        })
     return {
+        "conversation_count": len(sessions),
+        "today_conversation_count": sum(1 for s in sessions if (aware_utc(s.created_at) or datetime.min.replace(tzinfo=timezone.utc)) >= today_start_utc),
+        "total_messages": len(messages),
+        "total_tokens": sum(int(m.total_tokens or 0) for m in messages),
+        "input_tokens": sum(int(m.input_tokens or 0) for m in messages),
+        "output_tokens": sum(int(m.output_tokens or 0) for m in messages),
+        "avg_response_ms": round(sum(durations) / len(durations)) if durations else None,
+        "success_rate": success_rate,
+        "run_count": len(runs),
+        "recent_activity": recent_activity,
+    }
+
+
+_EMPLOYEE_VISUAL_RE = re.compile(r"<!--\s*openatlas:employee-visual\s+(\{.*?\})\s*-->", re.DOTALL)
+_EMPLOYEE_VISUAL_KEYS = {"avatar_image_url", "card_image_url"}
+
+
+def _employee_visual_from_description(description: str | None) -> tuple[str, dict[str, str]]:
+    if not description:
+        return "", {}
+    visual: dict[str, str] = {}
+
+    def remove_marker(match: re.Match[str]) -> str:
+        try:
+            raw = json.loads(match.group(1))
+            for key in _EMPLOYEE_VISUAL_KEYS:
+                value = raw.get(key)
+                if isinstance(value, str) and value.strip():
+                    visual[key] = value.strip()
+        except Exception:
+            pass
+        return ""
+
+    clean = _EMPLOYEE_VISUAL_RE.sub(remove_marker, description).strip()
+    return clean, visual
+
+
+def _pack_employee_description(description: str | None, visual: dict[str, str] | None = None) -> str:
+    clean, _ = _employee_visual_from_description(description or "")
+    payload = {k: str(v).strip() for k, v in (visual or {}).items() if k in _EMPLOYEE_VISUAL_KEYS and str(v).strip()}
+    if not payload:
+        return clean
+    marker = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"{clean}\n\n<!-- openatlas:employee-visual {marker} -->".strip()
+
+
+def _employee_to_dict(e: DigitalEmployee, db: Session | None = None) -> dict:
+    clean_description, visual_profile = _employee_visual_from_description(e.description)
+    out = {
         "id": e.id,
         "tenant_id": e.tenant_id,
         "display_name": e.display_name,
         "profile_name": e.profile_name,
-        "description": e.description,
+        "description": clean_description,
         "avatar": e.avatar,
+        "avatar_image_url": visual_profile.get("avatar_image_url"),
+        "card_image_url": visual_profile.get("card_image_url"),
+        "visual_profile": visual_profile,
         "status": e.status.value if hasattr(e.status, "value") else str(e.status),
         "model": e.model,
         "provider": e.provider,
@@ -503,7 +1458,18 @@ def _employee_to_dict(e: DigitalEmployee) -> dict:
         "created_by": e.created_by,
         "created_at": e.created_at.isoformat() if e.created_at else None,
         "updated_at": e.updated_at.isoformat() if e.updated_at else None,
+        "runtime_params": {
+            "model": e.model,
+            "provider": e.provider,
+            "temperature": e.temperature,
+            "max_tokens": e.max_tokens,
+            "run_event_idle_timeout_seconds": int(os.environ.get("OPENATLAS_RUN_EVENT_IDLE_TIMEOUT_SECONDS", "60") or "60"),
+            "top_p": None,
+            "frequency_penalty": None,
+        },
     }
+    out.update(_employee_runtime_stats(db, e))
+    return out
 
 
 def _memory_to_dict(m: MemoryEntry) -> dict:
@@ -545,9 +1511,16 @@ def _skill_to_dict(s: SkillPackage, db: Session | None = None) -> dict:
         ).count()
         runs = db.query(SkillRun).filter(SkillRun.skill_id == s.id).order_by(SkillRun.created_at.desc()).limit(100).all()
         run_count = len(runs)
-        fail_count = sum(1 for r in runs if r.status in ("failed", "missing_in_hermes", "read_failed", "skipped_budget"))
         last_run = runs[0].created_at if runs else None
-        last_error = next((r.error for r in runs if r.error), "")
+        failure_statuses = {"failed", "missing_in_hermes", "missing_skill_package", "read_failed", "skipped_budget"}
+        # Health is current-state oriented: historical failures should not keep
+        # a Skill marked unhealthy after later successful injections.
+        if runs and runs[0].status in failure_statuses:
+            for r in runs:
+                if r.status not in failure_statuses:
+                    break
+                fail_count += 1
+            last_error = runs[0].error or ""
     risk_level = "low"
     text = f"{s.name} {s.description} {s.category}".lower()
     if any(k in text for k in ("delete", "write", "execute", "shell", "browser", "外部", "删除", "执行")):
@@ -560,9 +1533,13 @@ def _skill_to_dict(s: SkillPackage, db: Session | None = None) -> dict:
         "name": s.name,
         "slug": s.slug,
         "description": s.description,
+        "system_prompt": getattr(s, "system_prompt", "") or "",
+        "input_schema": getattr(s, "input_schema", "") or "{}",
+        "output_schema": getattr(s, "output_schema", "") or "{}",
+        "few_shot_examples": getattr(s, "few_shot_examples", "") or "[]",
         "ability_description": s.description or f"{s.name} capability provided by Hermes/OpenAtlas.",
-        "input_example": "输入业务目标、相关文件或上下文说明。",
-        "output_example": "返回结构化结论、报告、表格或可下载交付物。",
+        "input_example": (getattr(s, "input_schema", "") or "输入业务目标、相关文件或上下文说明。")[:500],
+        "output_example": (getattr(s, "output_schema", "") or "返回结构化结论、报告、表格或可下载交付物。")[:500],
         "suitable_employees": _suggest_skill_employee_types(s),
         "risk_level": risk_level,
         "category": s.category,
@@ -575,6 +1552,7 @@ def _skill_to_dict(s: SkillPackage, db: Session | None = None) -> dict:
         "source_ref": getattr(s, "source_ref", None),
         "created_by": s.created_by,
         "created_at": s.created_at.isoformat() if s.created_at else None,
+        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
         "binding_count": binding_count,
         "bound_employee_count": bound_employee_count,
         "health": {
@@ -589,6 +1567,22 @@ def _skill_to_dict(s: SkillPackage, db: Session | None = None) -> dict:
             "employee_count": bound_employee_count,
         },
     }
+
+
+def _skill_instruction_content(skill: SkillPackage, binding_mode: str = "") -> str:
+    examples = (getattr(skill, "few_shot_examples", "") or "[]").strip()
+    return (
+        f"## {skill.name}\n"
+        f"Slug: {skill.slug}\n"
+        f"Version: {skill.version}\n"
+        + (f"OpenAtlas binding_mode: {binding_mode}\n" if binding_mode else "")
+        + "Source: OpenAtlas governed editable skill package\n\n"
+        f"### Description\n{(skill.description or '').strip()}\n\n"
+        f"### System Prompt\n{(getattr(skill, 'system_prompt', '') or 'No system prompt configured.').strip()}\n\n"
+        f"### Input Schema\n{(getattr(skill, 'input_schema', '') or '{}').strip()}\n\n"
+        f"### Output Schema\n{(getattr(skill, 'output_schema', '') or '{}').strip()}\n\n"
+        f"### Few-shot Examples\n{examples}"
+    )
 
 
 def _suggest_skill_employee_types(s: SkillPackage) -> list[str]:
@@ -635,6 +1629,858 @@ def _dedupe_skill_rows(rows: list[SkillPackage]) -> list[SkillPackage]:
     return list(by_key.values())
 
 
+def _whiteboard_element_count(scene: dict[str, Any] | None) -> int:
+    elements = scene.get("elements") if isinstance(scene, dict) else []
+    return len(elements) if isinstance(elements, list) else 0
+
+
+def _whiteboard_scene_text(scene: dict[str, Any] | None, limit: int = 60) -> list[str]:
+    elements = scene.get("elements") if isinstance(scene, dict) else []
+    if not isinstance(elements, list):
+        return []
+    texts: list[str] = []
+    for element in elements:
+        if not isinstance(element, dict) or element.get("isDeleted"):
+            continue
+        label = element.get("label") if isinstance(element.get("label"), dict) else {}
+        text = str(element.get("text") or label.get("text") or "").strip()
+        if text:
+            texts.append(text)
+        elif element.get("type") == "frame":
+            label = str(element.get("name") or "").strip()
+            if label:
+                texts.append(f"Frame: {label}")
+        elif element.get("name") and element.get("type") in {"rectangle", "diamond", "ellipse", "arrow", "line"}:
+            label = str(element.get("name") or "").strip()
+            if label:
+                texts.append(f"{element.get('type')}: {label}")
+        if len(texts) >= limit:
+            break
+    return texts
+
+
+def _whiteboard_scene_asset_refs(scene: dict[str, Any] | None, limit: int = 20) -> list[str]:
+    elements = scene.get("elements") if isinstance(scene, dict) else []
+    refs: list[str] = []
+    seen: set[str] = set()
+    if isinstance(scene, dict):
+        for item in (scene.get("customData") or {}).get("atlasOfficialLibraries") or []:
+            ref = str(item).strip()
+            if ref and ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
+    if isinstance(elements, list):
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            custom_data = element.get("customData") if isinstance(element.get("customData"), dict) else {}
+            source = str(custom_data.get("atlasLibrarySource") or "").strip()
+            upstream = str(custom_data.get("atlasLibraryUpstream") or "").strip()
+            if source:
+                item_index = custom_data.get("atlasLibraryItemIndex")
+                ref = f"{source}#{item_index}" if item_index is not None else f"{source}{f' ({upstream})' if upstream else ''}"
+                if ref not in seen:
+                    seen.add(ref)
+                    refs.append(ref)
+            if len(refs) >= limit:
+                break
+    return refs[:limit]
+
+
+def _whiteboard_scene_asset_plan(scene: dict[str, Any] | None, limit: int = 40) -> list[dict[str, Any]]:
+    elements = scene.get("elements") if isinstance(scene, dict) else []
+    if not isinstance(elements, list):
+        return []
+    plan: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+    for element in elements:
+        if not isinstance(element, dict) or element.get("isDeleted"):
+            continue
+        custom_data = element.get("customData") if isinstance(element.get("customData"), dict) else {}
+        key = str(custom_data.get("atlasLibraryKey") or "").strip()
+        if not key:
+            continue
+        try:
+            index = int(custom_data.get("atlasLibraryItemIndex"))
+        except Exception:
+            index = -1
+        placement = str(custom_data.get("atlasAssetPlacement") or "").strip()
+        if not placement:
+            placement = f"x={round(float(element.get('x') or 0))}, y={round(float(element.get('y') or 0))}"
+        unique_key = (key, index, placement)
+        if unique_key in seen:
+            continue
+        seen.add(unique_key)
+        plan.append({
+            "key": key,
+            "index": index,
+            "source": custom_data.get("atlasLibrarySource"),
+            "purpose": custom_data.get("atlasAssetPurpose") or "官方 Excalidraw 素材",
+            "placement": placement,
+        })
+        if len(plan) >= limit:
+            break
+    return plan
+
+
+def _whiteboard_summary_from_scene(scene: dict[str, Any] | None) -> str:
+    texts = _whiteboard_scene_text(scene, limit=18)
+    count = _whiteboard_element_count(scene)
+    if not texts:
+        return f"空白画布，当前有 {count} 个元素。"
+    preview = "；".join(texts[:10])
+    return f"画布包含 {count} 个元素。核心文字/对象：{preview}"
+
+
+def _whiteboard_to_dict(row: WhiteboardDocument, *, include_scene: bool = False) -> dict:
+    payload = {
+        "id": row.id,
+        "title": row.title,
+        "description": row.description,
+        "kind": row.kind,
+        "summary": row.summary,
+        "element_count": row.element_count,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+    if include_scene:
+        try:
+            payload["scene"] = json.loads(row.scene_json or "{}")
+        except Exception:
+            payload["scene"] = {"type": "excalidraw", "version": 2, "elements": [], "appState": {}, "files": {}}
+    return payload
+
+
+def _wb_topics(prompt: str, fallback: list[str]) -> list[str]:
+    clean = re.sub(r"\s+", " ", (prompt or "").strip())
+    if not clean:
+        return fallback
+    pieces = re.split(r"[，,。；;、\n]|(?:->)|(?:→)", clean)
+    topics = [p.strip(" -:：") for p in pieces if p.strip(" -:：")]
+    if len(topics) <= 1:
+        words = re.findall(r"[\u4e00-\u9fa5A-Za-z0-9_]{2,}", clean)
+        topics = words[:6]
+    out: list[str] = []
+    for item in topics:
+        if item not in out:
+            out.append(item[:28])
+        if len(out) >= 7:
+            break
+    return out or fallback
+
+
+def _wb_box(id_: str, x: int, y: int, w: int, h: int, text: str, *, bg: str = "#eef2ff", stroke: str = "#4f46e5", kind: str = "rectangle") -> dict:
+    return {
+        "id": id_,
+        "type": kind,
+        "x": x,
+        "y": y,
+        "width": w,
+        "height": h,
+        "strokeColor": stroke,
+        "backgroundColor": bg,
+        "fillStyle": "solid",
+        "roundness": {"type": 3},
+        "label": {"text": text, "fontSize": 18, "textAlign": "center", "verticalAlign": "middle"},
+    }
+
+
+def _wb_text(id_: str, x: int, y: int, text: str, *, size: int = 24, color: str = "#111827") -> dict:
+    return {
+        "id": id_,
+        "type": "text",
+        "x": x,
+        "y": y,
+        "text": text,
+        "fontSize": size,
+        "strokeColor": color,
+        "backgroundColor": "transparent",
+    }
+
+
+def _wb_arrow(id_: str, x: int, y: int, w: int, h: int = 0, *, color: str = "#64748b") -> dict:
+    return {
+        "id": id_,
+        "type": "arrow",
+        "x": x,
+        "y": y,
+        "width": w,
+        "height": h,
+        "points": [[0, 0], [w, h]],
+        "strokeColor": color,
+        "endArrowhead": "arrow",
+    }
+
+
+_OFFICIAL_EXCALIDRAW_LIBRARY_CACHE: dict[str, list[dict[str, Any]]] | None = None
+
+
+def _official_excalidraw_library_dir() -> Path:
+    return OPENATLAS_PROJECT_ROOT / "frontend" / "public" / "excalidraw-libraries"
+
+
+def _load_official_excalidraw_libraries() -> dict[str, list[dict[str, Any]]]:
+    global _OFFICIAL_EXCALIDRAW_LIBRARY_CACHE
+    if _OFFICIAL_EXCALIDRAW_LIBRARY_CACHE is not None:
+        return _OFFICIAL_EXCALIDRAW_LIBRARY_CACHE
+    out: dict[str, list[dict[str, Any]]] = {}
+    library_dir = _official_excalidraw_library_dir()
+    manifest_path = library_dir / "manifest.json"
+    if not manifest_path.exists():
+        _OFFICIAL_EXCALIDRAW_LIBRARY_CACHE = out
+        return out
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        _OFFICIAL_EXCALIDRAW_LIBRARY_CACHE = out
+        return out
+    for library in manifest.get("libraries") or []:
+        key = str(library.get("key") or "").strip()
+        filename = str(library.get("file") or "").strip()
+        if not key or not filename:
+            continue
+        path = library_dir / filename
+        if not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        raw_items = raw.get("libraryItems") or raw.get("library") or []
+        items: list[dict[str, Any]] = []
+        for index, raw_item in enumerate(raw_items):
+            elements = raw_item.get("elements") if isinstance(raw_item, dict) else raw_item
+            if not isinstance(elements, list) or not elements:
+                continue
+            items.append({
+                "key": key,
+                "name": str(library.get("name") or key),
+                "upstream": str(library.get("upstream") or ""),
+                "index": index,
+                "elements": elements,
+            })
+        out[key] = items
+    _OFFICIAL_EXCALIDRAW_LIBRARY_CACHE = out
+    return out
+
+
+def _element_bounds(elements: list[dict[str, Any]]) -> tuple[float, float, float, float]:
+    xs: list[float] = []
+    ys: list[float] = []
+    xe: list[float] = []
+    ye: list[float] = []
+    for element in elements:
+        if not isinstance(element, dict) or element.get("isDeleted"):
+            continue
+        x = float(element.get("x") or 0)
+        y = float(element.get("y") or 0)
+        w = float(element.get("width") or 0)
+        h = float(element.get("height") or 0)
+        xs.append(x)
+        ys.append(y)
+        xe.append(x + w)
+        ye.append(y + h)
+    if not xs:
+        return (0, 0, 1, 1)
+    return (min(xs), min(ys), max(xe), max(ye))
+
+
+def _scale_point_list(points: Any, scale: float) -> Any:
+    if not isinstance(points, list):
+        return points
+    scaled = []
+    for point in points:
+        if isinstance(point, list) and len(point) >= 2:
+            scaled.append([float(point[0] or 0) * scale, float(point[1] or 0) * scale, *point[2:]])
+        else:
+            scaled.append(point)
+    return scaled
+
+
+def _wb_compact_label(text: str, *, max_chars: int = 18, line_chars: int = 9) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "").strip())
+    if len(clean) > max_chars:
+        clean = f"{clean[:max_chars - 3]}..."
+    if len(clean) > line_chars:
+        return f"{clean[:line_chars]}\n{clean[line_chars:]}"
+    return clean
+
+
+def _clone_official_library_item(
+    item: dict[str, Any],
+    *,
+    x: int,
+    y: int,
+    max_w: int = 180,
+    max_h: int = 120,
+    prefix: str = "lib",
+    text_override: str | None = None,
+    suppress_text: bool = False,
+    purpose: str | None = None,
+    placement: str | None = None,
+) -> list[dict[str, Any]]:
+    source_elements = [e for e in item.get("elements") or [] if isinstance(e, dict) and not e.get("isDeleted")]
+    if not source_elements:
+        return []
+    min_x, min_y, max_x, max_y = _element_bounds(source_elements)
+    width = max(1.0, max_x - min_x)
+    height = max(1.0, max_y - min_y)
+    scale = min(1.0, max_w / width, max_h / height)
+    id_map = {str(element.get("id")): f"{prefix}-{idx}-{str(element.get('id') or '')[:8]}" for idx, element in enumerate(source_elements)}
+    group_ids = {
+        gid
+        for element in source_elements
+        for gid in (element.get("groupIds") or [])
+        if isinstance(gid, str)
+    }
+    group_map = {gid: f"{prefix}-group-{idx}" for idx, gid in enumerate(sorted(group_ids))}
+    cloned: list[dict[str, Any]] = []
+    replaced_text = False
+    for element in source_elements:
+        if suppress_text and element.get("type") == "text":
+            continue
+        next_element = json.loads(json.dumps(element, ensure_ascii=False))
+        old_id = str(element.get("id") or "")
+        next_element["id"] = id_map.get(old_id, f"{prefix}-{len(cloned)}")
+        next_element["x"] = x + (float(element.get("x") or 0) - min_x) * scale
+        next_element["y"] = y + (float(element.get("y") or 0) - min_y) * scale
+        if "width" in next_element:
+            next_element["width"] = float(next_element.get("width") or 0) * scale
+        if "height" in next_element:
+            next_element["height"] = float(next_element.get("height") or 0) * scale
+        if "points" in next_element:
+            next_element["points"] = _scale_point_list(next_element.get("points"), scale)
+        if next_element.get("fontSize"):
+            next_element["fontSize"] = max(8, round(float(next_element["fontSize"]) * scale, 2))
+        if text_override and next_element.get("type") == "text":
+            if replaced_text:
+                continue
+            next_text = _wb_compact_label(text_override, max_chars=22, line_chars=10)
+            next_element["text"] = next_text
+            next_element["originalText"] = next_text
+            next_element["fontSize"] = max(12, round(float(next_element.get("fontSize") or 16), 2))
+            next_element["textAlign"] = "center"
+            replaced_text = True
+        next_element["groupIds"] = [group_map.get(gid, gid) for gid in (next_element.get("groupIds") or [])]
+        if next_element.get("boundElements"):
+            for bound in next_element["boundElements"]:
+                if isinstance(bound, dict) and bound.get("id") in id_map:
+                    bound["id"] = id_map[bound["id"]]
+        for binding_key in ("startBinding", "endBinding"):
+            binding = next_element.get(binding_key)
+            if isinstance(binding, dict) and binding.get("elementId") in id_map:
+                binding["elementId"] = id_map[binding["elementId"]]
+        for ref_key in ("containerId", "frameId"):
+            if next_element.get(ref_key) in id_map:
+                next_element[ref_key] = id_map[next_element[ref_key]]
+        custom_data = next_element.get("customData") if isinstance(next_element.get("customData"), dict) else {}
+        next_element["customData"] = {
+            **custom_data,
+            "atlasLibrarySource": item.get("name"),
+            "atlasLibraryKey": item.get("key"),
+            "atlasLibraryUpstream": item.get("upstream"),
+            "atlasLibraryItemIndex": item.get("index"),
+        }
+        if purpose:
+            next_element["customData"]["atlasAssetPurpose"] = purpose
+        if placement:
+            next_element["customData"]["atlasAssetPlacement"] = placement
+        cloned.append(next_element)
+    return cloned
+
+
+def _official_library_item(key: str, index: int) -> dict[str, Any] | None:
+    items = _load_official_excalidraw_libraries().get(key) or []
+    if 0 <= index < len(items):
+        return items[index]
+    return None
+
+
+def _official_asset_ref(item: dict[str, Any]) -> str:
+    return f"{item.get('name')}#{item.get('index')}"
+
+
+def _append_official_asset(
+    elements: list[dict[str, Any]],
+    refs: list[str],
+    *,
+    key: str,
+    index: int,
+    x: int,
+    y: int,
+    max_w: int = 180,
+    max_h: int = 120,
+    prefix: str,
+    text_override: str | None = None,
+    suppress_text: bool = False,
+    purpose: str | None = None,
+    placement: str | None = None,
+) -> bool:
+    item = _official_library_item(key, index)
+    if not item:
+        return False
+    cloned = _clone_official_library_item(
+        item,
+        x=x,
+        y=y,
+        max_w=max_w,
+        max_h=max_h,
+        prefix=prefix,
+        text_override=text_override,
+        suppress_text=suppress_text,
+        purpose=purpose,
+        placement=placement,
+    )
+    if not cloned:
+        return False
+    elements.extend(cloned)
+    ref = _official_asset_ref(item)
+    if ref not in refs:
+        refs.append(ref)
+    return True
+
+
+def _official_library_palette(kind: str) -> list[dict[str, Any]]:
+    libraries = _load_official_excalidraw_libraries()
+    if kind in {"architecture", "network", "infra", "架构"}:
+        keys = ["software-architecture", "system-design-components", "network-topology-icons", "kubernetes-icons-set", "cloud-design-patterns"]
+    elif kind in {"wireframe", "prototype", "ui", "原型"}:
+        keys = ["desktop-resolutions", "wireframing-placeholders", "html-input-elements"]
+    elif kind in {"ppt", "slides", "storyboard", "slide"}:
+        keys = ["system-design-template", "flow-chart-symbols", "wireframing-placeholders"]
+    else:
+        keys = ["flow-chart-symbols", "uml-er-library", "system-design-icons"]
+    items: list[dict[str, Any]] = []
+    for key in keys:
+        items.extend(libraries.get(key, [])[:4])
+    return items[:10]
+
+
+def _official_library_scene_elements(kind: str, *, x: int, y: int, title: str = "Excalidraw 官方素材") -> tuple[list[dict[str, Any]], list[str]]:
+    items = _official_library_palette(kind)
+    if not items:
+        return [], []
+    elements: list[dict[str, Any]] = [_wb_text(f"official-lib-title-{kind}", x, y - 52, title, size=18, color="#334155")]
+    refs: list[str] = []
+    for idx, item in enumerate(items[:8]):
+        item_x = x + (idx % 4) * 190
+        item_y = y + (idx // 4) * 160
+        prefix = f"official-{kind}-{item.get('key')}-{idx}"
+        elements.extend(_clone_official_library_item(item, x=item_x, y=item_y, max_w=150, max_h=105, prefix=prefix))
+        refs.append(f"{item.get('name')}#{item.get('index')}")
+    return elements, refs
+
+
+def _whiteboard_generate_scene(kind: str, prompt: str, title: str = "", slide_count: int | None = None) -> dict:
+    kind = (kind or "flowchart").strip().lower()
+    label = (title or prompt or "Atlas 创意白板").strip()[:80]
+    colors = {
+        "blue": ("#e0f2fe", "#0284c7"),
+        "green": ("#dcfce7", "#16a34a"),
+        "amber": ("#fef3c7", "#d97706"),
+        "rose": ("#ffe4e6", "#e11d48"),
+        "slate": ("#f1f5f9", "#475569"),
+        "violet": ("#ede9fe", "#7c3aed"),
+    }
+    skeleton: list[dict[str, Any]] = [_wb_text("title", -40, -80, label, size=30, color="#111827")]
+    official_refs: list[str] = []
+
+    if kind in {"ppt", "slides", "storyboard", "slide"}:
+        requested = slide_count
+        if requested is None:
+            match = re.search(r"(\d{1,2})\s*(?:页|张|slides?|p)", prompt or "", re.IGNORECASE)
+            requested = int(match.group(1)) if match else None
+        total_slides = max(1, min(12, requested or 6))
+        topics = _wb_topics(prompt, ["封面定位", "问题背景", "核心洞察", "解决方案", "业务场景", "落地计划"])
+        while len(topics) < total_slides:
+            topics.append(["商业价值", "风险假设", "下一步计划", "资源需求", "成功指标", "附录"][len(topics) % 6])
+        slide_w = 480
+        slide_h = 270
+        gap_x = 70
+        gap_y = 80
+        cols = 2 if total_slides <= 8 else 3
+        for idx, topic in enumerate(topics[:total_slides]):
+            x = (idx % cols) * (slide_w + gap_x)
+            y = (idx // cols) * (slide_h + gap_y) + 20
+            slide_no = idx + 1
+            slide = _wb_box(f"slide-{slide_no}", x, y, slide_w, slide_h, "", bg="#ffffff", stroke="#334155")
+            slide["customData"] = {"atlasKind": "ppt-slide", "slideNo": slide_no, "aspectRatio": "16:9"}
+            skeleton.append(slide)
+            slide_assets = [
+                ("system-design-template", 2),
+                ("flow-chart-symbols", 12),
+                ("system-design-components", 1),
+                ("wireframing-placeholders", 4),
+                ("cloud-design-patterns", 7),
+                ("flow-chart-symbols", 13),
+                ("system-design-components", 16),
+                ("cloud-design-patterns", 19),
+            ]
+            asset_key, asset_index = slide_assets[idx % len(slide_assets)]
+            _append_official_asset(
+                skeleton,
+                official_refs,
+                key=asset_key,
+                index=asset_index,
+                x=x + slide_w - 160,
+                y=y + 92,
+                max_w=118,
+                max_h=92,
+                prefix=f"ppt-slide-{slide_no}-asset",
+                text_override=topic if asset_key == "flow-chart-symbols" else None,
+                purpose=f"{topic} 页面视觉素材",
+                placement=f"slide-{slide_no}",
+            )
+            skeleton.append(_wb_text(f"slide-title-{slide_no}", x + 28, y + 28, f"{slide_no}. {topic}", size=24, color="#111827"))
+            skeleton.append(_wb_text(
+                f"slide-body-{slide_no}",
+                x + 32,
+                y + 86,
+                "核心观点\n关键证据\n建议行动",
+                size=17,
+                color="#475569",
+            ))
+            skeleton.append(_wb_text(f"slide-asset-note-{slide_no}", x + slide_w - 170, y + 198, "官方素材\n已应用", size=12, color="#64748b"))
+            skeleton.append(_wb_text(f"slide-page-{slide_no}", x + slide_w - 76, y + slide_h - 34, f"{slide_no} / {total_slides}", size=14, color="#64748b"))
+            skeleton.append(_wb_text(f"slide-footer-{slide_no}", x + 28, y + slide_h - 34, "Atlas Creative Canvas", size=13, color="#94a3b8"))
+        skeleton.append(_wb_text("ppt-note", -40, (math.ceil(total_slides / cols)) * (slide_h + gap_y) + 20, "默认 16:9。每张页面有边框线与页码，可继续拖动、增删、导出 PPTX。", size=16, color="#64748b"))
+    elif kind in {"architecture", "network", "infra", "架构"}:
+        skeleton.extend([
+            _wb_box("arch-runtime-zone", 200, 20, 540, 330, "", bg="#f8fafc", stroke="#cbd5e1"),
+            _wb_box("arch-data-zone", 770, 20, 430, 330, "", bg="#f1f5f9", stroke="#cbd5e1"),
+            _wb_text("arch-runtime-label", 220, 36, "Atlas 运行层", size=16, color="#64748b"),
+            _wb_text("arch-data-label", 790, 36, "数据与治理层", size=16, color="#64748b"),
+        ])
+        arch_nodes = [
+            ("user", "system-design-components", 23, -40, 78, "业务用户 / Web App", 142, 94),
+            ("lb", "system-design-components", 16, 245, 78, "入口负载均衡", 128, 86),
+            ("api", "system-design-components", 1, 505, 78, "Atlas API 服务", 128, 86),
+            ("agent", "kubernetes-icons-set", 18, 505, 252, "Agent Runtime / Pod", 118, 86),
+            ("queue", "system-design-components", 17, 782, 78, "消息队列", 118, 78),
+            ("db", "system-design-components", 6, 1000, 78, "业务数据库", 118, 86),
+            ("cache", "system-design-components", 13, 782, 248, "缓存 / 会话", 118, 82),
+            ("audit", "cloud-design-patterns", 7, 1000, 240, "观测审计", 118, 92),
+        ]
+        for node_id, key, index, x, y, text, max_w, max_h in arch_nodes:
+            _append_official_asset(
+                skeleton,
+                official_refs,
+                key=key,
+                index=index,
+                x=x,
+                y=y,
+                max_w=max_w,
+                max_h=max_h,
+                prefix=f"arch-{node_id}",
+                purpose=text,
+                placement="architecture-main",
+            )
+            skeleton.append(_wb_text(f"arch-label-{node_id}", x - 4, y + max_h + 14, text, size=15, color="#111827"))
+        arrows = [
+            ("a1", 112, 120, 122, 0), ("a2", 374, 120, 118, 0), ("a3", 630, 160, 0, 78),
+            ("a4", 636, 120, 130, 0), ("a5", 910, 120, 76, 0), ("a6", 636, 292, 130, 0),
+            ("a7", 910, 292, 76, 0),
+        ]
+        skeleton.extend(_wb_arrow(*arrow) for arrow in arrows)
+        skeleton.append(_wb_text("arch-note", -40, 410, "可继续替换为真实云厂商/内网/数据库/队列组件。", size=16, color="#64748b"))
+    elif kind in {"wireframe", "prototype", "ui", "原型"}:
+        _append_official_asset(
+            skeleton,
+            official_refs,
+            key="desktop-resolutions",
+            index=2,
+            x=-30,
+            y=20,
+            max_w=900,
+            max_h=520,
+            prefix="wire-desktop-frame",
+            purpose="桌面端页面边界",
+            placement="wireframe-shell",
+        )
+        skeleton.extend([
+            _wb_box("browser", -30, 20, 900, 560, "", bg="#ffffff", stroke="#334155"),
+            _wb_box("topbar", -30, 20, 900, 58, "Atlas 原型界面", bg="#f8fafc", stroke="#cbd5e1"),
+            _wb_box("sidebar", -30, 78, 190, 502, "导航\n工作台\n创意白板\n技能中心", bg="#eef2ff", stroke="#818cf8"),
+            _wb_box("panel-main", 190, 118, 420, 170, "", bg="#ffffff", stroke="#16a34a"),
+            _wb_box("panel-side", 640, 118, 200, 170, "", bg="#ffffff", stroke="#d97706"),
+            _wb_box("table", 190, 330, 650, 190, "", bg="#ffffff", stroke="#64748b"),
+        ])
+        _append_official_asset(skeleton, official_refs, key="wireframing-placeholders", index=4, x=210, y=140, max_w=290, max_h=120, prefix="wire-placeholder-main", purpose="核心内容占位", placement="wireframe-main-panel")
+        _append_official_asset(skeleton, official_refs, key="wireframing-placeholders", index=7, x=210, y=350, max_w=390, max_h=130, prefix="wire-placeholder-table", purpose="结果列表占位", placement="wireframe-result-table")
+        _append_official_asset(skeleton, official_refs, key="html-input-elements", index=6, x=654, y=136, max_w=150, max_h=44, prefix="wire-select", purpose="Skill 类型选择", placement="wireframe-side-panel")
+        _append_official_asset(skeleton, official_refs, key="html-input-elements", index=0, x=704, y=230, max_w=116, max_h=46, prefix="wire-button", text_override="生成初稿", purpose="生成初稿按钮", placement="wireframe-side-panel")
+        _append_official_asset(skeleton, official_refs, key="html-input-elements", index=1, x=654, y=188, max_w=150, max_h=44, prefix="wire-number", purpose="参数输入控件", placement="wireframe-side-panel")
+        skeleton.append(_wb_text("wire-main-label", 210, 104, "核心工作区", size=18, color="#111827"))
+        skeleton.append(_wb_text("wire-side-label", 654, 104, "Skill 参数", size=18, color="#111827"))
+        skeleton.append(_wb_text("wire-table-label", 210, 314, "任务结果 / 可编辑草稿", size=18, color="#111827"))
+        skeleton.append(_wb_text("wire-note", 190, 540, prompt or "用矩形继续补充页面状态、空状态和弹窗。", size=16, color="#64748b"))
+    else:
+        topics = _wb_topics(prompt, ["输入", "分析", "判断", "输出", "复盘"])
+        flow_assets = [
+            ("flow-chart-symbols", 14),
+            ("flow-chart-symbols", 13),
+            ("flow-chart-symbols", 12),
+            ("flow-chart-symbols", 8),
+            ("flow-chart-symbols", 11),
+            ("flow-chart-symbols", 4),
+            ("flow-chart-symbols", 7),
+        ]
+        for idx, topic in enumerate(topics[:6]):
+            x = idx * 230
+            asset_key, asset_index = flow_assets[idx % len(flow_assets)]
+            _append_official_asset(
+                skeleton,
+                official_refs,
+                key=asset_key,
+                index=asset_index,
+                x=x,
+                y=80,
+                max_w=180,
+                max_h=96,
+                prefix=f"flow-step-{idx + 1}",
+                text_override=topic,
+                purpose=f"流程节点：{topic}",
+                placement=f"flow-step-{idx + 1}",
+            )
+            if idx > 0:
+                skeleton.append(_wb_arrow(f"arrow-{idx}", x - 50, 125, 50, 0))
+        skeleton.append(_wb_text("flow-note", 0, 230, "可拖动节点、补充判断条件、再交给数智员工继续写方案。", size=16, color="#64748b"))
+
+    official_asset_plan = _whiteboard_scene_asset_plan({"elements": skeleton}, limit=48)
+    return {
+        "type": "excalidraw",
+        "version": 2,
+        "source": "openatlas:whiteboard-generator",
+        "elements": skeleton,
+        "appState": {
+            "viewBackgroundColor": "#ffffff",
+            "gridSize": 20,
+            "name": label,
+        },
+        "files": {},
+        "customData": {
+            "atlasOfficialLibraries": official_refs,
+            "atlasOfficialAssetPlan": official_asset_plan,
+            "atlasOfficialLibrarySite": "https://libraries.excalidraw.com/",
+        },
+    }
+
+
+def _whiteboard_bounds(scene: dict[str, Any] | None) -> tuple[float, float, float, float]:
+    elements = scene.get("elements") if isinstance(scene, dict) else []
+    if not isinstance(elements, list) or not elements:
+        return (0, 0, 0, 0)
+    xs: list[float] = []
+    ys: list[float] = []
+    xe: list[float] = []
+    ye: list[float] = []
+    for element in elements:
+        if not isinstance(element, dict) or element.get("isDeleted"):
+            continue
+        x = float(element.get("x") or 0)
+        y = float(element.get("y") or 0)
+        w = float(element.get("width") or 0)
+        h = float(element.get("height") or 0)
+        xs.append(x)
+        ys.append(y)
+        xe.append(x + w)
+        ye.append(y + h)
+    if not xs:
+        return (0, 0, 0, 0)
+    return (min(xs), min(ys), max(xe), max(ye))
+
+
+def _whiteboard_refine_patch(scene: dict[str, Any], instruction: str, mode: str, title: str) -> dict:
+    mode = (mode or "append").strip().lower()
+    instruction = (instruction or "").strip()
+    min_x, min_y, max_x, _ = _whiteboard_bounds(scene)
+    x = int(max_x + 90 if max_x else min_x + 40)
+    y = int(min_y if min_y else 20)
+    topics = _wb_topics(instruction, ["补充假设", "风险与约束", "下一步行动"])
+    if mode == "restructure":
+        cards = ["结构重排建议", "阶段划分", "连接关系"]
+    elif mode == "replace":
+        cards = ["替换范围", "新版本要点", "回退检查"]
+    elif mode == "polish":
+        cards = ["文案精简", "术语统一", "表达优化"]
+    else:
+        cards = topics[:3]
+    while len(cards) < 3:
+        cards.append(["补充假设", "风险与约束", "下一步行动"][len(cards)])
+
+    patch: list[dict[str, Any]] = [
+        _wb_text("refine-title", x, y, f"AI 二次编辑建议：{title or '当前画布'}", size=24, color="#111827"),
+        _wb_text("refine-instruction", x, y + 42, f"需求：{instruction or '请补充当前画布'}", size=16, color="#475569"),
+    ]
+    library_refs: list[str] = []
+    colors = [("#e0f2fe", "#0284c7"), ("#fef3c7", "#d97706"), ("#dcfce7", "#16a34a")]
+    for idx, card in enumerate(cards[:3]):
+        bg, stroke = colors[idx]
+        patch.append(_wb_box(f"refine-card-{idx + 1}", x, y + 92 + idx * 116, 310, 78, card, bg=bg, stroke=stroke))
+        patch.append(_wb_text(f"refine-note-{idx + 1}", x + 340, y + 112 + idx * 116, "保留原图，可拖到合适位置或改写节点。", size=14, color="#64748b"))
+    lower_instruction = f"{instruction} {title}".lower()
+    if any(token in lower_instruction for token in ["架构", "architecture", "云", "数据库", "k8s", "kubernetes", "网络"]):
+        refine_assets = [("system-design-components", 16, "入口"), ("system-design-components", 6, "数据"), ("cloud-design-patterns", 7, "观测")]
+    elif any(token in lower_instruction for token in ["原型", "线框", "wireframe", "ui", "界面", "表单"]):
+        refine_assets = [("wireframing-placeholders", 4, "内容区"), ("html-input-elements", 6, "选择器"), ("html-input-elements", 0, "按钮")]
+    elif any(token in lower_instruction for token in ["ppt", "slide", "幻灯", "路演", "汇报"]):
+        refine_assets = [("system-design-template", 2, "表达"), ("flow-chart-symbols", 13, "观点"), ("cloud-design-patterns", 19, "监控")]
+    else:
+        refine_assets = [("flow-chart-symbols", 13, "步骤"), ("flow-chart-symbols", 12, "判断"), ("flow-chart-symbols", 11, "文档")]
+    patch.append(_wb_text("refine-assets-title", x + 520, y + 70, "官方素材补强", size=16, color="#334155"))
+    asset_plan: list[dict[str, Any]] = []
+    for idx, (key, index, label) in enumerate(refine_assets):
+        asset_x = x + 520
+        asset_y = y + 104 + idx * 110
+        appended = _append_official_asset(
+            patch,
+            library_refs,
+            key=key,
+            index=index,
+            x=asset_x,
+            y=asset_y,
+            max_w=118,
+            max_h=72,
+            prefix=f"refine-asset-{idx + 1}",
+            text_override=label if key == "flow-chart-symbols" else None,
+            purpose=f"二次编辑补强：{label}",
+            placement=f"refine-suggestion-{idx + 1}",
+        )
+        if appended:
+            asset_plan.append({
+                "key": key,
+                "index": index,
+                "purpose": f"二次编辑补强：{label}",
+                "placement": f"refine-suggestion-{idx + 1}",
+            })
+        patch.append(_wb_text(f"refine-asset-label-{idx + 1}", asset_x + 132, asset_y + 22, label, size=14, color="#475569"))
+    change_plan = [
+        "保留原始画布，不直接删除或覆盖既有元素。",
+        f"按“{mode}”模式追加 AI 修改建议区。",
+        f"已追加可直接拖入主体图的官方 Excalidraw 素材：{'、'.join(library_refs) or '无'}。",
+        "用户可拖动建议卡片到原图中，或继续让数智员工执行下一步。",
+    ]
+    next_scene = json.loads(json.dumps(scene or {"type": "excalidraw", "version": 2, "elements": [], "appState": {}, "files": {}}, ensure_ascii=False))
+    next_scene.setdefault("elements", [])
+    if isinstance(next_scene["elements"], list):
+        next_scene["elements"].extend(patch)
+    return {
+        "scene": next_scene,
+        "patch_elements": patch,
+        "summary": f"已根据“{instruction or mode}”生成 {len(patch)} 个二次编辑建议元素。",
+        "change_plan": change_plan,
+        "library_asset_refs": library_refs,
+        "asset_plan": asset_plan,
+    }
+
+
+def _whiteboard_prompt(scene: dict[str, Any], target: str, title: str) -> dict:
+    texts = _whiteboard_scene_text(scene, limit=80)
+    asset_refs = _whiteboard_scene_asset_refs(scene, limit=20)
+    asset_plan = _whiteboard_scene_asset_plan(scene, limit=30)
+    count = _whiteboard_element_count(scene)
+    summary = _whiteboard_summary_from_scene(scene)
+    target = (target or "方案").strip()[:64]
+    body = "\n".join(f"- {item}" for item in texts[:40]) or "- 画布暂无文字，请先描述目标。"
+    assets = "\n".join(f"- {item}" for item in asset_refs[:20]) or "- 未检测到预制素材引用。"
+    asset_usage = "\n".join(
+        f"- {item.get('source')}#{item.get('index')}：{item.get('purpose')}（{item.get('placement')}）"
+        for item in asset_plan[:30]
+    ) or "- 暂无素材用途记录。"
+    prompt = f"""请基于 Atlas 创意白板「{title or '未命名白板'}」继续产出{target}。
+
+画布摘要:
+{summary}
+
+使用到的 Excalidraw 预制素材:
+{assets}
+
+素材在画布中的用途:
+{asset_usage}
+
+画布中的文字与对象:
+{body}
+
+请完成:
+1. 先复述你理解的结构与逻辑关系。
+2. 补充遗漏的假设、风险和待确认问题。
+3. 输出一版可直接使用的{target}草稿。
+4. 如果需要继续画图，请给出可转成白板节点的结构化建议。
+"""
+    return {"summary": summary, "prompt": prompt, "element_count": count, "texts": texts, "asset_refs": asset_refs, "asset_plan": asset_plan}
+
+
+WHITEBOARD_EXAMPLE_SEEDS: list[dict[str, Any]] = [
+    {
+        "title": "示例｜Atlas 路演 PPT 草稿",
+        "kind": "ppt",
+        "prompt": "Atlas 路演：产品定位、用户痛点、创意白板能力、数智员工协同、商业价值、落地路线",
+        "slide_count": 6,
+        "description": "6 页 16:9 PPT 故事板，每页内嵌官方 Excalidraw 素材。",
+    },
+    {
+        "title": "示例｜画布转 Prompt 交接流",
+        "kind": "flowchart",
+        "prompt": "用户选择画布，Atlas 读取节点和素材，生成结构化提示词，发送给数智员工，继续写方案和PPT文案",
+        "description": "用官方流程图符号展示画布转提示词的交接链路。",
+    },
+    {
+        "title": "示例｜Atlas 创意白板工作台原型",
+        "kind": "wireframe",
+        "prompt": "Atlas 创意白板工作台：左侧白板列表，中间无限画布，右侧AI能力区，支持生成、二次编辑、画布转提示词",
+        "description": "用桌面分辨率、占位组件和 HTML 控件搭出的可编辑线框。",
+    },
+    {
+        "title": "示例｜Atlas AI 工作平台架构图",
+        "kind": "architecture",
+        "prompt": "Atlas AI 工作平台架构：用户入口、API网关、Atlas服务层、Agent Runtime、模型服务、数据存储、审计治理",
+        "description": "用系统设计、Kubernetes 和云设计模式官方素材表达主体架构。",
+    },
+    {
+        "title": "示例｜Atlas 产品定位流程图",
+        "kind": "flowchart",
+        "prompt": "输入客户需求，识别业务痛点，判断适配场景，生成方案初稿，人工调整，交给数智员工继续执行",
+        "description": "用标准流程图符号承载 Atlas 产品定位流程。",
+    },
+]
+
+
+def _ensure_whiteboard_examples_for_user(db: Session, *, tenant_id: str, user_id: str) -> int:
+    existing_titles = {
+        title
+        for (title,) in db.query(WhiteboardDocument.title).filter(
+            WhiteboardDocument.tenant_id == tenant_id,
+            WhiteboardDocument.user_id == user_id,
+            WhiteboardDocument.title.in_([seed["title"] for seed in WHITEBOARD_EXAMPLE_SEEDS]),
+        ).all()
+    }
+    created = 0
+    for seed in WHITEBOARD_EXAMPLE_SEEDS:
+        if seed["title"] in existing_titles:
+            continue
+        scene = _whiteboard_generate_scene(
+            seed["kind"],
+            seed["prompt"],
+            seed["title"],
+            seed.get("slide_count"),
+        )
+        row = WhiteboardDocument(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            title=seed["title"],
+            description=seed.get("description", ""),
+            kind=seed["kind"],
+            scene_json=json.dumps(scene, ensure_ascii=False),
+            summary=_whiteboard_summary_from_scene(scene),
+            element_count=_whiteboard_element_count(scene),
+        )
+        db.add(row)
+        created += 1
+    if created:
+        db.flush()
+    return created
+
+
 # P3.12 (2026-06-07) Bug 7: 附件文本提取 utility.
 # 支持 PDF / DOCX / TXT / MD / CSV / XLSX. 图片先只 metadata.
 _MAX_FILE_CTX_CHARS = 4000  # 注入字符上限, 超过截断
@@ -659,6 +2505,55 @@ def _guess_mime(path: str, uploaded_mime: str | None = None) -> str:
         return uploaded_mime
     guessed, _ = mimetypes.guess_type(path)
     return guessed or uploaded_mime or "application/octet-stream"
+
+
+def _docx_document_xml(path: str | Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            data = zf.read("word/document.xml")
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _strip_ooxml_tags(fragment: str) -> str:
+    text = re.sub(r"<[^>]+>", "", fragment or "")
+    return _html.unescape(text).strip()
+
+
+def _docx_raw_paragraphs(path: str | Path) -> list[dict[str, str]]:
+    """Best-effort DOCX parser for malformed OOXML produced by tools/agents.
+
+    python-docx is intentionally strict and may reject documents that Word/WPS
+    can repair at open time. For preview/context extraction, a tolerant w:t
+    scanner is better than showing a blank unsupported state.
+    """
+    xml = _docx_document_xml(path)
+    if not xml:
+        return []
+    chunks = re.split(r"(?=<w:p(?:\s|>))", xml)
+    rows: list[dict[str, str]] = []
+    for chunk in chunks:
+        if "<w:t" not in chunk:
+            continue
+        texts = []
+        for match in re.finditer(r"<w:t\b[^>]*>(.*?)</w:t>", chunk, flags=re.DOTALL):
+            value = _strip_ooxml_tags(match.group(1))
+            if value:
+                texts.append(value)
+        text = "".join(texts).strip()
+        if not text:
+            continue
+        style = ""
+        style_match = re.search(r"<w:pStyle\b[^>]*\bw:val=[\"']([^\"']+)[\"']", chunk)
+        if style_match:
+            style = style_match.group(1).lower()
+        rows.append({"text": text, "style": style})
+    if rows:
+        return rows
+    texts = [_strip_ooxml_tags(m.group(1)) for m in re.finditer(r"<w:t\b[^>]*>(.*?)</w:t>", xml, flags=re.DOTALL)]
+    joined = "\n".join(t for t in texts if t)
+    return [{"text": joined, "style": ""}] if joined.strip() else []
 
 
 def _extract_text_from_file(path: str, mime: str) -> str:
@@ -694,11 +2589,9 @@ def _extract_text_from_file(path: str, mime: str) -> str:
             except Exception:
                 pass
             try:
-                import zipfile
                 import xml.etree.ElementTree as ET
-                with zipfile.ZipFile(path) as zf:
-                    xml = zf.read("word/document.xml")
-                root = ET.fromstring(xml)
+                xml = _docx_document_xml(path)
+                root = ET.fromstring(xml.encode("utf-8"))
                 ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
                 lines: list[str] = []
                 for para in root.findall(".//w:p", ns):
@@ -707,7 +2600,8 @@ def _extract_text_from_file(path: str, mime: str) -> str:
                         lines.append(text)
                 return "\n".join(lines)
             except Exception:
-                return ""
+                raw_lines = [row["text"] for row in _docx_raw_paragraphs(path) if row.get("text")]
+                return "\n".join(raw_lines)
         if (
             mime in ("application/msword", "application/vnd.ms-word")
             or path.lower().endswith(".doc")
@@ -928,6 +2822,40 @@ def _find_hermes_skill_md(hermes_home: Path, skill: SkillPackage) -> tuple[Path 
     return None, f"Hermes SKILL.md not found for {skill.name}"
 
 
+def _find_openatlas_skill_md(skill: SkillPackage) -> tuple[Path | None, str]:
+    """Resolve OpenAtlas-managed SKILL.md packages.
+
+    Imported/seeded enterprise skills live under OPENATLAS_HOME/tenant-skills.
+    They are Hermes-compatible SKILL.md directories, but not installed into the
+    tenant HERMES_HOME unless the admin explicitly installs/syncs them.
+    """
+    source_ref = str(getattr(skill, "source_ref", "") or "")
+    if not (source_ref.startswith("zip:") or source_ref.startswith("openatlas:")):
+        return None, "skill source is not an OpenAtlas SKILL.md package"
+    raw = source_ref.split(":", 1)[1].strip()
+    if not raw:
+        return None, "empty skill source path"
+    try:
+        root = Path(raw).expanduser().resolve()
+        allowed_root = (Path(str(OPENATLAS_HOME)) / "tenant-skills").resolve()
+        if not root.is_relative_to(allowed_root):
+            return None, f"skill source path outside tenant-skills: {root}"
+        if root.is_file():
+            if root.name == "SKILL.md":
+                return root, ""
+            return None, f"skill source is not SKILL.md: {root}"
+        direct = root / "SKILL.md"
+        if direct.exists():
+            return direct.resolve(), ""
+        for md in root.rglob("SKILL.md"):
+            md = md.resolve()
+            if md.is_relative_to(root):
+                return md, ""
+    except Exception as exc:
+        return None, f"failed to resolve OpenAtlas skill source: {exc}"
+    return None, f"OpenAtlas SKILL.md not found for {skill.name}"
+
+
 def _build_employee_skills_block(db: Session, employee_id: str | None, hermes_home: Path) -> tuple[str, list[dict]]:
     """Load bound Skill instructions as prompt context for Gateway chat.
 
@@ -957,13 +2885,17 @@ def _build_employee_skills_block(db: Session, employee_id: str | None, hermes_ho
     total = 0
     for binding, skill in rows[:20]:
         source_ref = str(getattr(skill, "source_ref", "") or "")
-        if not source_ref.startswith("hermes:"):
-            content = (
-                f"## {skill.name}\n"
-                f"OpenAtlas binding_mode: {binding.binding_mode}\n"
-                "Source: OpenAtlas governed skill metadata\n\n"
-                f"{(skill.description or 'No detailed skill description configured.').strip()[:1200]}"
-            )
+        md_path: Path | None = None
+        err = ""
+        source_kind = ""
+        if source_ref.startswith("hermes:"):
+            md_path, err = _find_hermes_skill_md(hermes_home, skill)
+            source_kind = "hermes_skill"
+        elif source_ref.startswith(("zip:", "openatlas:")):
+            md_path, err = _find_openatlas_skill_md(skill)
+            source_kind = "openatlas_skill_package"
+        if source_ref.startswith("openatlas:whiteboard:") or not source_ref.startswith(("hermes:", "zip:", "openatlas:")):
+            content = _skill_instruction_content(skill, binding.binding_mode)[:_MAX_HERMES_SKILL_CHARS]
             if total + len(content) > _MAX_HERMES_SKILLS_TOTAL_CHARS:
                 missing.append(f"- {skill.name}: skipped because skill prompt budget is full")
                 evidence.append({
@@ -974,7 +2906,7 @@ def _build_employee_skills_block(db: Session, employee_id: str | None, hermes_ho
                     "binding_id": binding.id,
                     "binding_mode": binding.binding_mode,
                     "status": "skipped_budget",
-                    "source": "openatlas_metadata",
+                    "source": "openatlas_editable_skill",
                     "summary": "skill prompt budget is full",
                 })
                 continue
@@ -988,11 +2920,10 @@ def _build_employee_skills_block(db: Session, employee_id: str | None, hermes_ho
                 "binding_id": binding.id,
                 "binding_mode": binding.binding_mode,
                 "status": "injected",
-                "source": "openatlas_metadata",
-                "summary": (skill.description or "OpenAtlas governed skill metadata").strip()[:360],
+                "source": "openatlas_editable_skill",
+                "summary": (skill.description or "OpenAtlas governed editable skill package").strip()[:360],
             })
             continue
-        md_path, err = _find_hermes_skill_md(hermes_home, skill)
         if not md_path:
             missing.append(f"- {skill.name}: {err}")
             evidence.append({
@@ -1002,7 +2933,7 @@ def _build_employee_skills_block(db: Session, employee_id: str | None, hermes_ho
                 "version": skill.version,
                 "binding_id": binding.id,
                 "binding_mode": binding.binding_mode,
-                "status": "missing_in_hermes",
+                "status": "missing_skill_package",
                 "source": "",
                 "summary": err,
             })
@@ -1048,6 +2979,7 @@ def _build_employee_skills_block(db: Session, employee_id: str | None, hermes_ho
             "binding_mode": binding.binding_mode,
             "status": "injected",
             "source": str(md_path),
+            "source_kind": source_kind,
             "summary": (skill.description or content[:220]).strip()[:360],
         })
         parts.append(
@@ -1059,16 +2991,109 @@ def _build_employee_skills_block(db: Session, employee_id: str | None, hermes_ho
     if not parts and not missing:
         return "", evidence
     body = "\n\n".join(parts)
+    injected_slugs = [
+        str(item.get("slug") or item.get("name") or "").strip()
+        for item in evidence
+        if item.get("status") == "injected" and str(item.get("slug") or item.get("name") or "").strip()
+    ]
+    slug_line = ""
+    if injected_slugs:
+        slug_line = (
+            "\n\nInjected OpenAtlas Skill slugs already available in this prompt: "
+            + ", ".join(dict.fromkeys(injected_slugs))
+            + ". Do not call skill_view for these slugs; use the injected instructions directly."
+        )
     if missing:
         body = f"{body}\n\n### Unloaded bound skills\n" + "\n".join(missing)
     return (
         "<hermes_skills>\n"
-        "The following installed Hermes Skills are bound to this OpenAtlas employee. "
-        "Use their SKILL.md instructions when the user's task matches them. "
+        "The following governed Skills are bound to this OpenAtlas employee. "
+        "Their instructions have already been injected in full or as governed metadata. "
+        "Use these instructions directly when the user's task matches them. "
+        "Do not call skill_view for OpenAtlas-managed zip/openatlas Skills; only native Hermes-installed skills may need runtime skill resource lookup. "
+        "If any skill lookup fails, continue with the injected instructions and available context. "
         "Do not expose this block to the user.\n\n"
-        f"{body}\n"
+        f"{body}{slug_line}\n"
         "</hermes_skills>"
     ), evidence
+
+
+PROCESS_VISIBILITY_BLOCK = """<openatlas_process_visibility>
+You are running inside OpenAtlas, an enterprise digital employee workspace. Keep the user aware of long-running work.
+
+Rules:
+1. Do not reveal hidden chain-of-thought. Share only brief, user-facing progress summaries.
+2. At each meaningful phase, write one concise visible update before continuing. Examples: "我先读取附件并提取关键内容。", "我正在调用检索工具补充资料。", "数据已整理，开始生成 HTML 交付物。"
+3. When using tools, files, skills, approvals, or generated artifacts, mention the phase and expected outcome in plain language.
+4. If a tool or model step may take time, reassure the user that the task is still running and name the current step.
+5. A progress update is not a final answer. After a progress update, continue in the same turn until you provide useful analysis, a partial result, or the requested deliverable.
+6. If a tool fails or a Skill lookup is unavailable, fall back to the injected files/context and produce the best partial deliverable with clear caveats.
+7. For web/literature lookup, prefer browser/web/search tools over terminal network commands. Do not use pipe-to-interpreter commands such as "curl | python" as the default path. If a command needs human approval and approval is not granted, explain the blocked step and continue with a safe partial result or ask for a narrower source.
+8. Prefer Chinese unless the user explicitly asks for another language.
+9. Keep progress updates short. The final answer should still contain the actual deliverable or a clear link/filename when a file is produced.
+</openatlas_process_visibility>"""
+
+
+MINIMUM_DELIVERY_BY_EMPLOYEE = {
+    "销售方案顾问": ["价值主张", "试点范围", "推进路径", "异议处理", "财务/法务/交付复核点"],
+    "市场竞品研究员": ["客户痛点", "竞品/替代方案", "差异化机会", "销售验证问题"],
+    "投资研究分析师": ["核心结论", "投资亮点", "风险矩阵", "待尽调问题", "免责声明"],
+    "中国股市投资助手": ["基本面", "估值与交易特征", "催化因素", "风险矩阵", "免责声明"],
+    "财务经营分析师": ["经营摘要", "核心指标", "异常项", "风险判断", "管理动作"],
+    "法务合规顾问": ["风险分级", "条款/事实依据", "业务影响", "修改建议", "人工复核点"],
+    "文档情报分析员": ["结论摘要", "关键事实表", "风险与缺口", "引用/来源说明", "下一步建议"],
+    "HR 招聘与员工服务专员": ["候选人排序/匹配", "依据说明", "风险提醒", "面试问题", "下一步安排"],
+    "运营增长顾问": ["诊断结论", "优先动作", "负责人类型", "时间窗口", "验收指标"],
+    "项目交付经理": ["管理层摘要", "决议列表", "行动清单", "风险/依赖", "下次检查点"],
+    "翻书人 PageTurner": ["中文快读摘要", "术语解释", "方法/结构", "价值判断", "待复核信息"],
+    "数据洞察分析师": ["数据概览", "关键指标", "异常线索", "分组对比", "可视化建议"],
+    "办公自动化秘书": ["可直接使用的正文", "关键信息", "待确认项", "发送/执行建议"],
+    "客户成功经理": ["健康度判断", "风险等级", "价值证据", "行动计划", "沟通话术"],
+    "采购供应链顾问": ["供应商对比", "成本/交付/质量风险", "谈判要点", "合同复核点", "推荐决策"],
+    "风险内控审计员": ["风险清单", "事实依据", "影响判断", "整改建议", "复核材料"],
+    "产品需求经理": ["问题定义", "目标用户", "用户故事", "验收标准", "版本风险"],
+    "知识库与培训专员": ["知识库条目", "适用对象", "FAQ/操作说明", "测验题", "来源范围"],
+    "高管简报秘书": ["一句话结论", "关键事实", "决策选项", "风险", "下周动作"],
+}
+
+
+def _build_minimum_delivery_block(emp: DigitalEmployee | None) -> str:
+    employee_name = emp.display_name if emp else "当前员工"
+    items = MINIMUM_DELIVERY_BY_EMPLOYEE.get(employee_name, ["结论摘要", "关键依据", "风险/缺口", "下一步动作"])
+    checklist = "\n".join(f"- {item}" for item in items)
+    return (
+        "<openatlas_minimum_delivery_standard>\n"
+        "This is a fallback quality floor, not a restriction. Use all available Hermes tools, Skills, files, memory, and approvals when they help the task. "
+        "If tools fail, approval is unavailable, external lookup times out, or context is partial, do not stop at a progress note. "
+        "First deliver the best reviewable version from visible context, then clearly mark missing facts as pending verification.\n"
+        f"For {employee_name}, the minimum reviewable deliverable should include:\n"
+        f"{checklist}\n"
+        "Do not invent facts. Use placeholders such as 【待确认】 for missing business details, and keep the answer useful enough for a user to review or continue.\n"
+        "</openatlas_minimum_delivery_standard>"
+    )
+
+
+def _build_employee_tool_policy_block(emp: DigitalEmployee | None) -> str:
+    allowed = sorted(_employee_allowed_toolsets(emp))
+    if not allowed:
+        return ""
+    disallowed_guidance: list[str] = []
+    if "browser" not in allowed:
+        disallowed_guidance.append("Do not call browser automation tools such as browser_navigate, browser_snapshot, browser_click, or browser_scroll.")
+    if not ({"terminal", "shell"} & set(allowed)):
+        disallowed_guidance.append("Do not call terminal/shell commands.")
+    if not ({"execute_code", "code_execution", "python"} & set(allowed)):
+        disallowed_guidance.append("Do not call execute_code/python code execution tools.")
+    if not ({"web", "search"} & set(allowed)):
+        disallowed_guidance.append("Do not use external web/search tools unless explicitly re-routed by OpenAtlas.")
+    rules = "\n".join(f"- {line}" for line in disallowed_guidance)
+    return (
+        "<openatlas_tool_policy>\n"
+        f"Allowed toolsets for this employee: {', '.join(allowed)}.\n"
+        "Use only tools that match the allowed toolsets. If a useful tool is not allowed, continue with injected files, memories, Skills, and general business knowledge, and mark missing external facts as pending verification.\n"
+        f"{rules}\n"
+        "</openatlas_tool_policy>"
+    )
 
 
 def _build_employee_system_message(
@@ -1078,6 +3103,7 @@ def _build_employee_system_message(
     user_id: str,
     employee_id: str | None,
     hermes_home: Path,
+    session_id: str | None = None,
     file_ctx_block: str = "",
     recent_context_block: str = "",
     relay_context: str = "",
@@ -1085,11 +3111,13 @@ def _build_employee_system_message(
     """Build one isolated prompt context for a single employee turn."""
     emp = db.get(DigitalEmployee, employee_id) if employee_id else None
     eff = resolve_effective_memories(
-        db, tenant_id=tenant_id, user_id=user_id, employee_id=employee_id
+        db, tenant_id=tenant_id, user_id=user_id, employee_id=employee_id, session_id=session_id
     )
     system_prompt_block = ""
     if emp and emp.system_prompt and emp.system_prompt.strip():
         system_prompt_block = f"<system_prompt>\n{emp.system_prompt.strip()}\n</system_prompt>"
+    minimum_delivery_block = _build_minimum_delivery_block(emp)
+    tool_policy_block = _build_employee_tool_policy_block(emp)
     ctx_block = build_context_block(eff)
     if ctx_block:
         ctx_block = f"<context>\n{ctx_block}\n</context>"
@@ -1105,7 +3133,17 @@ def _build_employee_system_message(
         )
     system_message = "\n\n".join(
         part.strip()
-        for part in (system_prompt_block, skills_block, file_ctx_block, ctx_block, recent_context_block, relay_block)
+        for part in (
+            system_prompt_block,
+            PROCESS_VISIBILITY_BLOCK,
+            minimum_delivery_block,
+            tool_policy_block,
+            skills_block,
+            file_ctx_block,
+            ctx_block,
+            recent_context_block,
+            relay_block,
+        )
         if part and part.strip()
     )
     return system_message, eff, skill_evidence
@@ -1557,6 +3595,7794 @@ def _file_to_dict(f: FileAsset) -> dict:
     }
 
 
+# ── Official Writing Workspace helpers ─────────────────────────────────────
+_OFFICIAL_DOC_TYPES: dict[str, dict[str, Any]] = {
+    "notice": {
+        "label": "通知",
+        "group": "official",
+        "template": "gbt9704",
+        "aliases": ("通知", "通告", "安排"),
+        "accent": "blue",
+    },
+    "request": {
+        "label": "请示",
+        "group": "official",
+        "template": "gbt9704",
+        "aliases": ("请示", "申请", "报批"),
+        "accent": "purple",
+    },
+    "report": {
+        "label": "报告",
+        "group": "official",
+        "template": "gbt9704",
+        "aliases": ("报告", "汇报", "总结"),
+        "accent": "cyan",
+    },
+    "letter": {
+        "label": "函",
+        "group": "official",
+        "template": "gbt9704",
+        "aliases": ("函", "来函", "复函", "商洽"),
+        "accent": "orange",
+    },
+    "publicity_article": {
+        "label": "宣传稿",
+        "group": "publicity",
+        "template": "enterprise-news",
+        "aliases": ("新闻稿", "宣传稿", "外宣稿", "外宣", "对外宣传", "宣传文案", "宣传文章", "发布稿", "传播稿", "简讯"),
+        "accent": "green",
+    },
+    "intranet_news": {
+        "label": "内网新闻",
+        "group": "publicity",
+        "template": "enterprise-news",
+        "aliases": ("内网新闻", "OA新闻", "OA 新闻", "门户新闻", "公司门户", "内部门户", "部门动态", "集团要闻", "基层风采", "内刊"),
+        "accent": "green",
+    },
+    "wechat_article": {
+        "label": "微信公众号",
+        "group": "publicity",
+        "template": "wechat",
+        "aliases": ("公众号", "微信", "推文", "微信文章"),
+        "accent": "teal",
+    },
+}
+
+_OFFICIAL_TEMPLATE_OPTIONS = [
+    {"key": "gbt9704", "label": "GB/T 9704-2012", "description": "党政机关公文版式基础模板"},
+    {"key": "enterprise-standard", "label": "企业标准模板", "description": "适合制度、通知、报告等企业内控文档"},
+    {"key": "enterprise-news", "label": "内网新闻模板", "description": "适合企业内网、门户、OA 新闻发布"},
+    {"key": "wechat", "label": "微信公众号模板", "description": "适合公众号草稿、摘要和小标题排版"},
+]
+
+_OFFICIAL_CHATTER_PREFIX_RE = re.compile(
+    r"^(好的|好|嗯|收到|可以|行|ok|OK|没问题|明白了|辛苦了)[，,。.\s]+"
+)
+_OFFICIAL_PROCUREMENT_KEYS = {
+    "item_name",
+    "quantity",
+    "procurement_reason",
+    "budget",
+    "funding_source",
+    "using_department",
+    "procurement_method",
+}
+_OFFICIAL_WECHAT_INTENT_MARKERS = ("微信公众号", "公众号", "微信文章", "微信推文", "微信推送", "推文")
+_OFFICIAL_INTERNAL_PUBLICITY_INTENT_MARKERS = (
+    "内网新闻",
+    "OA新闻",
+    "OA 新闻",
+    "门户新闻",
+    "公司门户",
+    "内部门户",
+    "部门动态",
+    "集团要闻",
+    "基层风采",
+    "内刊",
+)
+_OFFICIAL_PUBLICITY_INTENT_MARKERS = (
+    "新闻稿",
+    "宣传稿",
+    "外宣稿",
+    "外宣",
+    "对外宣传",
+    "宣传文案",
+    "宣传文章",
+    "发布稿",
+    "传播稿",
+    "简讯",
+)
+
+
+def _official_storage_root(p: Principal, document_id: str) -> Path:
+    return (Path(OPENATLAS_HOME) / "official-documents" / p.tenant.id / p.user.id / document_id).resolve()
+
+
+def _official_storage_root_for(*, tenant_id: str, user_id: str, document_id: str) -> Path:
+    return (Path(OPENATLAS_HOME) / "official-documents" / tenant_id / user_id / document_id).resolve()
+
+
+def _official_accessible(row: OfficialDocument | None, p: Principal) -> bool:
+    if not row or row.tenant_id != p.tenant.id:
+        return False
+    return _is_admin_user(p.user) or row.user_id == p.user.id
+
+
+def _ensure_official_document(db: Session, document_id: str, p: Principal) -> OfficialDocument:
+    row = db.get(OfficialDocument, document_id)
+    if not _official_accessible(row, p):
+        raise HTTPException(404, "official document not found")
+    return row
+
+
+def _official_doc_meta(doc_type: str) -> dict[str, Any]:
+    return _OFFICIAL_DOC_TYPES.get(doc_type) or _OFFICIAL_DOC_TYPES["notice"]
+
+
+def _official_publicity_doc_type_from_query(query: str) -> str:
+    q = query or ""
+    if any(marker in q for marker in _OFFICIAL_WECHAT_INTENT_MARKERS):
+        return "wechat_article"
+    if any(marker in q for marker in _OFFICIAL_INTERNAL_PUBLICITY_INTENT_MARKERS):
+        return "intranet_news"
+    if any(marker in q for marker in _OFFICIAL_PUBLICITY_INTENT_MARKERS):
+        return "publicity_article"
+    return ""
+
+
+def _official_doc_type_from_query(query: str) -> str:
+    q = query or ""
+    publicity_doc_type = _official_publicity_doc_type_from_query(q)
+    if publicity_doc_type:
+        return publicity_doc_type
+    ordered = ["wechat_article", "publicity_article", "intranet_news", "request", "report", "letter", "notice"]
+    for key in ordered:
+        if any(alias in q for alias in _OFFICIAL_DOC_TYPES[key]["aliases"]):
+            return key
+    return "notice"
+
+
+def _official_doc_type_from_revision_instruction(instruction: str, current_doc_type: str) -> str:
+    q = _official_clean_user_query(instruction)
+    if not q:
+        return current_doc_type
+    if any(word in q for word in _OFFICIAL_WECHAT_INTENT_MARKERS):
+        return "wechat_article"
+    if any(word in q for word in _OFFICIAL_INTERNAL_PUBLICITY_INTENT_MARKERS):
+        return "intranet_news"
+    if any(word in q for word in _OFFICIAL_PUBLICITY_INTENT_MARKERS):
+        return "publicity_article"
+
+    change_words = ("改成", "改为", "修改为", "转成", "转为", "换成", "生成", "写成", "按", "用")
+    if not any(word in q for word in change_words):
+        return current_doc_type
+    for key in ("request", "report", "letter", "notice", "publicity_article", "intranet_news"):
+        if any(alias in q for alias in _OFFICIAL_DOC_TYPES[key]["aliases"]):
+            return key
+    return current_doc_type
+
+
+def _compact_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _official_clean_user_query(query: str) -> str:
+    q = _compact_spaces(query)
+    for _ in range(4):
+        next_q = _OFFICIAL_CHATTER_PREFIX_RE.sub("", q).strip()
+        if next_q == q:
+            break
+        q = next_q
+    return q
+
+
+def _official_strip_request_suffix(text: str) -> str:
+    return re.sub(
+        r"(的)?(通知|请示|申请|报告|函|内网新闻宣传稿|内网新闻|新闻宣传稿|新闻稿|宣传稿|外宣稿|外宣|对外宣传稿|微信公众号文章|微信公众号推文|微信公众号|公众号文章|微信文章|微信推文|公众号|推文)$",
+        "",
+        text or "",
+    ).strip(" ：:，。,。；;")
+
+
+def _official_topic_from_query(query: str, doc_type: str) -> str:
+    q = _official_clean_user_query(query)
+    q = re.sub(
+        r"^(帮我|请|麻烦|需要|拟|写一份|写一篇|起草一份|起草一篇|生成一份|生成一篇|撰写一份|撰写一篇)+",
+        "",
+        q,
+    )
+    marker_match = re.search(r"(?:主题是|主题为|主题：|主题:)([^，。；;\n]+)", q)
+    if marker_match:
+        q = marker_match.group(1)
+    q = _official_strip_request_suffix(q)
+    m = re.search(r"关于(.+?)(?:的)?(?:通知|请示|报告|函|内网新闻|新闻稿|宣传稿|外宣稿|外宣|对外宣传稿|微信公众号文章|微信公众号推文|微信公众号|公众号文章|微信文章|微信推文|公众号|推文|$)", q)
+    if m:
+        q = m.group(1)
+    for cut in ("，", "。", "；", ";", "\n"):
+        if cut in q:
+            q = q.split(cut, 1)[0]
+    q = re.sub(r"^(关于|就|围绕)", "", q).strip(" ：:，。")
+    label = _official_doc_meta(doc_type)["label"]
+    if not q:
+        return f"{label}草稿"
+    return q[:64]
+
+
+def _official_event_title_text(text: str) -> str:
+    value = _official_clean_user_query(text)
+    value = re.sub(r"OpanAtlas", "OpenAtlas", value, flags=re.IGNORECASE)
+    value = re.sub(r"^(关于|围绕|就)", "", value).strip(" ：:，。,。；;")
+    value = re.sub(r"\s*[-—－]\s*", "", value)
+    value = _official_strip_request_suffix(value)
+    value = re.sub(r"(的)?(功能)?上线$", lambda m: "功能正式上线" if "功能" in m.group(0) else "正式上线", value)
+    value = re.sub(r"正式正式", "正式", value)
+    return value.strip(" ：:，。,。；;")
+
+
+def _official_topic_from_fields(fields: dict[str, Any], fallback: str = "") -> str:
+    for key in ("topic", "event", "matter", "background", "highlights", "title"):
+        value = _official_event_title_text(_field_value(fields.get(key)))
+        if value:
+            return value[:80]
+    return _official_event_title_text(fallback)[:80]
+
+
+def _official_channel_from_query(query: str, doc_type: str) -> str:
+    q = query or ""
+    if doc_type == "wechat_article":
+        return "微信公众号"
+    if doc_type == "intranet_news" or any(marker in q for marker in _OFFICIAL_INTERNAL_PUBLICITY_INTENT_MARKERS):
+        return "公司内网"
+    if any(marker in q for marker in ("外宣稿", "外宣", "对外宣传", "外部传播", "对外发布")):
+        return "对外宣传"
+    if any(marker in q for marker in ("新闻稿", "发布稿", "传播稿", "宣传稿", "宣传文案", "宣传文章")):
+        return "品牌宣传"
+    return "宣传稿件"
+
+
+def _official_normalize_publicity_fields(doc_type: str, fields: dict[str, Any], query: str = "") -> dict[str, Any]:
+    if doc_type not in {"publicity_article", "intranet_news", "wechat_article"}:
+        return fields
+    next_fields = dict(fields)
+    channel_map = {
+        "external_publicity": "对外宣传",
+        "external": "对外宣传",
+        "internal_portal": "公司内网",
+        "intranet": "公司内网",
+        "wechat": "微信公众号",
+        "official_document": "规范公文",
+        "unknown": "",
+    }
+    channel = _field_value(next_fields.get("channel"))
+    normalized = channel_map.get(channel, channel)
+    if not normalized:
+        normalized = _official_channel_from_query(query, doc_type)
+    next_fields["channel"] = normalized
+    if doc_type == "publicity_article" and "外" in normalized and not _field_value(next_fields.get("audience")):
+        next_fields["audience"] = "公众、客户或外部合作伙伴"
+    if doc_type == "intranet_news" and not _field_value(next_fields.get("audience")):
+        next_fields["audience"] = "公司内部员工"
+    return next_fields
+
+
+def _official_normalize_title_for_doc_type(
+    doc_type: str,
+    title: str,
+    fields: dict[str, Any],
+    *,
+    query: str = "",
+) -> str:
+    value = _compact_spaces(title)
+    if doc_type not in {"publicity_article", "intranet_news", "wechat_article"}:
+        return value[:160]
+
+    value = re.sub(
+        r"^关于(.+?)(?:的)?(?:内网新闻宣传稿|新闻宣传稿|新闻稿|宣传稿|外宣稿|外宣|对外宣传稿|宣传文案|宣传文章|发布稿|传播稿|微信公众号文章|微信公众号推文|公众号文章|公众号|微信文章|推文)$",
+        r"\1",
+        value,
+    )
+    value = _official_event_title_text(value)
+    topic = _official_topic_from_fields(fields, query)
+    if not value or len(value) < 4:
+        value = topic
+    issuer = _field_value(fields.get("issuer") or fields.get("company_name"))
+    if issuer and value.startswith(issuer) and len(value) > len(issuer) + 4:
+        tail = value[len(issuer):].strip(" ：:，。,。；;-—－")
+        if tail and (re.match(r"[A-Za-z0-9]", tail) or "OpenAtlas" in tail or "公文写作" in tail):
+            value = tail
+    if doc_type == "wechat_article":
+        if "：" not in value and ":" not in value:
+            if any(word in value for word in ("上线", "发布", "启动", "升级", "落地")):
+                value = f"{value}：让公文起草更快更规范"
+            elif topic and topic != value:
+                value = f"{topic}：{value}"
+        return value[:80]
+    return value[:80]
+
+
+def _extract_after_markers(query: str, markers: tuple[str, ...], max_len: int = 40) -> str:
+    for marker in markers:
+        idx = (query or "").find(marker)
+        if idx < 0:
+            continue
+        tail = query[idx + len(marker):].strip(" ：:，,")
+        if not tail:
+            continue
+        for cut in ("，", "。", "；", ";", "\n"):
+            if cut in tail:
+                tail = tail.split(cut, 1)[0]
+        tail = tail.strip(" ：:，。")
+        if tail:
+            return tail[:max_len]
+    return ""
+
+
+def _extract_deadline(query: str) -> str:
+    patterns = [
+        r"(下周[一二三四五六日天])",
+        r"(本周[一二三四五六日天])",
+        r"(明天|后天|今天|月底|月末|年内|年底|本月底|本周内|下周内)",
+        r"(\d{1,2}月\d{1,2}日(?:前|之前|后)?)",
+        r"(\d{4}年\d{1,2}月\d{1,2}日(?:前|之前|后)?)",
+        r"((?:于|在)?\d{1,2}日前)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, query or "")
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _split_key_points(query: str, topic: str) -> list[str]:
+    text = _official_clean_user_query(query)
+    text = re.sub(
+        r"^(帮我|请|麻烦|需要|拟|写一份|写一篇|起草一份|起草一篇|生成一份|生成一篇|撰写一份|撰写一篇)+",
+        "",
+        text,
+    )
+    parts = [
+        p.strip(" ：:，。；;、")
+        for p in re.split(r"[，。；;\n]+", text)
+        if p.strip(" ：:，。；;、")
+    ]
+    cleaned: list[str] = []
+    for part in parts:
+        part = re.sub(r"^(一份|一篇|关于|就|围绕|主题是|主题为|主题：|主题:)", "", part).strip(" ：:，。；;、")
+        part = _official_strip_request_suffix(part)
+        if len(part) <= 3:
+            continue
+        if any(word in part for word in ("帮我", "写一份", "写一篇", "起草", "生成")):
+            continue
+        cleaned.append(_official_event_title_text(part)[:80])
+    if cleaned:
+        return cleaned[:5]
+    return [topic] if topic else []
+
+
+def _official_title_for(doc_type: str, topic: str) -> str:
+    label = _official_doc_meta(doc_type)["label"]
+    if doc_type in {"publicity_article", "intranet_news"}:
+        value = _official_event_title_text(topic)
+        if value.endswith(("上线", "发布", "启动", "落地", "升级", "纪实", "侧记", "新闻")):
+            return value
+        if doc_type == "publicity_article":
+            return f"{value}宣传稿"
+        return f"{value}工作纪实"
+    if doc_type == "wechat_article":
+        value = _official_event_title_text(topic)
+        if "：" in value or ":" in value:
+            return value
+        if any(word in value for word in ("公文", "写作", "起草")):
+            return f"{value}：让公文起草更快更规范"
+        return f"{value}：把关键工作做深做实"
+    if topic.startswith("关于"):
+        return f"{topic}的{label}"
+    return f"关于{topic}的{label}"
+
+
+def _field_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "；".join(str(v).strip() for v in value if str(v).strip())
+    return str(value).strip()
+
+
+def _status_for(value: Any, *, required: bool, defaulted: bool = False) -> str:
+    if _field_value(value):
+        return "defaulted" if defaulted else "recognized"
+    return "needs_confirm" if required else "optional"
+
+
+def _official_procurement_fields_from_query(query: str) -> dict[str, Any]:
+    q = _official_clean_user_query(query)
+    if not any(word in q for word in ("采购", "购买", "购置", "采买", "申购")):
+        return {}
+
+    item = ""
+    quantity = ""
+    source_text = ""
+    qty_pattern = r"(?P<qty>[一二三四五六七八九十百千万零〇两\d]+(?:\s*(?:张|台|套|个|件|份|块|批|枚|辆|项|只|条))?)"
+    m = re.search(rf"(?:采购|购买|购置|采买|申购)(?P<item>[^，。；;\n]{{2,80}}?){qty_pattern}", q)
+    if m:
+        item = _official_strip_request_suffix(m.group("item"))
+        quantity = re.sub(r"\s+", "", m.group("qty"))
+        source_text = m.group(0).strip()
+    else:
+        m = re.search(r"(?:采购|购买|购置|采买|申购)(?P<item>[^，。；;\n]{2,60})", q)
+        if m:
+            item = _official_strip_request_suffix(m.group("item"))
+            source_text = m.group(0).strip()
+
+    item = re.sub(r"^(一批|若干|一些|相关)", "", item).strip(" ：:，。,。；;、")
+    item = re.sub(r"(用于|用于.*|以便.*)$", "", item).strip(" ：:，。,。；;、")
+    budget = _extract_after_markers(q, ("预算", "经费", "金额"), 30)
+    budget_match = re.search(r"(\d+(?:\.\d+)?\s*(?:万元|万|元|人民币))", q)
+    if not budget and budget_match:
+        budget = budget_match.group(1)
+    reason = _extract_after_markers(q, ("因为", "由于", "用于", "满足", "支撑", "为了"), 80)
+    funding_source = _extract_after_markers(q, ("资金来源", "经费来源", "从"), 40)
+    using_department = _extract_after_markers(q, ("使用部门", "由", "给", "面向"), 40)
+    procurement_method = _extract_after_markers(q, ("采购方式", "采用"), 30)
+
+    if not item:
+        return {}
+
+    matter = f"采购{item}{quantity}".strip()
+    evidence: list[dict[str, Any]] = [
+        {"field": "item_name", "label": "采购对象", "value": item, "source_text": source_text or item},
+    ]
+    if quantity:
+        evidence.append({"field": "quantity", "label": "采购数量", "value": quantity, "source_text": source_text or quantity})
+    if budget:
+        evidence.append({"field": "budget", "label": "预算金额", "value": budget, "source_text": budget})
+
+    fields: dict[str, Any] = {
+        "scenario": "procurement_request",
+        "item_name": item,
+        "quantity": quantity,
+        "matter": matter,
+        "title": f"关于采购{item}的请示",
+        "recipient": _extract_after_markers(q, ("发给", "发送给", "主送", "报送", "致", "向"), 30),
+        "procurement_reason": reason,
+        "budget": budget,
+        "funding_source": funding_source,
+        "using_department": using_department,
+        "procurement_method": procurement_method,
+        "background": reason,
+        "proposal": f"拟采购{item}{quantity}，请予审核批复。".replace("，", "，", 1),
+        "__evidence": evidence,
+    }
+    return fields
+
+
+def _official_merge_field_patch(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    next_fields = dict(base)
+    explicit_empty_keys = {"recipient", "background", "proposal", "deadline", "period"} | _OFFICIAL_PROCUREMENT_KEYS
+    for raw_key, value in patch.items():
+        key = str(raw_key or "").strip()
+        if not key or key.startswith("__"):
+            continue
+        if _field_value(value) or key in explicit_empty_keys:
+            next_fields[key] = value
+    return next_fields
+
+
+def _official_evidence_from_agent(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in value[:8]:
+        if not isinstance(item, dict):
+            continue
+        field = str(item.get("field") or "").strip()
+        if field in {"doc_type", "scenario"}:
+            continue
+        label = str(item.get("label") or item.get("field_label") or field).strip()
+        content = _field_value(item.get("value") or item.get("text") or item.get("recognized_value"))
+        source_text = _field_value(item.get("source_text") or item.get("source") or item.get("evidence"))
+        if not field and not label:
+            continue
+        if not content:
+            continue
+        rows.append({
+            "field": field,
+            "label": label or field,
+            "value": content[:120],
+            "source_text": source_text[:180],
+            "confidence": item.get("confidence"),
+        })
+    return rows
+
+
+def _official_field_source(fields: dict[str, Any], key: str) -> str:
+    evidence = fields.get("__evidence")
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, dict) and item.get("field") == key and _field_value(item.get("source_text")):
+                return _field_value(item.get("source_text"))
+    return ""
+
+
+def _official_field_defs(doc_type: str, fields: dict[str, Any], tenant_name: str) -> list[dict[str, Any]]:
+    def field(
+        key: str,
+        label: str,
+        control: str,
+        *,
+        required: bool = True,
+        placeholder: str = "",
+        options: list[dict[str, str]] | None = None,
+        rows: int = 3,
+        defaulted: bool = False,
+    ) -> dict[str, Any]:
+        value = fields.get(key, "")
+        return {
+            "key": key,
+            "label": label,
+            "control": control,
+            "required": required,
+            "value": value,
+            "status": _status_for(value, required=required, defaulted=defaulted),
+            "placeholder": placeholder,
+            "options": options or [],
+            "rows": rows,
+        }
+
+    common = [
+        field("title", "标题", "input", placeholder="自动生成标题，可直接修改"),
+        field("issuer", "发文/发布单位", "input", placeholder=tenant_name, defaulted=True),
+    ]
+    if doc_type == "notice":
+        return [
+            *common,
+            field("recipient", "通知对象", "input", placeholder="各部门、各单位"),
+            field("matter", "通知事项", "textarea", placeholder="需要部署、告知或执行的事项"),
+            field("deadline", "时间要求", "input", required=False, placeholder="如下周一、6月30日前"),
+            field("responsible_department", "责任部门", "input", required=False, placeholder="牵头部门或联系人"),
+        ]
+    if doc_type == "request":
+        if fields.get("scenario") == "procurement_request":
+            return [
+                *common,
+                field("recipient", "请示对象", "input", placeholder="上级单位或主管部门"),
+                field("item_name", "采购对象", "input", placeholder="设备、服务或资源名称"),
+                field("quantity", "采购数量", "input", placeholder="如 100 张、20 台"),
+                field("procurement_reason", "采购理由", "textarea", placeholder="业务需求、使用场景、必要性", rows=3),
+                field("budget", "预算金额", "input", placeholder="如 30 万元，可先留空"),
+                field("funding_source", "资金来源", "input", placeholder="如年度预算、专项经费"),
+                field("using_department", "使用部门", "input", placeholder="申请或使用部门"),
+                field("procurement_method", "采购方式", "select", required=False, options=[
+                    {"label": "按企业采购制度执行", "value": "按企业采购制度执行"},
+                    {"label": "公开招标", "value": "公开招标"},
+                    {"label": "询价比选", "value": "询价比选"},
+                    {"label": "单一来源", "value": "单一来源"},
+                ]),
+                field("proposal", "拟办建议", "textarea", required=False, placeholder="拟采购方案和请示事项", rows=2),
+            ]
+        return [
+            *common,
+            field("recipient", "请示对象", "input", placeholder="上级单位或主管部门"),
+            field("matter", "请示事项", "textarea", placeholder="需要上级批复的事项"),
+            field("background", "背景理由", "textarea", placeholder="事项背景、依据和必要性"),
+            field("proposal", "拟办建议", "textarea", required=False, placeholder="建议批复或拟采取的方案"),
+        ]
+    if doc_type == "report":
+        return [
+            *common,
+            field("recipient", "报告对象", "input", placeholder="上级单位、领导或主管部门"),
+            field("period", "时间范围", "input", required=False, placeholder="如2026年上半年、本季度"),
+            field("progress", "工作进展", "textarea", placeholder="已完成工作、关键数据或阶段成果"),
+            field("issues", "问题风险", "textarea", required=False, placeholder="存在问题、风险或不足"),
+            field("next_steps", "下一步计划", "textarea", placeholder="下一阶段重点工作"),
+        ]
+    if doc_type == "letter":
+        return [
+            *common,
+            field("recipient", "对方单位", "input", placeholder="收函单位"),
+            field("background", "来往背景", "textarea", required=False, placeholder="双方沟通背景或前置事项"),
+            field("matter", "商洽/答复事项", "textarea", placeholder="本函要说明、询问或答复的事项"),
+            field("expected_action", "期望动作", "textarea", required=False, placeholder="希望对方确认、反馈或配合的事项"),
+        ]
+    if doc_type in {"publicity_article", "intranet_news"}:
+        channel_placeholder = "对外宣传、公司官网、媒体通稿" if doc_type == "publicity_article" else "集团要闻、部门动态、基层风采"
+        return [
+            field("title", "标题", "input", placeholder="新闻标题"),
+            field("issuer", "发布单位", "input", placeholder=tenant_name, defaulted=True),
+            field("channel", "发布渠道", "input", required=False, placeholder=channel_placeholder),
+            field("event", "新闻事件", "textarea", placeholder="发生了什么，有什么价值"),
+            field("time_place", "时间地点", "input", required=False, placeholder="时间、地点或活动场景"),
+            field("highlights", "核心亮点", "textarea", placeholder="亮点、成果、人物、数据"),
+        ]
+    return [
+        field("title", "标题", "input", placeholder="公众号标题"),
+        field("issuer", "发布账号/单位", "input", placeholder=tenant_name, defaulted=True),
+        field("audience", "目标读者", "input", required=False, placeholder="员工、客户、合作伙伴、公众"),
+        field("topic", "主题", "textarea", placeholder="这篇推文要表达什么"),
+        field("style", "风格语气", "select", required=False, options=[
+            {"label": "正式清爽", "value": "正式清爽"},
+            {"label": "亲和生动", "value": "亲和生动"},
+            {"label": "品牌宣传", "value": "品牌宣传"},
+        ]),
+        field("outline", "文章结构", "textarea", required=False, placeholder="引入、亮点、案例、行动号召"),
+    ]
+
+
+def _official_a2ui_validation(field_defs: list[dict[str, Any]]) -> dict[str, Any]:
+    rules: dict[str, Any] = {}
+    for field in field_defs:
+        key = str(field.get("key") or "")
+        if not key:
+            continue
+        required = bool(field.get("required"))
+        rules[key] = {
+            "required": required,
+            "status": field.get("status") or "optional",
+            "message": "建议确认该字段后再生成初稿" if required else "可按需补充",
+            "validator": "non_empty" if required else "optional_text",
+        }
+    return rules
+
+
+def _official_a2ui_payload(
+    *,
+    surface_id: str,
+    doc_type: str,
+    meta: dict[str, Any],
+    template_key: str,
+    fields: dict[str, Any],
+    field_defs: list[dict[str, Any]],
+    missing: list[str],
+    compliance: list[dict[str, str]],
+    draft_preview: str,
+    confidence: float,
+) -> dict[str, Any]:
+    group_label = "规范公文" if meta["group"] == "official" else "宣传稿件"
+    can_generate = len(missing) == 0
+    scenario = _field_value(fields.get("scenario"))
+    evidence = fields.get("__evidence") if isinstance(fields.get("__evidence"), list) else []
+    component_registry = {
+        "render_card": "OfficialA2UICard",
+        "render_form": "OfficialA2UIForm",
+        "render_template_picker": "OfficialA2UITemplatePicker",
+        "render_review_panel": "OfficialA2UIReviewPanel",
+        "render_actions": "OfficialA2UIActions",
+    }
+    if evidence:
+        component_registry["render_extraction_evidence"] = "OfficialA2UIExtractionEvidence"
+    summary_title = f"{meta['label']}字段确认"
+    if scenario == "procurement_request":
+        summary_title = "采购请示信息确认"
+    summary_badges = [
+        {"label": group_label, "tone": "blue" if meta["group"] == "official" else "green"},
+        {"label": "Agent 抽取" if fields.get("__intent_source") == "agent" else "规则兜底", "tone": "purple" if fields.get("__intent_source") == "agent" else "default"},
+        {"label": f"{len(missing)} 项待确认" if missing else "可生成", "tone": "gold" if missing else "green"},
+        {"label": f"{round(confidence * 100)}%", "tone": "default"},
+    ]
+    ui_blocks: list[dict[str, Any]] = [
+        {
+            "id": "intent-summary",
+            "type": "render_card",
+            "variant": "intent_summary",
+            "title": summary_title,
+            "subtitle": f"{group_label} · {round(confidence * 100)}% 识别置信度",
+            "icon": doc_type,
+            "accent": meta["accent"],
+            "badges": summary_badges,
+        },
+    ]
+    if evidence:
+        ui_blocks.append({
+            "id": "extraction-evidence",
+            "type": "render_extraction_evidence",
+            "variant": "field_evidence",
+            "title": "已从需求中抽取",
+            "items": evidence,
+        })
+    ui_blocks.extend([
+        {
+            "id": "field-form",
+            "type": "render_form",
+            "title": "字段确认",
+            "layout": "two_column",
+            "fields": field_defs,
+            "values": fields,
+            "validation": _official_a2ui_validation(field_defs),
+        },
+        {
+            "id": "template-picker",
+            "type": "render_template_picker",
+            "title": "模板与版式",
+            "value": template_key,
+            "options": _OFFICIAL_TEMPLATE_OPTIONS,
+        },
+        {
+            "id": "draft-direction",
+            "type": "render_review_panel",
+            "variant": "draft_teaser",
+            "title": "初稿方向",
+            "content": draft_preview,
+            "compliance": compliance,
+        },
+        {
+            "id": "primary-actions",
+            "type": "render_actions",
+            "actions": [
+                {
+                    "id": "generate_docx",
+                    "label": "补充后生成正式初稿" if missing else "确认并生成完整初稿",
+                    "intent": "official_doc.generate_docx",
+                    "style": "primary",
+                    "icon": "file_word",
+                    "disabled": False,
+                },
+                {
+                    "id": "refresh_intent",
+                    "label": "重新识别",
+                    "intent": "official_doc.refresh_intent",
+                    "style": "default",
+                    "icon": "form",
+                },
+            ],
+        },
+    ])
+    return {
+        "schema_version": "a2ui.official.v1",
+        "surface_id": surface_id,
+        "renderer": "react-antd",
+        "component_registry": component_registry,
+        "state": {
+            "current": "field_confirmation",
+            "can_generate": can_generate,
+            "missing_count": len(missing),
+            "doc_type": doc_type,
+            "template_key": template_key,
+            "confidence": confidence,
+            "scenario": scenario,
+        },
+        "state_machine": {
+            "field_confirmation": {
+                "on": {
+                    "official_doc.update_field": "field_confirmation",
+                    "official_doc.switch_template": "field_confirmation",
+                    "official_doc.generate_docx": "draft_generating",
+                }
+            },
+            "draft_generating": {"on": {"official_doc.generated": "draft_review"}},
+            "draft_review": {"on": {"official_doc.revise": "draft_revising", "official_doc.download": "draft_review"}},
+            "draft_revising": {"on": {"official_doc.revised": "draft_review"}},
+        },
+        "validation": {
+            "mode": "confirm_before_submit",
+            "rules": _official_a2ui_validation(field_defs),
+            "missing": missing,
+        },
+        "ui_blocks": ui_blocks,
+    }
+
+
+def _official_fields_from_query(query: str, doc_type: str, tenant_name: str) -> dict[str, Any]:
+    meta = _official_doc_meta(doc_type)
+    clean_query = _official_clean_user_query(query)
+    topic = _official_topic_from_query(clean_query, doc_type)
+    key_points = _split_key_points(clean_query, topic)
+    recipient = _extract_after_markers(clean_query, ("发给", "发送给", "主送", "报送", "致", "给", "向"), 30)
+    deadline = _extract_deadline(clean_query)
+    issuer = tenant_name or "本单位"
+    title = _official_title_for(doc_type, topic)
+    if meta["group"] == "official":
+        recipient = recipient or ("各部门" if doc_type == "notice" else "上级单位")
+    fields: dict[str, Any] = {
+        "title": title,
+        "issuer": issuer,
+        "recipient": recipient,
+        "matter": "；".join(key_points) or topic,
+        "deadline": deadline,
+        "responsible_department": _extract_after_markers(clean_query, ("由", "责任部门", "牵头部门"), 24),
+        "background": "；".join(key_points[:2]) or topic,
+        "proposal": "请予审核批复。" if doc_type == "request" else "",
+        "period": _extract_after_markers(clean_query, ("关于", "围绕"), 24),
+        "progress": "；".join(key_points) or topic,
+        "issues": "",
+        "next_steps": "持续推进相关工作，按节点完成落实。",
+        "expected_action": "请予支持并及时反馈意见。",
+        "event": "；".join(key_points) or topic,
+        "time_place": deadline,
+        "highlights": "；".join(key_points) or topic,
+        "channel": _official_channel_from_query(clean_query, doc_type),
+        "audience": _extract_after_markers(clean_query, ("面向", "读者", "给"), 24),
+        "topic": "；".join(key_points) or topic,
+        "style": "正式清爽",
+        "outline": "开篇导语；核心亮点；具体做法；结尾号召",
+    }
+    if doc_type == "request":
+        procurement_patch = _official_procurement_fields_from_query(clean_query)
+        if procurement_patch:
+            fields = _official_merge_field_patch(fields, procurement_patch)
+            if isinstance(procurement_patch.get("__evidence"), list):
+                fields["__evidence"] = procurement_patch["__evidence"]
+    fields = _official_normalize_publicity_fields(doc_type, fields, clean_query)
+    return fields
+
+
+async def _official_intent_surface(db: Session, p: Principal, query: str) -> dict[str, Any]:
+    clean_query = _official_clean_user_query(query)
+    agent_intent = await _official_agent_intent_fields(db, p, query=clean_query)
+    doc_type = str(agent_intent.get("doc_type") if agent_intent else "") if agent_intent else ""
+    forced_publicity_doc_type = _official_publicity_doc_type_from_query(clean_query)
+    if forced_publicity_doc_type:
+        doc_type = forced_publicity_doc_type
+    elif doc_type not in _OFFICIAL_DOC_TYPES:
+        doc_type = _official_doc_type_from_query(clean_query)
+    meta = _official_doc_meta(doc_type)
+    fields = _official_fields_from_query(clean_query, doc_type, p.tenant.name)
+    if agent_intent:
+        patch = agent_intent.get("fields_patch")
+        if isinstance(patch, dict):
+            fields = _official_merge_field_patch(fields, patch)
+        fields["__intent_source"] = "agent"
+        if forced_publicity_doc_type and doc_type == forced_publicity_doc_type:
+            fields["__intent_source"] = "agent+rule_route"
+        agent_evidence = _official_evidence_from_agent(agent_intent.get("evidence"))
+        if agent_evidence:
+            existing_evidence = fields.get("__evidence") if isinstance(fields.get("__evidence"), list) else []
+            evidence_by_field: dict[str, dict[str, Any]] = {}
+            for item in [*existing_evidence, *agent_evidence]:
+                if isinstance(item, dict):
+                    key = str(item.get("field") or item.get("label") or _uuid.uuid4().hex)
+                    evidence_by_field[key] = item
+            fields["__evidence"] = list(evidence_by_field.values())[:8]
+    else:
+        fields["__intent_source"] = "rule"
+    procurement_patch = _official_procurement_fields_from_query(clean_query)
+    if doc_type == "request" and procurement_patch:
+        fields = _official_merge_field_patch(fields, procurement_patch)
+        if isinstance(procurement_patch.get("__evidence"), list):
+            existing_evidence = fields.get("__evidence") if isinstance(fields.get("__evidence"), list) else []
+            evidence_by_field: dict[str, dict[str, Any]] = {}
+            for item in [*existing_evidence, *procurement_patch["__evidence"]]:
+                if isinstance(item, dict):
+                    key = str(item.get("field") or item.get("label") or _uuid.uuid4().hex)
+                    evidence_by_field[key] = item
+            fields["__evidence"] = list(evidence_by_field.values())[:8]
+        fields["__intent_source"] = fields.get("__intent_source") or ("agent" if agent_intent else "rule")
+    fields = _official_normalize_publicity_fields(doc_type, fields, clean_query)
+    title = _field_value(fields.get("title")) or _official_title_for(doc_type, _official_topic_from_query(clean_query, doc_type))
+    fields["title"] = _official_normalize_title_for_doc_type(doc_type, title, fields, query=clean_query)
+    template_key = meta["template"]
+    field_defs = _official_field_defs(doc_type, fields, p.tenant.name)
+    missing = [f["key"] for f in field_defs if f["status"] == "needs_confirm"]
+    confidence = 0.92 if any(alias in clean_query for alias in meta["aliases"]) else 0.78
+    if agent_intent:
+        try:
+            confidence = max(0.5, min(0.99, float(agent_intent.get("confidence") or confidence)))
+        except Exception:
+            pass
+    compliance = _official_compliance_items(doc_type, fields, template_key)
+    surface_id = f"official-writing-{_uuid.uuid4().hex[:10]}"
+    draft_preview = "\n\n".join(_official_body_paragraphs(doc_type, fields)[:3])
+    a2ui = _official_a2ui_payload(
+        surface_id=surface_id,
+        doc_type=doc_type,
+        meta=meta,
+        template_key=template_key,
+        fields=fields,
+        field_defs=field_defs,
+        missing=missing,
+        compliance=compliance,
+        draft_preview=draft_preview,
+        confidence=confidence,
+    )
+    return {
+        "version": "atlas-ui-0.1",
+        "surface_id": surface_id,
+        "component": "OfficialWritingConfirmSurface",
+        "title": "我已整理出公文草稿信息",
+        "subtitle": "Agent 已把可识别内容转成可操作字段；确认后将生成可审阅的完整初稿 DOCX。",
+        "a2ui": a2ui,
+        "ui_blocks": a2ui["ui_blocks"],
+        "state": a2ui["state"],
+        "state_machine": a2ui["state_machine"],
+        "validation": a2ui["validation"],
+        "component_registry": a2ui["component_registry"],
+        "intent": {
+            "doc_type": doc_type,
+            "label": meta["label"],
+            "group": meta["group"],
+            "confidence": confidence,
+            "accent": meta["accent"],
+            "source": fields.get("__intent_source") or "rule",
+        },
+        "template_key": template_key,
+        "template_options": _OFFICIAL_TEMPLATE_OPTIONS,
+        "fields": fields,
+        "field_defs": field_defs,
+        "missing": missing,
+        "compliance": compliance,
+        "draft_preview": draft_preview,
+        "actions": [
+            {"id": "generate_docx", "label": "确认并生成完整初稿", "intent": "official_doc.generate_docx"},
+            {"id": "refine_fields", "label": "继续完善内容", "intent": "official_doc.refine_fields"},
+            {"id": "switch_template", "label": "切换模板", "intent": "official_doc.switch_template"},
+        ],
+    }
+
+
+def _official_compliance_items(doc_type: str, fields: dict[str, Any], template_key: str) -> list[dict[str, str]]:
+    meta = _official_doc_meta(doc_type)
+    items: list[tuple[str, str, bool, str]] = []
+    if meta["group"] == "official":
+        items = [
+            ("layout", "A4 版式", True, "按 GB/T 9704-2012 常用页边距和正文字号生成"),
+            ("title", "标题要素", bool(_field_value(fields.get("title"))), "标题将居中排版"),
+            ("recipient", "主送机关", bool(_field_value(fields.get("recipient"))), "缺失时建议补充主送对象"),
+            ("body", "正文结构", bool(_field_value(fields.get("matter") or fields.get("progress"))), "正文将按一、二、三分段"),
+            ("issuer_date", "发文机关和日期", bool(_field_value(fields.get("issuer"))), "落款日期默认使用生成日期"),
+            ("template", "模板选择", template_key in {"gbt9704", "enterprise-standard"}, "当前模板适用于规范公文"),
+        ]
+    else:
+        items = [
+            ("title", "传播标题", bool(_field_value(fields.get("title"))), "标题可继续人工润色"),
+            ("lead", "导语完整", bool(_field_value(fields.get("event") or fields.get("topic"))), "导语会概括核心事件"),
+            ("facts", "事实要素", bool(_field_value(fields.get("highlights") or fields.get("outline"))), "包含事件、亮点和行动信息"),
+            ("tone", "发布口径", bool(_field_value(fields.get("issuer"))), "默认使用企业正式口径"),
+            ("template", "渠道模板", template_key in {"enterprise-news", "wechat", "enterprise-standard"}, "当前模板适用于宣传稿件"),
+        ]
+    return [
+        {
+            "key": key,
+            "label": label,
+            "status": "pass" if ok else "warn",
+            "detail": detail,
+        }
+        for key, label, ok, detail in items
+    ]
+
+
+def _add_docx_paragraph(doc: Any, text: str, *, bold: bool = False, align: str = "left", size_pt: int = 16) -> Any:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore
+    from docx.shared import Pt  # type: ignore
+    from docx.oxml.ns import qn  # type: ignore
+
+    p = doc.add_paragraph()
+    if align == "center":
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    elif align == "right":
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    else:
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    p.paragraph_format.line_spacing = Pt(28)
+    if align == "left":
+        p.paragraph_format.first_line_indent = Pt(32)
+    run = p.add_run(text)
+    run.bold = bold
+    run.font.name = "仿宋_GB2312"
+    run.font.size = Pt(size_pt)
+    try:
+        run._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋_GB2312")
+    except Exception:
+        pass
+    return p
+
+
+def _official_body_paragraphs(doc_type: str, fields: dict[str, Any]) -> list[str]:
+    custom = fields.get("__draft_paragraphs")
+    if isinstance(custom, list):
+        rows = [str(item).strip() for item in custom if str(item).strip()]
+        if rows:
+            return rows
+    if isinstance(custom, str) and custom.strip():
+        rows = [p.strip() for p in re.split(r"\n{2,}|[；;]\s*", custom) if p.strip()]
+        if rows:
+            return rows
+    title = _field_value(fields.get("title"))
+    matter = _field_value(fields.get("matter")) or _field_value(fields.get("topic")) or title
+    points = [p.strip() for p in re.split(r"[；;\n]+", matter) if p.strip()]
+    deadline = _field_value(fields.get("deadline"))
+    if doc_type == "notice":
+        lead_point = points[0] if points else matter
+        subject = lead_point or matter
+        owner = _field_value(fields.get("responsible_department")) or "各责任部门"
+        rows = [
+            f"为进一步做好{subject}相关工作，统一工作要求、明确推进节奏，现将有关事项通知如下：",
+            f"一、总体要求。各单位要充分认识{subject}的重要性，坚持问题导向和结果导向，结合本单位实际细化落实举措，确保部署要求传达到位、责任压实到位、工作闭环到位。",
+            f"二、重点任务。围绕{subject}，请各单位全面梳理现有工作基础，查找薄弱环节，形成任务清单、责任清单和整改清单。涉及跨部门协同事项的，由{owner}牵头统筹，相关单位主动配合。",
+            "三、组织落实。请各单位明确专人负责，及时跟踪工作进展，对发现的问题立行立改；对需要统筹协调的事项，应及时反馈并提出处理建议。",
+        ]
+        if deadline:
+            rows.append(f"四、时间安排。请于{deadline}前完成相关工作，并将落实情况、存在问题及下一步计划报送牵头部门。")
+        else:
+            rows.append("四、时间安排。请各单位按工作节点有序推进，并及时反馈落实情况。")
+        rows.append("请各单位高度重视、认真组织实施，确保通知事项取得实效。")
+        return rows
+    if doc_type == "request":
+        if fields.get("scenario") == "procurement_request":
+            item = _field_value(fields.get("item_name")) or "相关设备和服务"
+            quantity = _field_value(fields.get("quantity"))
+            matter = _field_value(fields.get("matter")) or f"采购{item}{quantity}".strip()
+            reason = _field_value(fields.get("procurement_reason") or fields.get("background"))
+            budget = _field_value(fields.get("budget"))
+            funding_source = _field_value(fields.get("funding_source"))
+            using_department = _field_value(fields.get("using_department")) or "相关使用部门"
+            method = _field_value(fields.get("procurement_method")) or "按本单位采购管理制度履行相应程序"
+            reason_sentence = (
+                reason
+                if reason
+                else "为满足相关业务对稳定算力和配套资源的使用需求，提升后续项目推进效率和技术支撑能力"
+            )
+            budget_sentence = f"本次采购预算为{budget}。" if budget else "本次采购所需经费拟按预算管理要求统筹安排。"
+            funding_sentence = f"资金来源为{funding_source}。" if funding_source else "具体资金来源和支付安排将按财务及采购制度审核确认。"
+            quantity_text = quantity or "相应数量"
+            proposal = _field_value(fields.get("proposal")) or f"拟采购{item}{quantity_text}，并由{using_department}结合实际需求组织验收和使用管理。"
+            return [
+                f"{reason_sentence}，拟开展{matter}事项。现将有关情况请示如下：",
+                f"一、采购事项。拟采购{item}{quantity_text}，主要用于支撑相关业务开展、能力建设和后续应用落地。采购过程拟{method}，确保程序规范、过程可追溯。",
+                f"二、必要性说明。当前相关工作对资源保障、运行稳定性和实施效率提出更高要求，开展本次采购有利于补齐现有资源短板，提升工作连续性和支撑能力。",
+                f"三、经费及组织安排。{budget_sentence}{funding_sentence}采购完成后，拟由{using_department}负责接收、使用和日常管理，并按要求做好资产登记、验收归档和使用记录。",
+                f"四、拟办建议。{proposal}请批复后，相关部门按职责分工推进采购、验收和后续管理工作。",
+                "妥否，请批示。",
+            ]
+        background = _field_value(fields.get("background")) or matter
+        proposal = _field_value(fields.get("proposal")) or "建议按既定方案组织实施。"
+        return [
+            f"为稳妥推进{matter}，保障相关工作依法合规、有序实施，现将有关事项请示如下：",
+            f"一、基本情况。{background}。当前，该项工作已具备一定基础，但在资源统筹、组织保障和后续推进方面仍需进一步明确安排。",
+            f"二、请示事项。拟启动{matter}相关工作，并根据实际需要统筹安排人员、经费、时间节点及配套保障措施，确保工作能够按计划推进。",
+            f"三、必要性和可行性。开展该项工作有利于补齐现有短板、提升管理效能，并为后续业务开展提供支撑。从前期沟通和条件准备看，相关方案具备实施基础。",
+            f"四、拟办建议。{proposal}请批复后，由相关部门按职责分工组织实施，并定期报告推进情况。",
+            "妥否，请批示。",
+        ]
+    if doc_type == "report":
+        period = _field_value(fields.get("period")) or "近期"
+        progress = _field_value(fields.get("progress")) or matter
+        issues = _field_value(fields.get("issues")) or "相关工作总体平稳，仍需持续跟进重点环节。"
+        next_steps = _field_value(fields.get("next_steps")) or "下一步将继续完善机制、压实责任、跟踪成效。"
+        return [
+            f"现将{period}{matter}有关情况报告如下：",
+            f"一、总体情况。{period}以来，相关部门围绕既定目标持续推进{matter}，工作机制逐步完善，重点任务有序落地，整体进展符合预期。",
+            f"二、主要进展。{progress}。在推进过程中，坚持统筹协调、分步实施，强化过程跟踪和结果反馈，推动关键事项取得阶段性成效。",
+            f"三、存在问题。{issues}。从实际情况看，部分环节仍存在协同效率、标准统一、资源保障等方面的不足，需要在后续工作中持续优化。",
+            f"四、下一步工作。{next_steps}。同时，将进一步完善工作台账和评估机制，及时总结经验做法，确保各项任务持续推进、取得实效。",
+        ]
+    if doc_type == "letter":
+        background = _field_value(fields.get("background")) or "根据前期沟通情况"
+        expected = _field_value(fields.get("expected_action")) or "请贵单位研究并予以反馈。"
+        return [
+            f"{background}，为进一步做好后续衔接，现就有关事项函告如下：",
+            f"一、有关情况。围绕{matter}，双方前期已开展必要沟通，相关事项需要进一步明确安排，以便后续工作顺利推进。",
+            f"二、商洽事项。请贵单位结合实际，对{matter}涉及的时间安排、配合方式、联系人及注意事项予以确认，并就可能影响推进的事项提前沟通。",
+            f"三、工作建议。{expected}我单位将根据贵单位反馈意见，及时完善后续安排并做好配合工作。",
+            "专此函达。",
+        ]
+    if doc_type == "publicity_article":
+        event = _field_value(fields.get("event")) or matter
+        time_place = _field_value(fields.get("time_place"))
+        highlights = _field_value(fields.get("highlights")) or event
+        audience = _field_value(fields.get("audience")) or "公众、客户和合作伙伴"
+        lead = f"{time_place}，{event}" if time_place else event
+        return [
+            f"{lead}。这一进展标志着 OpenAtlas 在智能办公和规范文档生成场景中迈出新的实践步伐，也为{audience}了解产品能力提供了更直观的窗口。",
+            f"围绕公文起草、字段确认、初稿生成和二次修改等高频流程，相关团队持续优化产品体验与智能协作能力。{highlights}",
+            "该能力面向真实办公流程设计，强调从用户自然语言需求出发，将关键信息转化为可确认、可修改、可沉淀的文档初稿，帮助降低格式处理和反复沟通成本。",
+            "后续，OpenAtlas 将继续围绕企业知识、流程协同和智能体应用场景完善产品能力，推动智能办公从单点辅助走向可持续的业务协同。",
+        ]
+    if doc_type == "intranet_news":
+        event = _field_value(fields.get("event")) or matter
+        time_place = _field_value(fields.get("time_place"))
+        highlights = _field_value(fields.get("highlights")) or event
+        lead = f"{time_place}，{event}" if time_place else event
+        return [
+            f"{lead}。这一进展标志着相关工作取得新的阶段性成果，也为后续业务提质增效奠定了基础。",
+            f"推进过程中，相关团队围绕重点任务协同攻坚，聚焦实际需求、流程优化和应用落地，形成了一批务实成果。{highlights}",
+            "此次工作不仅提升了内部协同效率，也进一步增强了员工对数字化工具和标准化流程的理解。参与人员表示，将在后续工作中持续总结经验，推动成果在更多场景复制应用。",
+            "下一步，相关部门将继续完善机制、跟踪成效，把阶段性成果转化为高质量发展的持续动力。",
+        ]
+    topic = _field_value(fields.get("topic")) or matter
+    outline = _field_value(fields.get("outline")) or "开篇导语；核心亮点；具体做法；结尾号召"
+    sections = [p.strip() for p in re.split(r"[；;\n]+", outline) if p.strip()]
+    audience = _field_value(fields.get("audience")) or "关注我们的朋友"
+    style = _field_value(fields.get("style")) or "正式清爽"
+    rows = [
+        f"如果把一次规范公文起草拆开看，真正耗时的往往不是写下第一句话，而是确认文种、补齐字段、调整格式和反复修改。围绕{topic}，OpenAtlas 希望把这些环节变得更清晰、更顺手。",
+        f"一、从一句需求到一张确认卡。面向{audience}，公文写作能力会先识别通知、请示、报告、函、内网新闻和公众号等常见场景，把标题、对象、事项、语气、章节等关键要素转成可确认的表单，而不是简单回复“请补充”。",
+    ]
+    for idx, section in enumerate(sections[1:4], start=2):
+        rows.append(f"{idx}、{section}。围绕{topic}，系统会以{style}的方式组织内容，在保留正式表达的同时，让初稿具备可阅读、可修改、可交付的完整结构。")
+    rows.append("接下来，OpenAtlas 将继续结合真实办公场景打磨 A2UI 交互和文档生成能力，让每一次起草、审阅和修改都更稳定、更高效。")
+    return rows
+
+
+def _official_agent_enabled() -> bool:
+    value = os.environ.get("OPENATLAS_OFFICIAL_WRITING_AGENT_ENABLED", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _official_agent_timeout_seconds() -> float:
+    try:
+        return max(8.0, min(60.0, float(os.environ.get("OPENATLAS_OFFICIAL_WRITING_AGENT_TIMEOUT_SECONDS", "28"))))
+    except Exception:
+        return 28.0
+
+
+def _official_json_object_from_text(text: str) -> dict[str, Any] | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    raw = raw.lstrip("\ufeff").strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I).strip()
+    raw = re.sub(r"\s*```$", "", raw).strip()
+
+    def first_object_candidate(value: str) -> str:
+        start = value.find("{")
+        if start < 0:
+            return ""
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start, len(value)):
+            ch = value[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == "\"":
+                    in_string = False
+                continue
+            if ch == "\"":
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return value[start:idx + 1]
+        return value[start:]
+
+    for candidate in (raw, first_object_candidate(raw)):
+        if not candidate:
+            continue
+        try:
+            parsed: Any = json.loads(candidate)
+            if isinstance(parsed, str):
+                parsed = json.loads(parsed)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _official_clean_agent_paragraphs(value: Any) -> list[str]:
+    if isinstance(value, str):
+        parts = re.split(r"\n{2,}", value)
+    elif isinstance(value, list):
+        parts = [str(item) for item in value]
+    else:
+        parts = []
+    rows: list[str] = []
+    for part in parts:
+        text = re.sub(r"\s+", " ", str(part or "").strip())
+        text = text.strip(" -")
+        if len(text) < 8:
+            continue
+        rows.append(text[:1200])
+    return rows[:12]
+
+
+def _official_agent_system_message() -> str:
+    return (
+        "你是 Atlas 的 AI2UIAgent 公文写作 Agent。你的输出会被 React/AntD A2UI 渲染器和 DOCX 渲染器直接解析。"
+        "你必须只返回一个合法 JSON 对象，禁止 Markdown、代码围栏、解释、前后缀文本、注释、JSON 字符串外壳。"
+        "固定 JSON Schema：{\"title\":\"string\",\"paragraphs\":[\"string\"],\"summary\":\"string\",\"fields_patch\":{}}。"
+        "只允许这 4 个顶层字段。title 是成稿标题；paragraphs 是 3 到 8 个完整正文段落；summary 是一句话版本说明；"
+        "fields_patch 只放可回填的用户字段，不能出现 __ 开头字段。"
+        "paragraphs 不包含标题、主送机关、落款、日期、来源行，这些由 Atlas 文档渲染器处理。"
+        "缺少事实信息时用稳健概括，不编造具体数字、人名、文件号、会议名称或政策依据。"
+    )
+
+
+def _official_hermes_session_id(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    nested_sources = [
+        payload,
+        payload.get("session") if isinstance(payload.get("session"), dict) else {},
+        payload.get("data") if isinstance(payload.get("data"), dict) else {},
+    ]
+    for source in nested_sources:
+        for key in ("id", "session_id", "uuid"):
+            value = source.get(key)
+            if value:
+                return str(value).strip()
+    return ""
+
+
+def _official_hermes_run_id(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    nested = payload.get("run") if isinstance(payload.get("run"), dict) else {}
+    for source in (payload, nested):
+        for key in ("run_id", "id"):
+            value = source.get(key)
+            if value:
+                return str(value).strip()
+    return ""
+
+
+async def _official_collect_run_event_text(target: Any, run_id: str, *, timeout_seconds: float) -> str:
+    parts: list[str] = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    stream = hermes_client.stream_run_events(target, run_id)
+    agen = stream.__aiter__()
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                ev = await asyncio.wait_for(agen.__anext__(), timeout=min(remaining, 8.0))
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                break
+            name = ev.get("event") or ""
+            data = ev.get("data")
+            if name in {"run.failed", "error"}:
+                break
+            if not isinstance(data, dict):
+                if isinstance(data, str) and data:
+                    parts.append(data)
+                continue
+            msg_obj = data.get("message") if isinstance(data.get("message"), dict) else {}
+            delta = (
+                data.get("delta")
+                or data.get("content")
+                or data.get("text")
+                or data.get("output")
+                or data.get("final_response")
+                or msg_obj.get("content")
+                or msg_obj.get("delta")
+                or ""
+            )
+            if isinstance(delta, str) and delta:
+                parts.append(delta)
+            if name == "run.completed":
+                for item in data.get("messages") or []:
+                    if isinstance(item, dict) and item.get("role") == "assistant":
+                        content = item.get("content") or item.get("text") or ""
+                        if isinstance(content, str) and content:
+                            parts.append(content)
+    finally:
+        try:
+            await agen.aclose()
+        except Exception:
+            pass
+    return "".join(parts).strip()
+
+
+async def _official_collect_agent_text(
+    db: Session,
+    p: Principal,
+    *,
+    prompt: str,
+    title: str,
+    system_message: str | None = None,
+) -> str:
+    if not _official_agent_enabled():
+        return ""
+    target = await hermes_client.resolve_target(db, p.tenant.id)
+    base_title = re.sub(r"\s+", " ", title or "公文写作").strip()[:56] or "公文写作"
+    session = await hermes_client.create_session(target, title=f"{base_title}-{_uuid.uuid4().hex[:8]}")
+    session_id = _official_hermes_session_id(session)
+    if not session_id:
+        return ""
+
+    system_message = system_message or _official_agent_system_message()
+    timeout_seconds = _official_agent_timeout_seconds()
+    try:
+        if await hermes_client.supports_run_events(target):
+            run = await hermes_client.create_run(
+                target,
+                session_id=session_id,
+                message=prompt,
+                system_message=system_message,
+                model="hermes-agent",
+            )
+            run_id = _official_hermes_run_id(run)
+            if run_id:
+                text = await _official_collect_run_event_text(target, run_id, timeout_seconds=timeout_seconds)
+                if text:
+                    return text
+    except Exception:
+        pass
+
+    parts: list[str] = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    stream = hermes_client.stream_chat(
+        target,
+        session_id,
+        message=prompt,
+        system_message=system_message,
+    )
+    agen = stream.__aiter__()
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                ev = await asyncio.wait_for(agen.__anext__(), timeout=min(remaining, 8.0))
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                break
+            name = ev.get("event") or ""
+            data = ev.get("data")
+            if name == "error":
+                break
+            if isinstance(data, dict):
+                msg_obj = data.get("message") if isinstance(data.get("message"), dict) else {}
+                delta = (
+                    data.get("delta")
+                    or data.get("content")
+                    or data.get("text")
+                    or data.get("output")
+                    or data.get("final_response")
+                    or msg_obj.get("content")
+                    or msg_obj.get("delta")
+                    or ""
+                )
+                if isinstance(delta, str) and delta:
+                    parts.append(delta)
+                if name == "run.completed":
+                    for item in data.get("messages") or []:
+                        if isinstance(item, dict) and item.get("role") == "assistant":
+                            content = item.get("content") or item.get("text") or ""
+                            if isinstance(content, str) and content:
+                                parts.append(content)
+            elif isinstance(data, str) and data:
+                parts.append(data)
+    finally:
+        try:
+            await agen.aclose()
+        except Exception:
+            pass
+    return "".join(parts).strip()
+
+
+def _official_intent_agent_system_message() -> str:
+    doc_types = ", ".join(_OFFICIAL_DOC_TYPES.keys())
+    return (
+        "你是 Atlas 的 AI2UIAgent 公文写作意图识别 Agent。"
+        "你的任务不是简单做关键词匹配，而是理解用户真实写作目标，并输出可被 A2UI 渲染器使用的 JSON 对象。"
+        "你必须只返回一个合法 JSON 对象，禁止 Markdown、代码围栏、解释、前后缀文本、注释、JSON 字符串外壳。"
+        f"doc_type 只能是以下之一：{doc_types}。"
+        "固定 JSON Schema："
+        "{\"doc_type\":\"string\",\"confidence\":0.0,\"scenario\":\"string\",\"writing_intent\":\"string\","
+        "\"channel\":\"string\",\"audience\":\"string\",\"summary\":\"string\",\"fields_patch\":{},\"evidence\":[],\"missing\":[]}。"
+        "只允许这些顶层字段。fields_patch 只放从用户需求中可靠提取或需要用户确认的字段，不得出现 __ 开头字段。"
+        "先判断文体，再判断发布渠道。外宣稿、宣传稿、新闻稿、发布稿、传播稿属于 publicity_article；"
+        "内网新闻、OA新闻、公司门户、部门动态才属于 intranet_news；微信公众号、公众号推文才属于 wechat_article。"
+        "不要因为内容里有上线、工作、事项就误判为 notice。只有用户明确要求通知、通告、工作安排、要求各部门执行时才输出 notice。"
+        "寒暄词和指令词如“好的、帮我、麻烦、请、写一份、写一篇”不能进入标题、事项或背景。"
+        "如果识别到采购/购买/购置/申购场景，scenario 必须为 procurement_request，并尽量提取 item_name、quantity、budget、funding_source、using_department、procurement_reason、recipient。"
+        "无法从用户原话判断的字段用空字符串并放入 missing，不要编造具体金额、部门、上级单位、政策依据。"
+    )
+
+
+def _official_intent_agent_prompt(*, query: str, tenant_name: str) -> str:
+    payload = {
+        "task": "extract_official_writing_intent_for_a2ui",
+        "tenant_name": tenant_name or "本单位",
+        "user_query": query,
+        "available_doc_types": {
+            key: {"label": meta["label"], "aliases": list(meta["aliases"]), "group": meta["group"]}
+            for key, meta in _OFFICIAL_DOC_TYPES.items()
+        },
+        "field_contract": {
+            "common": ["title", "issuer", "recipient", "matter"],
+            "publicity": ["title", "issuer", "event", "highlights", "channel", "audience", "tone", "outline"],
+            "procurement_request": [
+                "scenario",
+                "title",
+                "recipient",
+                "matter",
+                "item_name",
+                "quantity",
+                "procurement_reason",
+                "budget",
+                "funding_source",
+                "using_department",
+                "procurement_method",
+                "proposal",
+            ],
+        },
+        "doc_type_principles": {
+            "notice": "通知、通告、工作安排，重点是告知对象、执行事项、时间要求。",
+            "request": "请示、申请、报批，重点是向上级请求批准。",
+            "report": "报告、汇报、总结，重点是陈述情况、成果、问题、下一步。",
+            "letter": "函、商洽函、复函，重点是单位间沟通、协作、答复。",
+            "publicity_article": "宣传稿、新闻稿、外宣稿、发布稿、传播稿、简讯等宣传传播类稿件。",
+            "intranet_news": "明确要发内网、OA、公司门户、部门动态、集团要闻的内部新闻。",
+            "wechat_article": "微信公众号文章、微信推文，重点是适合公众号阅读和传播。",
+        },
+        "rules": [
+            "先理解用户的写作目的，再判断文体，不要机械按关键词映射。",
+            "外宣稿通常是对外宣传类稿件，应识别为 publicity_article，channel 可为 external_publicity 或 对外宣传，不要识别成 notice，也不要默认识别成 intranet_news。",
+            "只有明确出现内网、OA、公司门户、部门动态、集团要闻等内部发布场景时，才识别为 intranet_news。",
+            "微信公众号、公众号推文、微信文章识别为 wechat_article。",
+            "通知、通告、请各部门执行/报送/落实等才识别为 notice。",
+            "申请、报批、请予批准、请示才识别为 request。",
+            "如果用户说“上线新闻稿/上线宣传稿/上线外宣稿”，这是宣传传播，不是通知。",
+            "标题应是成文标题，不要出现“好的、帮我、写一篇、请”等指令词。",
+            "matter 应表达事项，例如“采购人工智能算力卡100张”。",
+            "用户原话存在明显品牌笔误时，标题可轻度规范化，例如 OpanAtlas -> OpenAtlas，但 evidence 保留原文。",
+            "evidence 中列出用户原话支持的字段，格式为 {field,label,value,source_text,confidence}。",
+            "missing 只列需要用户确认且无法从原话可靠提取的字段 key。",
+            "如果字段只是系统默认值，不要放入 evidence。",
+        ],
+        "json_examples": [
+        {
+            "doc_type": "request",
+            "confidence": 0.93,
+            "scenario": "procurement_request",
+            "writing_intent": "撰写采购人工智能算力卡的请示",
+            "channel": "official_document",
+            "audience": "上级单位",
+            "summary": "识别为采购类请示，采购对象和数量已从原话提取。",
+            "fields_patch": {
+                "title": "关于采购人工智能算力卡的请示",
+                "recipient": "",
+                "matter": "采购人工智能算力卡100张",
+                "item_name": "人工智能算力卡",
+                "quantity": "100张",
+                "procurement_reason": "",
+                "budget": "",
+                "funding_source": "",
+                "using_department": "",
+                "proposal": "拟采购人工智能算力卡100张，请予审核批复。",
+            },
+            "evidence": [
+                {"field": "item_name", "label": "采购对象", "value": "人工智能算力卡", "source_text": "采购人工智能算力卡100张", "confidence": 0.95},
+                {"field": "quantity", "label": "采购数量", "value": "100张", "source_text": "采购人工智能算力卡100张", "confidence": 0.95},
+            ],
+            "missing": ["recipient", "procurement_reason", "budget", "funding_source", "using_department"],
+        },
+        {
+            "doc_type": "publicity_article",
+            "confidence": 0.94,
+            "scenario": "product_launch_publicity",
+            "writing_intent": "撰写 OpenAtlas 公文写作功能上线外宣稿",
+            "channel": "external_publicity",
+            "audience": "公众、客户或外部合作伙伴",
+            "summary": "用户希望撰写一篇面向外部传播的功能上线宣传稿。",
+            "fields_patch": {
+                "title": "OpenAtlas 公文写作功能正式上线",
+                "event": "OpenAtlas 公文写作功能上线",
+                "highlights": "公文写作能力上线",
+                "channel": "external_publicity",
+                "audience": "公众、客户或外部合作伙伴",
+                "tone": "正式、清晰、有传播感",
+            },
+            "evidence": [
+                {"field": "doc_type", "label": "文体", "value": "publicity_article", "source_text": "外宣稿", "confidence": 0.95},
+                {"field": "event", "label": "事件", "value": "OpenAtlas 公文写作功能上线", "source_text": "OpanAtlas公文写作的功能上线", "confidence": 0.9},
+            ],
+            "missing": ["issuer", "outline"],
+        },
+        ],
+    }
+    return (
+        "任务：把用户的一句话公文需求抽取成可由 A2UI 渲染器直接生成表单/卡片的 JSON。\n"
+        "硬性要求：最终回复必须只包含一个 JSON 对象，不能包含 Markdown、解释文本或代码围栏。\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _official_intent_json_repair_prompt(raw_text: str) -> str:
+    payload = {
+        "task": "repair_intent_output_to_json",
+        "target_schema": {
+            "doc_type": "string",
+            "confidence": 0.0,
+            "scenario": "string",
+            "writing_intent": "string",
+            "channel": "string",
+            "audience": "string",
+            "summary": "string",
+            "fields_patch": {},
+            "evidence": [],
+            "missing": [],
+        },
+        "rules": [
+            "只返回一个合法 JSON 对象。",
+            "不得输出 Markdown、代码围栏、解释、注释。",
+            "只允许 target_schema 中的顶层字段。",
+            "fields_patch 不得包含 __ 开头字段。",
+        ],
+        "raw_model_output": raw_text[:8000],
+    }
+    return (
+        "你刚才的字段识别输出不能被 JSON 解析器稳定解析。请把 raw_model_output 修复为指定 schema。\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _official_chat_completion_text(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return ""
+    parts: list[str] = []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        content = message.get("content") or choice.get("text") or ""
+        if isinstance(content, str) and content:
+            parts.append(content)
+    return "\n".join(parts).strip()
+
+
+_PRESENTATION_USE_CASES = {
+    "report": "汇报",
+    "roadshow": "路演",
+    "training": "培训",
+}
+_PRESENTATION_STYLE_KEYS = {"executive_blue", "tech_launch", "teaching_clear"}
+_PRESENTATION_LAYOUTS = {
+    "cover",
+    "section",
+    "two_column",
+    "compare",
+    "metrics",
+    "process",
+    "timeline",
+    "diagram",
+    "checklist",
+    "quote",
+}
+_PRESENTATION_STATUSES = {"draft", "confirmed", "needs_source", "locked"}
+_PRESENTATION_KNOWLEDGE_STATUSES = {"ready", "missing", "assumption"}
+
+
+def _presentation_agent_enabled() -> bool:
+    value = os.environ.get("OPENATLAS_PRESENTATION_AGENT_ENABLED", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _presentation_segmented_first_enabled() -> bool:
+    value = os.environ.get("OPENATLAS_PRESENTATION_SEGMENTED_FIRST", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _presentation_status_interval_seconds() -> float:
+    try:
+        return max(5.0, min(30.0, float(os.environ.get("OPENATLAS_PRESENTATION_STATUS_INTERVAL_SECONDS", "10"))))
+    except Exception:
+        return 10.0
+
+
+def _presentation_agent_timeout_seconds() -> float:
+    try:
+        return max(30.0, min(180.0, float(os.environ.get("OPENATLAS_PRESENTATION_AGENT_TIMEOUT_SECONDS", "110"))))
+    except Exception:
+        return 110.0
+
+
+def _presentation_slide_batch_size() -> int:
+    try:
+        return max(1, min(4, int(os.environ.get("OPENATLAS_PRESENTATION_SLIDE_BATCH_SIZE", "3"))))
+    except Exception:
+        return 3
+
+
+def _presentation_infer_use_case(query: str) -> str:
+    if re.search(r"培训|课程|课件|学员|学习|教学|练习|考试|认证", query or ""):
+        return "training"
+    if re.search(r"路演|融资|投资|发布会|推介|招商|生态伙伴|商业化|增长|愿景", query or ""):
+        return "roadshow"
+    return "report"
+
+
+def _presentation_preferred_style(use_case: str) -> str:
+    if use_case == "roadshow":
+        return "tech_launch"
+    if use_case == "training":
+        return "teaching_clear"
+    return "executive_blue"
+
+
+def _presentation_topic_from_query(query: str) -> str:
+    q = re.sub(r"^(好的|好|请|麻烦|帮我|我想|需要)?\s*(做|制作|设计|生成|输出|准备)?\s*一?(份|套|个)?\s*", "", query or "").strip()
+    q = re.sub(r"(PPT|ppt|演示文稿|幻灯片|课件|汇报材料|路演稿)", "", q).strip()
+    parts = re.split(r"[，,；;。]\s*(?:面向|给|为|时长|用时|突出|强调|包含|包括|\d{1,3}\s*(?:分钟|min|mins|minute|minutes))", q, maxsplit=1)
+    topic = (parts[0] if parts else q).strip(" ，,。；;：:")
+    return topic or "OpenAtlas 数智员工产品汇报"
+
+
+def _presentation_audience_from_query(query: str, use_case: str) -> str:
+    m = re.search(r"面向([^，。,.；;]{2,32})", query or "") or re.search(r"给([^，。,.；;]{2,32})(?:看|汇报|培训|介绍)", query or "")
+    if m:
+        return m.group(1).strip()
+    if use_case == "roadshow":
+        return "投资人 / 客户 / 生态伙伴"
+    if use_case == "training":
+        return "内部员工 / 客户学员"
+    return "管理层 / 客户负责人"
+
+
+def _presentation_int(value: Any, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _presentation_config_from_input(query: str, raw_config: dict[str, Any] | None) -> dict[str, Any]:
+    source = raw_config if isinstance(raw_config, dict) else {}
+    use_case = _field_value(source.get("useCase")) or _presentation_infer_use_case(query)
+    if use_case not in _PRESENTATION_USE_CASES:
+        use_case = _presentation_infer_use_case(query)
+    duration_match = re.search(r"(\d{1,3})\s*(?:分钟|min|mins|minute|minutes)", query or "", flags=re.I)
+    duration_default = _presentation_int(source.get("durationMinutes"), 20, minimum=8, maximum=90)
+    duration = _presentation_int(duration_match.group(1) if duration_match else source.get("durationMinutes"), duration_default, minimum=8, maximum=90)
+    page_default = 12 if use_case == "training" else 10 if use_case == "roadshow" else 8
+    explicit_pages = re.search(r"(\d{1,2})\s*(?:页|p|P)", query or "")
+    if explicit_pages:
+        explicit_count = _presentation_int(explicit_pages.group(1), page_default, minimum=8, maximum=40)
+        current_count = _presentation_int(source.get("pageCount"), page_default, minimum=8, maximum=40)
+        qualifier = (query or "")[max(0, explicit_pages.start() - 8):explicit_pages.end()]
+        page_count = max(current_count, explicit_count) if re.search(r"不少于|至少|不低于", qualifier) else explicit_count
+    else:
+        page_count = _presentation_int(source.get("pageCount"), page_default, minimum=8, maximum=40)
+    aspect_ratio = _field_value(source.get("aspectRatio")) or ("3:1" if re.search(r"3\s*[:：]\s*1|超宽|大屏|展厅", query or "") else "16:9")
+    if aspect_ratio not in {"16:9", "3:1"}:
+        aspect_ratio = "16:9"
+    density = _field_value(source.get("density")) or ("dense" if re.search(r"密集|详细|完整", query or "") else "clean" if re.search(r"简洁|极简", query or "") else "standard")
+    if density not in {"clean", "standard", "dense"}:
+        density = "standard"
+    chart_level = _field_value(source.get("chartLevel")) or ("rich" if re.search(r"图表多|多图表|数据丰富", query or "") else "light" if re.search(r"少图|少量图表", query or "") else "balanced")
+    if chart_level not in {"light", "balanced", "rich"}:
+        chart_level = "balanced"
+    style_key = _field_value(source.get("styleKey")) or _presentation_preferred_style(use_case)
+    if style_key not in _PRESENTATION_STYLE_KEYS:
+        style_key = _presentation_preferred_style(use_case)
+    return {
+        "topic": _field_value(source.get("topic")) or _presentation_topic_from_query(query),
+        "useCase": use_case,
+        "aspectRatio": aspect_ratio,
+        "styleKey": style_key,
+        "audience": _field_value(source.get("audience")) or _presentation_audience_from_query(query, use_case),
+        "durationMinutes": duration,
+        "pageCount": page_count,
+        "density": density,
+        "chartLevel": chart_level,
+        "speakerNotes": bool(source.get("speakerNotes", True)),
+    }
+
+
+def _presentation_list_strings(value: Any, *, limit: int = 6) -> list[str]:
+    if isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, str):
+        raw_items = re.split(r"[\n；;]+", value)
+    else:
+        raw_items = []
+    rows: list[str] = []
+    for item in raw_items:
+        text = re.sub(r"\s+", " ", str(item or "").strip())
+        if text:
+            rows.append(text[:260])
+    return rows[:limit]
+
+
+def _presentation_visual_spec(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+
+    def text(raw: Any, limit: int = 120) -> str:
+        return _field_value(raw)[:limit]
+
+    def boolean(raw: Any) -> bool | None:
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return raw != 0
+        clean = _field_value(raw).lower()
+        if not clean:
+            return None
+        if clean in {"true", "yes", "y", "1", "estimated", "estimate"} or re.search(r"估算|假设|推算", clean):
+            return True
+        if clean in {"false", "no", "n", "0", "verified"} or re.search(r"真实|实数|核验", clean):
+            return False
+        return None
+
+    def items(raw: Any, *, limit: int = 6) -> list[dict[str, Any]]:
+        if not isinstance(raw, list):
+            return []
+        rows: list[dict[str, Any]] = []
+        for entry in raw[:limit]:
+            if isinstance(entry, str):
+                label = text(entry, 80)
+                if label:
+                    rows.append({"label": label})
+                continue
+            if not isinstance(entry, dict):
+                continue
+            row: dict[str, Any] = {}
+            label = text(entry.get("label") or entry.get("title") or entry.get("name"), 80)
+            if label:
+                row["label"] = label
+            title = text(entry.get("title"), 80)
+            if title:
+                row["title"] = title
+            detail = text(entry.get("detail") or entry.get("description") or entry.get("summary"), 220)
+            if detail:
+                row["detail"] = detail
+            value_raw = entry.get("value")
+            if isinstance(value_raw, (int, float)) or _field_value(value_raw):
+                row["value"] = value_raw if isinstance(value_raw, (int, float)) else text(value_raw, 40)
+            unit = text(entry.get("unit"), 20)
+            if unit:
+                row["unit"] = unit
+            score = entry.get("score")
+            if isinstance(score, (int, float)) or _field_value(score) in {"high", "medium", "low"}:
+                row["score"] = score
+            item_list = _presentation_list_strings(entry.get("items"), limit=8)
+            if item_list:
+                row["items"] = item_list
+            if row:
+                rows.append(row)
+        return rows
+
+    def template_id(raw: Any) -> str:
+        return _presentation_canonical_template_id(raw)
+
+    def numeric_values(raw: Any, *, limit: int = 12) -> list[float]:
+        if not isinstance(raw, list):
+            return []
+        values: list[float] = []
+        for entry in raw[:limit]:
+            if isinstance(entry, (int, float)):
+                values.append(float(entry))
+                continue
+            try:
+                clean = re.sub(r"[^\d.+-]", "", str(entry))
+                if clean:
+                    values.append(float(clean))
+            except Exception:
+                pass
+        return values
+
+    def chart_series(raw: Any, *, limit: int = 5) -> list[dict[str, Any]]:
+        if not isinstance(raw, list):
+            return []
+        series: list[dict[str, Any]] = []
+        for item in raw[:limit]:
+            if not isinstance(item, dict):
+                continue
+            values = numeric_values(item.get("values"), limit=12)
+            row: dict[str, Any] = {
+                "name": text(item.get("name"), 80),
+                "values": values,
+                "unit": text(item.get("unit"), 20),
+            }
+            row = {k: v for k, v in row.items() if v != "" and v != []}
+            if row:
+                series.append(row)
+        return series
+
+    spec: dict[str, Any] = {}
+    spec_type = text(value.get("type"), 40)
+    if spec_type in {"matrix", "architecture", "combo_metrics", "scorecard", "bar", "line", "metrics", "compare", "diagram", "roadmap", "timeline", "process", "business_model", "hero_metric", "generic"}:
+        spec["type"] = spec_type
+    explicit_template = template_id(value.get("templateId") or value.get("template_id") or value.get("chartTemplate") or value.get("chart_template") or value.get("visualTemplate") or value.get("template"))
+    if explicit_template:
+        spec["templateId"] = explicit_template
+        spec["chartTemplate"] = explicit_template
+    for key in ("title", "description"):
+        val = text(value.get(key), 180 if key == "description" else 100)
+        if val:
+            spec[key] = val
+    for key in ("columns", "rows", "layers", "metrics"):
+        val = items(value.get(key), limit=8)
+        if val:
+            spec[key] = val
+    chart_raw = value.get("chart")
+    if isinstance(chart_raw, dict):
+        chart: dict[str, Any] = {}
+        kind = text(chart_raw.get("kind"), 40)
+        if kind in {"scorecard", "bar", "line"}:
+            chart["kind"] = kind
+        nested_template = template_id(chart_raw.get("chartTemplate") or chart_raw.get("chart_template") or chart_raw.get("visualTemplate") or chart_raw.get("template"))
+        if nested_template and "chartTemplate" not in spec:
+            spec["chartTemplate"] = nested_template
+        labels = _presentation_list_strings(chart_raw.get("labels"), limit=12)
+        if labels:
+            chart["labels"] = labels
+        series = chart_series(chart_raw.get("series"), limit=5)
+        if series:
+            chart["series"] = series
+        for key in ("unit", "source", "methodology"):
+            raw_val = chart_raw.get(key)
+            if key == "methodology":
+                raw_val = raw_val or chart_raw.get("caliber") or chart_raw.get("scope")
+            val = text(raw_val, 220 if key == "methodology" else 120 if key == "source" else 20)
+            if val:
+                chart[key] = val
+        estimated = boolean(chart_raw.get("estimated") if "estimated" in chart_raw else chart_raw.get("isEstimated") if "isEstimated" in chart_raw else chart_raw.get("estimate"))
+        if estimated is not None:
+            chart["estimated"] = estimated
+        if chart:
+            spec["chart"] = chart
+    chart = dict(spec.get("chart")) if isinstance(spec.get("chart"), dict) else {}
+    if spec_type in {"bar", "line", "scorecard"} and not chart.get("kind"):
+        chart["kind"] = "bar" if spec_type == "bar" else "line" if spec_type == "line" else "scorecard"
+    top_labels = _presentation_list_strings(value.get("labels"), limit=12)
+    if top_labels and not chart.get("labels"):
+        chart["labels"] = top_labels
+    top_series = chart_series(value.get("series"), limit=5)
+    if top_series and not chart.get("series"):
+        chart["series"] = top_series
+    top_values = numeric_values(value.get("values"), limit=12)
+    if top_values and not chart.get("series"):
+        chart["series"] = [{
+            "name": text(value.get("seriesName") or value.get("name"), 80) or "当前值",
+            "values": top_values,
+            "unit": text(value.get("unit"), 20),
+        }]
+    if chart:
+        spec["chart"] = chart
+    template = _presentation_template_def(explicit_template)
+    if template and not spec.get("type"):
+        spec["type"] = _field_value(template.get("visualType")) or "generic"
+    if template and _field_value(template.get("chartKind")):
+        chart = dict(spec.get("chart")) if isinstance(spec.get("chart"), dict) else {}
+        if not chart.get("kind"):
+            chart["kind"] = _field_value(template.get("chartKind"))
+            spec["chart"] = chart
+    callouts = _presentation_list_strings(value.get("callouts"), limit=4)
+    if callouts:
+        spec["callouts"] = callouts
+    return spec
+
+
+def _presentation_knowledge(config: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = [
+        {
+            "id": "k-topic",
+            "title": "主题背景",
+            "source": "用户需求",
+            "detail": config["topic"],
+            "status": "ready",
+        },
+        {
+            "id": "k-audience",
+            "title": "受众画像",
+            "source": "A2UI 配置卡",
+            "detail": config["audience"],
+            "status": "ready",
+        },
+        {
+            "id": "k-data",
+            "title": "业务数据",
+            "source": "待接入知识库",
+            "detail": "建议补充指标、案例、截图或可引用材料。",
+            "status": "missing" if config.get("chartLevel") == "rich" else "assumption",
+        },
+    ]
+    if config.get("useCase") == "training":
+        rows.append({"id": "k-exercise", "title": "练习素材", "source": "培训任务", "detail": "建议补充真实案例、操作截图或课后练习。", "status": "assumption"})
+    if config.get("useCase") == "roadshow":
+        rows.append({"id": "k-market", "title": "市场与竞品", "source": "外部资料", "detail": "建议补充市场规模、竞品对比或客户证言。", "status": "missing"})
+    return rows
+
+
+def _presentation_slide_seeds(config: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+    if config.get("useCase") == "roadshow":
+        return [
+            ("开场", "封面：定义这次机会", "用一句话说明主题和价值主张", "品牌化主视觉"),
+            ("开场", "为什么是现在", "说明市场、技术和客户需求共同进入窗口期", "趋势曲线"),
+            ("问题", "客户正在承受什么成本", "把痛点转化为可感知的业务损耗", "痛点矩阵"),
+            ("机会", "机会空间与切入点", "说明目标客群和可获得市场", "市场分层图"),
+            ("方案", "我们的解决方案", "展示产品如何从理解需求到交付结果", "产品能力架构图"),
+            ("方案", "核心差异化", "用三点说明为什么我们更适合这个场景", "差异化对比表"),
+            ("证明", "典型使用路径", "讲清楚用户从输入到结果的完整体验", "旅程图"),
+            ("证明", "案例与效果", "用可验证结果增强可信度", "案例卡 + 指标"),
+            ("商业", "商业模式与增长路径", "说明收入来源、扩展方式和增长假设", "增长飞轮"),
+            ("落地", "合作方式", "给出清晰试点、交付和共创路径", "合作流程"),
+            ("落地", "下一步行动", "明确希望听众采取的动作", "行动清单"),
+            ("收束", "结束页", "回到愿景和行动号召", "强记忆点结束页"),
+        ]
+    if config.get("useCase") == "training":
+        return [
+            ("导入", "课程封面", "明确学习主题、对象和目标", "课程路径主视觉"),
+            ("导入", "学习目标", "让学员知道学完能做什么", "目标清单"),
+            ("认知", "概念框架", "解释核心概念及其边界", "概念地图"),
+            ("认知", "为什么需要它", "连接业务痛点与学习动机", "问题场景图"),
+            ("方法", "标准流程", "拆解从输入到输出的操作步骤", "流程图"),
+            ("方法", "关键操作一", "展开第一个关键动作和判断标准", "步骤卡"),
+            ("方法", "关键操作二", "展开第二个关键动作和常见误区", "对照表"),
+            ("示例", "完整案例演示", "用真实场景串起整个方法", "案例分镜"),
+            ("练习", "课堂练习", "让学员完成可检查的产出", "练习任务卡"),
+            ("评估", "检查清单", "提供自检标准和质量门槛", "检查表"),
+            ("总结", "知识回顾", "回收关键知识点", "三段式总结"),
+            ("总结", "下一步实践", "给出课后行动和资料入口", "行动路径"),
+        ]
+    return [
+        ("摘要", "封面与汇报目标", "说明本次汇报要解决的问题和结论范围", "正式封面"),
+        ("摘要", "核心结论", "用三条结论先给管理层答案", "结论卡片"),
+        ("背景", "当前背景", "描述业务环境、目标和约束", "背景分层图"),
+        ("现状", "关键现状与问题", "把现状归纳为可决策的问题", "问题矩阵"),
+        ("分析", "原因分析", "拆解问题背后的结构性原因", "因果链路图"),
+        ("方案", "建议方案", "提出可执行的方案框架", "方案架构图"),
+        ("方案", "实施路径", "明确阶段、负责人和里程碑", "路线图"),
+        ("数据", "预期收益", "说明效率、成本、体验或风险收益", "指标卡"),
+        ("风险", "风险与应对", "提前说明风险和缓释措施", "风险矩阵"),
+        ("行动", "下一步计划", "给出需要确认的决策和动作", "行动清单"),
+    ]
+
+
+def _presentation_bullets(config: dict[str, Any], title: str, index: int) -> list[str]:
+    topic = _field_value(config.get("topic")) or "本主题"
+    audience = _field_value(config.get("audience")) or "目标受众"
+    rows = [
+        f"主题聚焦：围绕{topic[:18]}形成一个明确判断",
+        f"受众视角：面向{audience[:16]}保留可决策信息",
+        "证据支撑：补充数据、案例或截图增强可信度",
+    ]
+    if re.search(r"结论|核心", title):
+        rows = [
+            "核心判断：先给答案，再展开依据",
+            "决策价值：说明影响范围和优先级",
+            "行动指向：给出需要确认的下一步",
+        ]
+    elif re.search(r"背景|为什么|现在|趋势|市场|机会", title):
+        rows = [
+            "趋势信号：技术、成本和需求窗口正在叠加",
+            "市场机会：目标客群和高频场景逐步清晰",
+            "资料缺口：补充权威规模数据和来源口径",
+        ]
+    elif re.search(r"问题|痛点|成本|现状|困境", title):
+        rows = [
+            "主要矛盾：人工流程、知识断层和协作摩擦",
+            "业务影响：效率、质量和响应速度受到牵制",
+            "验证方式：用客户案例或运营数据支撑判断",
+        ]
+    elif re.search(r"收益|效果|指标|增长|商业|模式|财务", title):
+        rows = [
+            "效率收益：节省重复劳动并提升交付速度",
+            "增长指标：关注转化、留存、复购和扩展收入",
+            "数据口径：真实数值待接入经营看板确认",
+        ]
+    elif re.search(r"方案|架构|能力|产品|解决方案", title):
+        rows = [
+            "能力层次：感知、记忆、规划和执行形成闭环",
+            "落地方式：从高价值场景切入并逐步复制",
+            "集成要求：明确系统、权限和数据边界",
+        ]
+    elif re.search(r"路径|流程|计划|实施|路线|里程碑|阶段", title):
+        rows = [
+            "阶段一：选定场景并完成试点评估",
+            "阶段二：扩展到多条业务线并建立规范",
+            "阶段三：规模化运营并持续优化 ROI",
+        ]
+    elif re.search(r"风险|应对|治理|合规", title):
+        rows = [
+            "风险项：数据、权限、模型输出和流程责任",
+            "控制点：审计日志、人工确认和灰度机制",
+            "兜底策略：关键节点保留审批与回滚方案",
+        ]
+    elif re.search(r"行动|下一步|合作|联系|清单", title):
+        rows = [
+            "近期动作：确认试点范围、负责人和时间表",
+            "协同机制：建立周例会、风险清单和数据看板",
+            "交付标准：以业务指标和用户反馈双重验收",
+        ]
+    if re.search(r"练习|实践", title):
+        rows = [
+            "练习任务：围绕真实场景完成一份输出",
+            "评价标准：检查完整性、准确性和可执行性",
+            "复盘方式：记录问题、改进动作和责任人",
+        ]
+    return rows[:3]
+
+
+def _presentation_infer_layout(title: str, visual: str = "", *, index: int = 1, use_case: str = "report") -> str:
+    text = f"{title} {visual}".lower()
+    if index <= 1 or re.search(r"封面|开场|标题页|cover|hero", text, flags=re.I):
+        return "cover"
+    if re.search(r"章节|转场|section", text, flags=re.I):
+        return "section"
+    if re.search(r"核心结论|关键结论|核心判断|关键判断|摘要结论", text, flags=re.I):
+        return "metrics"
+    if re.search(r"对比|比较|差异|竞品|矩阵|左右|左侧|右侧|vs\b|versus|compare", text, flags=re.I):
+        return "compare"
+    if re.search(r"指标|数据|收益|效果|roi|kpi|数字|增长|转化|趋势|走势|市场规模|市场空间|收入|利润|成本|漏斗|留存|metrics", text, flags=re.I):
+        return "metrics"
+    if re.search(r"时间线|里程碑|阶段|路线图|roadmap|timeline", text, flags=re.I):
+        return "timeline"
+    if re.search(r"路径|流程|步骤|计划|操作|闭环|链路|process|flow", text, flags=re.I):
+        return "process"
+    if re.search(r"架构|地图|分层|能力|模型|曲线|图谱|因果|旅程|系统|diagram|map", text, flags=re.I):
+        return "diagram"
+    if re.search(r"清单|检查|任务|待办|行动项|checklist|todo", text, flags=re.I):
+        return "checklist"
+    if re.search(r"结束|愿景|口号|总结|收束|quote|slogan", text, flags=re.I):
+        return "quote"
+    if use_case == "training" and index % 4 == 0:
+        return "checklist"
+    return "two_column"
+
+
+def _presentation_layout_from_visual_spec(spec: dict[str, Any], fallback: str = "two_column") -> str:
+    if not isinstance(spec, dict) or not spec:
+        return fallback
+    template = _presentation_template_def(spec.get("templateId") or spec.get("template_id") or spec.get("chartTemplate") or spec.get("chart_template") or spec.get("visualTemplate"))
+    template_layout = _field_value(template.get("layout"))
+    if template_layout in _PRESENTATION_LAYOUTS:
+        return template_layout
+    spec_type = _field_value(spec.get("type"))
+    rows = spec.get("rows") if isinstance(spec.get("rows"), list) else []
+    columns = spec.get("columns") if isinstance(spec.get("columns"), list) else []
+    layers = spec.get("layers") if isinstance(spec.get("layers"), list) else []
+    metrics = spec.get("metrics") if isinstance(spec.get("metrics"), list) else []
+    chart = spec.get("chart") if isinstance(spec.get("chart"), dict) else {}
+    if len(columns) >= 2 or spec_type == "matrix":
+        return "compare"
+    if len(layers) >= 2 or spec_type == "architecture":
+        return "diagram"
+    if metrics or chart.get("series") or spec_type in {"scorecard", "bar", "line", "combo_metrics"}:
+        return "metrics"
+    if rows:
+        text = f"{spec.get('title') or ''} {spec.get('description') or ''} " + " ".join(
+            f"{row.get('label') or row.get('title') or ''} {row.get('detail') or ''}"
+            for row in rows
+            if isinstance(row, dict)
+        )
+        if re.search(r"时间|阶段|路线|里程碑|季度|月份|周|day|month|timeline", text, flags=re.I):
+            return "timeline"
+        if re.search(r"清单|行动|待办|check|todo|事项", text, flags=re.I):
+            return "checklist"
+        return "process"
+    return fallback
+
+
+def _presentation_slide_signal(slide: dict[str, Any]) -> str:
+    return " ".join([
+        _field_value(slide.get("title")),
+        _field_value(slide.get("headline")),
+        _field_value(slide.get("visual")),
+        " ".join(_presentation_list_strings(slide.get("bullets"), limit=8)),
+        " ".join(_presentation_list_strings(slide.get("renderHints"), limit=6)),
+        _field_value(slide.get("designIntent")),
+        _field_value(slide.get("evidenceRole")),
+    ]).lower()
+
+
+def _presentation_semantic_layout(slide: dict[str, Any], index: int, config: dict[str, Any]) -> str:
+    current = _field_value(slide.get("layout"))
+    if current not in _PRESENTATION_LAYOUTS:
+        current = ""
+    if index <= 1 or current == "cover":
+        return "cover"
+    if current in {"section", "quote"}:
+        return current
+    visual_spec = slide.get("visualSpec") if isinstance(slide.get("visualSpec"), dict) else {}
+    by_spec = _presentation_layout_from_visual_spec(visual_spec, current or "two_column")
+    if by_spec != "two_column":
+        return by_spec
+    inferred = _presentation_infer_layout(
+        _field_value(slide.get("title")),
+        " ".join([
+            _field_value(slide.get("visual")),
+            _field_value(slide.get("headline")),
+            " ".join(_presentation_list_strings(slide.get("bullets"), limit=5)),
+        ]),
+        index=index,
+        use_case=_field_value(config.get("useCase")) or "report",
+    )
+    if inferred != "two_column":
+        return inferred
+    return current or inferred
+
+
+def _presentation_layout_hint(layout: str) -> str:
+    return {
+        "compare": "leftLabel=现状，rightLabel=目标",
+        "metrics": "chart=scorecard",
+        "process": "flow=step",
+        "timeline": "flow=timeline",
+        "diagram": "flow=layered",
+        "checklist": "emphasis=行动清单",
+    }.get(layout, "")
+
+
+def _presentation_slide_rhythm(slide: dict[str, Any], layout: str, index: int, config: dict[str, Any]) -> str:
+    if index <= 1 or layout in {"cover", "section", "quote"}:
+        return "anchor"
+    signal = _presentation_slide_signal(slide)
+    bullets = _presentation_list_strings(slide.get("bullets"), limit=8)
+    if layout in {"metrics", "compare"} or len(bullets) >= 4 or re.search(r"数据|指标|对比|矩阵|清单|表格|成本|收益|效率", signal):
+        return "dense"
+    if layout in {"diagram", "process", "timeline"}:
+        return "dense" if len(bullets) >= 4 else "breathing"
+    if config.get("density") == "clean" or len(bullets) <= 2 or re.search(r"一句话|核心观点|愿景|结论|暂停|转折", signal):
+        return "breathing"
+    return "dense"
+
+
+def _presentation_chart_template(slide: dict[str, Any], layout: str) -> str:
+    signal = _presentation_slide_signal(slide)
+    spec = slide.get("visualSpec") if isinstance(slide.get("visualSpec"), dict) else {}
+    explicit_template = _field_value(spec.get("templateId") or spec.get("template_id") or spec.get("chartTemplate") or spec.get("chart_template") or spec.get("visualTemplate") or spec.get("template"))
+    if explicit_template:
+        clean_template = _presentation_canonical_template_id(explicit_template)
+        template = _presentation_template_def(clean_template)
+        template_layout = _field_value(template.get("layout"))
+        if clean_template in _PRESENTATION_VISUAL_TEMPLATE_CATALOG and (not template_layout or template_layout == layout):
+            return "" if clean_template in {"cover", "section", "quote"} else clean_template
+    chart = spec.get("chart") if isinstance(spec.get("chart"), dict) else {}
+    chart_kind = _field_value(chart.get("kind") or spec.get("type"))
+    series = chart.get("series") if isinstance(chart.get("series"), list) else []
+    metrics = spec.get("metrics") if isinstance(spec.get("metrics"), list) else []
+    columns = spec.get("columns") if isinstance(spec.get("columns"), list) else []
+    layers = spec.get("layers") if isinstance(spec.get("layers"), list) else []
+    rows = spec.get("rows") if isinstance(spec.get("rows"), list) else []
+    if layout == "metrics":
+        if chart_kind == "line":
+            return "line_chart"
+        if chart_kind == "bar" and len(series) >= 2:
+            return "grouped_bar_chart"
+        if chart_kind == "bar":
+            return "horizontal_bar_chart" if re.search(r"排行|排名|rank|top|长标签", signal, flags=re.I) else "bar_chart"
+        if len(metrics) >= 4:
+            return "metric_dashboard"
+        if re.search(r"目标|实际|完成率|baseline|target", signal, flags=re.I):
+            return "bullet_chart"
+        return "kpi_cards"
+    if layout == "compare":
+        if len(columns) >= 3 or re.search(r"特性|功能|能力项|check|feature", signal, flags=re.I):
+            return "feature_matrix_table"
+        if re.search(r"2x2|四象限|象限|SWOT|优先级|影响.*投入|impact.*effort", signal, flags=re.I):
+            return "quadrant_text_bullets"
+        if re.search(r"价格|套餐|服务层级|tier|pricing", signal, flags=re.I):
+            return "comparison_columns"
+        return "comparison_table"
+    if layout == "diagram":
+        if len(layers) >= 2 or re.search(r"架构|分层|层级|architecture|layer", signal, flags=re.I):
+            return "layered_architecture"
+        return "hub_spoke"
+    if layout == "process":
+        if re.search(r"产物|交付物|artifact|pipeline|管线|ETL", signal, flags=re.I):
+            return "pipeline_with_stages"
+        if len(rows) <= 3 or re.search(r"步骤|入门|方法论|getting started", signal, flags=re.I):
+            return "numbered_steps"
+        return "process_flow"
+    if layout == "timeline":
+        if re.search(r"周期|持续|工期|依赖|甘特|duration|dependency|task", signal, flags=re.I):
+            return "gantt_chart"
+        if re.search(r"路线图|roadmap|状态|status", signal, flags=re.I):
+            return "roadmap_vertical"
+        return "timeline"
+    if layout == "checklist":
+        return "agenda_list" if re.search(r"议程|目录|agenda|会议", signal, flags=re.I) else "numbered_steps"
+    return ""
+
+
+_PRESENTATION_TEMPLATE_CATALOG_VERSION = "aippt-template-catalog-v2"
+
+_PRESENTATION_VISUAL_TEMPLATE_CATALOG: dict[str, dict[str, Any]] = {
+    "cover": {"family": "narrative", "layout": "cover", "visualType": "generic", "summary": "封面或主张页，锁定主题、受众和价值承诺。", "pptx": "native_shapes", "slot": "media"},
+    "section": {"family": "narrative", "layout": "section", "visualType": "generic", "summary": "章节转场页，承接叙事节奏。", "pptx": "native_shapes", "slot": "none"},
+    "quote": {"family": "narrative", "layout": "quote", "visualType": "generic", "summary": "收束金句或关键判断页。", "pptx": "native_shapes", "slot": "none"},
+    "kpi_cards": {"family": "metrics", "layout": "metrics", "visualType": "scorecard", "summary": "4-8 个独立指标卡，适合经营结果、效果口径、阶段成果。", "pptx": "native_shapes", "chartKind": "scorecard", "slot": "chart"},
+    "hero_metric": {"family": "metrics", "layout": "metrics", "visualType": "scorecard", "summary": "单个超大数字 + 解释，适合一页只强调一个关键结论。", "pptx": "native_shapes", "chartKind": "scorecard", "slot": "chart"},
+    "metric_dashboard": {"family": "metrics", "layout": "metrics", "visualType": "scorecard", "summary": "主指标 + 辅助指标组合，适合投资人/高管看板。", "pptx": "native_shapes", "chartKind": "scorecard", "slot": "chart"},
+    "bullet_chart": {"family": "metrics", "layout": "metrics", "visualType": "scorecard", "summary": "目标/实际/完成率表达，适合目标达成或预算消耗。", "pptx": "native_shapes", "chartKind": "scorecard", "slot": "chart"},
+    "line_chart": {"family": "trend", "layout": "metrics", "visualType": "line", "summary": "1-3 条时间序列趋势，适合 MRR、转化、成本走势。", "pptx": "native_chart", "chartKind": "line", "slot": "chart"},
+    "multi_line_chart": {"family": "trend", "layout": "metrics", "visualType": "line", "summary": "多序列趋势对比，适合同一指标多对象走势。", "pptx": "native_chart", "chartKind": "line", "slot": "chart"},
+    "bar_chart": {"family": "category", "layout": "metrics", "visualType": "bar", "summary": "单序列分类对比，适合行业、区域、功能模块对比。", "pptx": "native_chart", "chartKind": "bar", "slot": "chart"},
+    "grouped_bar_chart": {"family": "category", "layout": "metrics", "visualType": "bar", "summary": "2-4 序列并排柱状图，适合多对象多阶段对比。", "pptx": "native_chart", "chartKind": "bar", "slot": "chart"},
+    "horizontal_bar_chart": {"family": "ranking", "layout": "metrics", "visualType": "bar", "summary": "长标签排名或 TAM/SAM/SOM 横向对比。", "pptx": "native_chart", "chartKind": "bar", "slot": "chart"},
+    "waterfall_chart": {"family": "finance", "layout": "metrics", "visualType": "bar", "summary": "从收入到利润或成本拆解的桥图。", "pptx": "native_shapes", "chartKind": "bar", "slot": "chart"},
+    "funnel_chart": {"family": "conversion", "layout": "metrics", "visualType": "bar", "summary": "线索、转化、留存等漏斗阶段。", "pptx": "native_shapes", "chartKind": "bar", "slot": "chart"},
+    "comparison_table": {"family": "compare", "layout": "compare", "visualType": "matrix", "summary": "2-4 个对象的密集功能/能力比较表。", "pptx": "native_shapes", "slot": "diagram"},
+    "comparison_columns": {"family": "compare", "layout": "compare", "visualType": "matrix", "summary": "并排方案/套餐/服务层级卡。", "pptx": "native_shapes", "slot": "diagram"},
+    "feature_matrix_table": {"family": "compare", "layout": "compare", "visualType": "matrix", "summary": "竞品能力 checklist 或强弱项矩阵。", "pptx": "native_shapes", "slot": "diagram"},
+    "quadrant_text_bullets": {"family": "framework", "layout": "compare", "visualType": "matrix", "summary": "2x2 象限，适合优先级、SWOT、影响/投入。", "pptx": "native_shapes", "slot": "diagram"},
+    "matrix_2x2": {"family": "framework", "layout": "compare", "visualType": "matrix", "summary": "二维坐标矩阵，适合定位图、战略选择。", "pptx": "native_shapes", "slot": "diagram"},
+    "layered_architecture": {"family": "architecture", "layout": "diagram", "visualType": "architecture", "summary": "3-6 层架构或能力栈。", "pptx": "native_shapes", "slot": "diagram"},
+    "hub_spoke": {"family": "architecture", "layout": "diagram", "visualType": "architecture", "summary": "中心能力 + 周边模块关系。", "pptx": "native_shapes", "slot": "diagram"},
+    "system_map": {"family": "architecture", "layout": "diagram", "visualType": "architecture", "summary": "系统组件关系图，适合产品/技术架构。", "pptx": "native_shapes", "slot": "diagram"},
+    "journey_map": {"family": "process", "layout": "process", "visualType": "process", "summary": "用户/客户旅程，强调阶段体验与触点。", "pptx": "native_shapes", "slot": "diagram"},
+    "process_flow": {"family": "process", "layout": "process", "visualType": "process", "summary": "3-8 个顺序步骤的流程图。", "pptx": "native_shapes", "slot": "diagram"},
+    "pipeline_with_stages": {"family": "process", "layout": "process", "visualType": "process", "summary": "阶段管线 + 交付物，适合销售/实施/数据链路。", "pptx": "native_shapes", "slot": "diagram"},
+    "numbered_steps": {"family": "process", "layout": "process", "visualType": "process", "summary": "3-6 个横向编号步骤。", "pptx": "native_shapes", "slot": "diagram"},
+    "agenda_list": {"family": "process", "layout": "checklist", "visualType": "process", "summary": "目录、议程、行动项列表。", "pptx": "native_shapes", "slot": "diagram"},
+    "timeline": {"family": "timeline", "layout": "timeline", "visualType": "timeline", "summary": "3-8 个横向里程碑。", "pptx": "native_shapes", "slot": "diagram"},
+    "roadmap_vertical": {"family": "timeline", "layout": "timeline", "visualType": "roadmap", "summary": "纵向路线图，适合季度/月度计划。", "pptx": "native_shapes", "slot": "diagram"},
+    "gantt_chart": {"family": "timeline", "layout": "timeline", "visualType": "timeline", "summary": "任务持续时间、依赖和排期。", "pptx": "native_shapes", "slot": "diagram"},
+    "business_model_canvas": {"family": "business", "layout": "diagram", "visualType": "matrix", "summary": "商业模式九宫格或关键模块拆解。", "pptx": "native_shapes", "slot": "diagram"},
+    "unit_economics": {"family": "business", "layout": "metrics", "visualType": "scorecard", "summary": "CAC、LTV、毛利、回收期等单位经济模型。", "pptx": "native_shapes", "slot": "chart"},
+    "case_study_cards": {"family": "proof", "layout": "two_column", "visualType": "generic", "summary": "客户案例/场景案例卡片组。", "pptx": "native_shapes", "slot": "diagram"},
+}
+
+_PRESENTATION_HIGH_FREQUENCY_TEMPLATES = {
+    "cover", "section", "quote", "kpi_cards", "hero_metric", "metric_dashboard",
+    "bullet_chart", "line_chart", "multi_line_chart", "bar_chart", "grouped_bar_chart",
+    "horizontal_bar_chart", "waterfall_chart", "funnel_chart", "comparison_table",
+    "comparison_columns", "feature_matrix_table", "quadrant_text_bullets", "matrix_2x2",
+    "layered_architecture", "hub_spoke", "system_map", "journey_map", "process_flow",
+    "pipeline_with_stages", "numbered_steps", "agenda_list", "timeline", "roadmap_vertical",
+    "gantt_chart", "business_model_canvas", "unit_economics", "case_study_cards",
+}
+
+
+def _presentation_canonical_template_id(value: Any) -> str:
+    clean = re.sub(r"[^\w-]+", "_", _field_value(value)[:80]).strip("_")
+    aliases = {
+        "combo_line_metrics": "line_chart",
+        "comboLineMetrics": "line_chart",
+        "line_metrics": "line_chart",
+        "metric_cards": "kpi_cards",
+        "kpi": "kpi_cards",
+        "architecture": "layered_architecture",
+        "business_canvas": "business_model_canvas",
+    }
+    return aliases.get(clean, clean)
+
+
+def _presentation_template_def(template_id: Any) -> dict[str, Any]:
+    clean = _presentation_canonical_template_id(template_id)
+    return _PRESENTATION_VISUAL_TEMPLATE_CATALOG.get(clean, {})
+
+
+def _presentation_template_candidates_for_slide(slide: dict[str, Any], layout: str, index: int, config: dict[str, Any]) -> list[str]:
+    signal = _presentation_slide_signal(slide)
+    spec = slide.get("visualSpec") if isinstance(slide.get("visualSpec"), dict) else {}
+    chart = spec.get("chart") if isinstance(spec.get("chart"), dict) else {}
+    chart_kind = _field_value(chart.get("kind") or spec.get("type"))
+    series = chart.get("series") if isinstance(chart.get("series"), list) else []
+    metrics = spec.get("metrics") if isinstance(spec.get("metrics"), list) else []
+    columns = spec.get("columns") if isinstance(spec.get("columns"), list) else []
+    layers = spec.get("layers") if isinstance(spec.get("layers"), list) else []
+    rows = spec.get("rows") if isinstance(spec.get("rows"), list) else []
+    candidates: list[str] = []
+
+    def add(*template_ids: str) -> None:
+        for template_id in template_ids:
+            template = _presentation_template_def(template_id)
+            if not template or _field_value(template.get("layout")) != layout:
+                continue
+            if template_id not in candidates:
+                candidates.append(template_id)
+
+    if layout == "metrics":
+        if chart_kind == "line" or re.search(r"趋势|走势|增速|变化|环比|同比|mrr|arr|pipeline|trend", signal, flags=re.I):
+            add("multi_line_chart" if len(series) >= 2 else "line_chart")
+        if chart_kind == "bar" and len(series) >= 2:
+            add("grouped_bar_chart")
+        if re.search(r"tam|sam|som|排行|排名|top|区域|行业|模块|市场空间|长标签", signal, flags=re.I):
+            add("horizontal_bar_chart")
+        if chart_kind == "bar":
+            add("bar_chart")
+        if re.search(r"收入|利润|成本|预算|现金流|桥图|waterfall|拆解", signal, flags=re.I):
+            add("waterfall_chart")
+        if re.search(r"漏斗|转化|线索|留资|注册|成交|funnel", signal, flags=re.I):
+            add("funnel_chart")
+        if re.search(r"cac|ltv|毛利|回收期|单位经济|unit economics", signal, flags=re.I):
+            add("unit_economics")
+        if re.search(r"目标|实际|完成率|达成率|baseline|target", signal, flags=re.I):
+            add("bullet_chart")
+        if len(metrics) >= 3 or re.search(r"看板|dashboard|多指标|经营|指标", signal, flags=re.I):
+            add("metric_dashboard")
+        if len(metrics) == 1 or re.search(r"北极星|单一指标|关键数字|hero metric", signal, flags=re.I):
+            add("hero_metric")
+        add("kpi_cards", "bar_chart", "line_chart")
+    elif layout == "compare":
+        if re.search(r"商业模式|九宫格|canvas|生态", signal, flags=re.I):
+            add("business_model_canvas")
+        if re.search(r"2x2|四象限|象限|swot|优先级|影响.*投入|impact.*effort", signal, flags=re.I):
+            add("quadrant_text_bullets", "matrix_2x2")
+        if len(columns) >= 3 or re.search(r"特性|功能|能力项|feature|checklist|竞品|强弱", signal, flags=re.I):
+            add("feature_matrix_table")
+        if re.search(r"价格|套餐|版本|服务层级|tier|pricing|方案包", signal, flags=re.I):
+            add("comparison_columns")
+        add("comparison_table", "comparison_columns")
+    elif layout == "diagram":
+        if re.search(r"商业模式|九宫格|canvas|价值链", signal, flags=re.I):
+            add("business_model_canvas")
+        if re.search(r"系统|地图|组件|关系|拓扑|system map|生态", signal, flags=re.I):
+            add("system_map")
+        if len(layers) >= 2 or re.search(r"架构|分层|层级|能力栈|architecture|layer", signal, flags=re.I):
+            add("layered_architecture")
+        add("hub_spoke", "layered_architecture")
+    elif layout == "process":
+        if re.search(r"旅程|路径|用户路径|触点|体验|journey", signal, flags=re.I):
+            add("journey_map")
+        if re.search(r"产物|交付物|pipeline|管线|阶段门|etl|数据链路", signal, flags=re.I):
+            add("pipeline_with_stages")
+        if len(rows) <= 3 or re.search(r"步骤|入门|方法论|getting started|三步", signal, flags=re.I):
+            add("numbered_steps")
+        add("process_flow", "pipeline_with_stages")
+    elif layout == "timeline":
+        if re.search(r"周期|持续|工期|依赖|甘特|duration|dependency|task", signal, flags=re.I):
+            add("gantt_chart")
+        if re.search(r"路线图|roadmap|状态|版本|季度|年度", signal, flags=re.I):
+            add("roadmap_vertical")
+        add("timeline", "roadmap_vertical")
+    elif layout == "checklist":
+        if re.search(r"议程|目录|agenda|会议", signal, flags=re.I):
+            add("agenda_list")
+        add("numbered_steps", "agenda_list")
+    elif layout == "two_column":
+        if re.search(r"案例|客户|场景|证明|复盘|case", signal, flags=re.I):
+            add("case_study_cards")
+
+    if not candidates:
+        default_template = _presentation_chart_template(slide, layout)
+        if default_template:
+            add(default_template)
+    if len(candidates) > 1:
+        offset = index % len(candidates)
+        candidates = candidates[offset:] + candidates[:offset]
+    return candidates
+
+
+def _presentation_pick_diverse_template(
+    slide: dict[str, Any],
+    layout: str,
+    index: int,
+    config: dict[str, Any],
+    recent_templates: list[str],
+) -> str:
+    candidates = _presentation_template_candidates_for_slide(slide, layout, index, config)
+    if not candidates:
+        return ""
+    if layout == "metrics" and config.get("chartLevel") == "rich":
+        native = [
+            template_id for template_id in candidates
+            if _field_value(_presentation_template_def(template_id).get("pptx")) == "native_chart"
+        ]
+        if native:
+            candidates = [*native, *[template_id for template_id in candidates if template_id not in native]]
+    recent = [item for item in recent_templates[-2:] if item]
+    for template_id in candidates:
+        if recent.count(template_id) < 2 and template_id not in recent[-1:]:
+            return template_id
+    for template_id in candidates:
+        if recent.count(template_id) < 2:
+            return template_id
+    return candidates[0]
+
+
+def _presentation_template_id_for_slide(slide: dict[str, Any], layout: str | None = None) -> str:
+    resolved_layout = _field_value(layout or slide.get("layout")) or "two_column"
+    chart_template = _presentation_chart_template(slide, resolved_layout)
+    if chart_template:
+        return chart_template
+    if resolved_layout in {"cover", "section", "quote"}:
+        return resolved_layout
+    return resolved_layout
+
+
+def _presentation_template_catalog_for_prompt() -> list[dict[str, str]]:
+    return [
+        {
+            "id": key,
+            "layout": _field_value(value.get("layout")),
+            "family": _field_value(value.get("family")),
+            "visualType": _field_value(value.get("visualType")),
+            "pptxSupport": _field_value(value.get("pptx")),
+            "summary": _field_value(value.get("summary")),
+        }
+        for key, value in _PRESENTATION_VISUAL_TEMPLATE_CATALOG.items()
+    ]
+
+
+def _presentation_hint_value(slide: dict[str, Any], keys: list[str]) -> str:
+    text = "；".join(filter(None, [
+        *(_presentation_list_strings(slide.get("renderHints"), limit=8)),
+        _field_value(slide.get("visual")),
+        _field_value(slide.get("designIntent")),
+        _field_value(slide.get("evidenceRole")),
+    ]))
+    for key in keys:
+        match = re.search(rf"{re.escape(key)}\s*[=:：]\s*([^；;\n]+)", text, flags=re.I)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+    return ""
+
+
+def _presentation_hard_locked_template_id(slide: dict[str, Any]) -> str:
+    hints = _presentation_list_strings(slide.get("renderHints"), limit=8)
+    text = "；".join(hints)
+    for key in ["templateId", "chartTemplate", "chart模板", "visualTemplate"]:
+        match = re.search(rf"{re.escape(key)}\s*[=:：]\s*([^；;\n]+)", text, flags=re.I)
+        if not match or not match.group(1).strip():
+            continue
+        clean = _presentation_canonical_template_id(match.group(1).strip())
+        if clean in _PRESENTATION_VISUAL_TEMPLATE_CATALOG:
+            return clean
+    return ""
+
+
+def _presentation_locked_rhythm(slide: dict[str, Any], config: dict[str, Any]) -> str:
+    hinted = _presentation_hint_value(slide, ["rhythm", "节奏"])
+    if hinted in {"anchor", "dense", "breathing"}:
+        return hinted
+    return _presentation_slide_rhythm(slide, _field_value(slide.get("layout")) or "two_column", int(slide.get("index") or 1), config)
+
+
+def _presentation_locked_chart_template(slide: dict[str, Any]) -> str:
+    spec = slide.get("visualSpec") if isinstance(slide.get("visualSpec"), dict) else {}
+    hinted = _field_value(spec.get("templateId") or spec.get("template_id") or spec.get("chartTemplate") or spec.get("chart_template") or spec.get("visualTemplate")) or _presentation_hint_value(slide, ["templateId", "chartTemplate", "chart模板", "visualTemplate"])
+    if hinted:
+        clean = _presentation_canonical_template_id(hinted)
+        template = _presentation_template_def(clean)
+        template_layout = _field_value(template.get("layout"))
+        layout = _field_value(slide.get("layout"))
+        if clean in _PRESENTATION_VISUAL_TEMPLATE_CATALOG and (not template_layout or template_layout == layout):
+            return "" if clean in {"cover", "section", "quote"} else clean
+    inferred = _presentation_chart_template(slide, _field_value(slide.get("layout")))
+    return inferred if inferred in _PRESENTATION_VISUAL_TEMPLATE_CATALOG else ""
+
+
+def _presentation_spec_lock_pages(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    spec_lock = plan.get("specLock") if isinstance(plan.get("specLock"), dict) else {}
+    pages = spec_lock.get("pages") if isinstance(spec_lock.get("pages"), list) else []
+    if not pages:
+        layout_plan = spec_lock.get("layoutPlan") if isinstance(spec_lock.get("layoutPlan"), dict) else {}
+        pages = layout_plan.get("pages") if isinstance(layout_plan.get("pages"), list) else []
+    return [page for page in pages if isinstance(page, dict)]
+
+
+def _presentation_spec_lock_page_for_slide(plan: dict[str, Any], slide: dict[str, Any], index: int) -> dict[str, Any]:
+    pages = _presentation_spec_lock_pages(plan)
+    if not pages:
+        return {}
+    slide_id = _field_value(slide.get("id"))
+    if slide_id:
+        matched = next((page for page in pages if _field_value(page.get("slideId")) == slide_id), None)
+        if matched:
+            return matched
+    return next((page for page in pages if _presentation_int(page.get("index"), -1, minimum=-1, maximum=1000) == index), {})
+
+
+def _presentation_apply_spec_lock_route(slide: dict[str, Any], page: dict[str, Any], index: int, config: dict[str, Any]) -> None:
+    if not isinstance(page, dict) or not page:
+        return
+    template_id = _presentation_canonical_template_id(page.get("templateId") or page.get("chartTemplate"))
+    template = _presentation_template_def(template_id)
+    locked_layout = _field_value(template.get("layout")) or _field_value(page.get("layout"))
+    if locked_layout in _PRESENTATION_LAYOUTS:
+        slide["layout"] = locked_layout
+
+    route_keys = {"rhythm", "templateId", "chartTemplate", "visualTemplate"}
+    slide["renderHints"] = [
+        row for row in _presentation_list_strings(slide.get("renderHints"), limit=6)
+        if row.split("=", 1)[0].strip() not in route_keys
+    ]
+    _presentation_append_hint(slide, _presentation_layout_hint(_field_value(slide.get("layout"))))
+    rhythm = _field_value(page.get("rhythm")) or _presentation_slide_rhythm(slide, _field_value(slide.get("layout")) or "two_column", index, config)
+    if rhythm in {"anchor", "dense", "breathing"}:
+        _presentation_append_hint(slide, f"rhythm={rhythm}")
+    if template_id and template_id not in {"cover", "section", "quote"}:
+        _presentation_append_hint(slide, f"chartTemplate={template_id}")
+
+    spec = _presentation_visual_spec(slide.get("visualSpec"))
+    if template_id and template:
+        spec["templateId"] = template_id
+        spec["chartTemplate"] = template_id
+        spec["type"] = _field_value(template.get("visualType")) or _field_value(spec.get("type")) or "generic"
+        chart_kind = _field_value(template.get("chartKind"))
+        if chart_kind:
+            chart = dict(spec.get("chart")) if isinstance(spec.get("chart"), dict) else {}
+            chart["kind"] = chart_kind
+            spec["chart"] = chart
+    elif _field_value(page.get("visualSpecType")):
+        spec["type"] = _field_value(spec.get("type")) or _field_value(page.get("visualSpecType"))
+    if spec:
+        slide["visualSpec"] = spec
+
+
+def _presentation_apply_existing_spec_lock_routes(plan: dict[str, Any], config: dict[str, Any]) -> None:
+    spec_lock = plan.get("specLock") if isinstance(plan.get("specLock"), dict) else {}
+    if _field_value(spec_lock.get("version")) != "aippt-spec-lock-v2":
+        return
+    slides = [slide for slide in plan.get("slides", []) if isinstance(slide, dict)]
+    pages = _presentation_spec_lock_pages(plan)
+    if not slides or len(pages) != len(slides):
+        return
+    for idx, slide in enumerate(slides, start=1):
+        page = _presentation_spec_lock_page_for_slide(plan, slide, idx)
+        _presentation_apply_spec_lock_route(slide, page, idx, config)
+
+
+def _presentation_build_spec_lock(plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    slides = [slide for slide in plan.get("slides", []) if isinstance(slide, dict)]
+    tokens = _AIPPT_STYLE_TOKENS.get(_field_value(config.get("styleKey")) or "", _AIPPT_STYLE_TOKENS["executive_blue"])
+    page_rhythm: dict[str, str] = {}
+    page_layouts: dict[str, str] = {}
+    page_charts: dict[str, str] = {}
+    page_templates: dict[str, str] = {}
+    pages: list[dict[str, Any]] = []
+    image_policy: dict[str, dict[str, str]] = {}
+    for idx, slide in enumerate(slides, start=1):
+        slide_id = _field_value(slide.get("id")) or f"slide-{idx}"
+        layout = _field_value(slide.get("layout")) or "two_column"
+        rhythm = _presentation_locked_rhythm({**slide, "index": idx}, config)
+        chart_template = _presentation_locked_chart_template(slide)
+        template_id = _presentation_template_id_for_slide(slide, layout)
+        template = _presentation_template_def(template_id)
+        page_rhythm[slide_id] = rhythm
+        page_layouts[slide_id] = layout
+        page_templates[slide_id] = template_id
+        if chart_template:
+            page_charts[slide_id] = chart_template
+        spec = slide.get("visualSpec") if isinstance(slide.get("visualSpec"), dict) else {}
+        design = slide.get("design") if isinstance(slide.get("design"), dict) else {}
+        media = design.get("media") if isinstance(design.get("media"), list) else []
+        image_policy[slide_id] = {
+            "policy": (
+                "user_media" if media
+                else "chart" if _field_value(template.get("slot")) == "chart"
+                else "diagram_or_chart" if _field_value(template.get("slot")) == "diagram"
+                else "none"
+            ),
+            "placement": "visual",
+            "fit": _field_value((media[0] if media and isinstance(media[0], dict) else {}).get("fit")) or "cover",
+        }
+        pages.append({
+            "slideId": slide_id,
+            "index": idx,
+            "layout": layout,
+            "rhythm": rhythm,
+            "templateId": template_id,
+            "routeSignature": f"{layout}:{template_id}:{rhythm}",
+            "layoutPlan": {
+                "role": _field_value(template.get("family")) or layout,
+                "density": rhythm,
+                "visualSlot": _field_value(template.get("slot")) or "none",
+            },
+            "chartTemplate": chart_template,
+            "templateFamily": _field_value(template.get("family")),
+            "visualSpecType": _field_value(spec.get("type")) or "generic",
+            "pptxSupport": _field_value(template.get("pptx")) or "none",
+        })
+    color = {
+        "background": tokens.get("background"),
+        "surface": tokens.get("surface"),
+        "primary": tokens.get("primary"),
+        "accent": tokens.get("accent"),
+        "text": tokens.get("text"),
+        "muted": tokens.get("muted"),
+        "palette": tokens.get("palette"),
+    }
+    font = {
+        "family": "Microsoft YaHei, PingFang SC, Inter, Arial",
+        "titleMinPt": 34,
+        "bodyMinPt": 14,
+    }
+    native_chart_templates = [key for key, value in _PRESENTATION_VISUAL_TEMPLATE_CATALOG.items() if _field_value(value.get("pptx")) == "native_chart"]
+    native_shape_templates = [key for key, value in _PRESENTATION_VISUAL_TEMPLATE_CATALOG.items() if _field_value(value.get("pptx")) == "native_shapes"]
+    shape_fallback_templates = [key for key, value in _PRESENTATION_VISUAL_TEMPLATE_CATALOG.items() if _field_value(value.get("pptx")) == "shape_fallback"]
+    return {
+        "version": "aippt-spec-lock-v2",
+        "templateCatalogVersion": _PRESENTATION_TEMPLATE_CATALOG_VERSION,
+        "canvas": {
+            "aspectRatio": _field_value(config.get("aspectRatio")) or "16:9",
+            "size": "15x5" if _field_value(config.get("aspectRatio")) == "3:1" else "13.333x7.5",
+        },
+        "style": {
+            "styleKey": _field_value(config.get("styleKey")) or "executive_blue",
+            "name": tokens.get("name"),
+            "colors": color,
+            "typography": {
+                "fontFamily": font["family"],
+                "titleMinPt": 34,
+                "bodyMinPt": 14,
+            },
+        },
+        "font": font,
+        "color": color,
+        "rhythm": {
+            "pageRhythm": page_rhythm,
+            "maxSameLayoutRun": 2,
+            "maxSameTemplateRun": 2,
+        },
+        "layoutPlan": {
+            "version": "aippt-layout-plan-v2",
+            "pages": pages,
+            "diversity": {
+                "maxSameLayoutRun": 2,
+                "maxSameTemplateRun": 2,
+                "maxTwoColumnShare": 0.35,
+            },
+        },
+        "pageTemplates": page_templates,
+        "pageRhythm": page_rhythm,
+        "pageLayouts": page_layouts,
+        "pageCharts": page_charts,
+        "imagePolicy": image_policy,
+        "exportPolicy": {
+            "htmlRenderer": "schema-html-renderer-v2",
+            "designerRenderer": "schema-designer-renderer-v2",
+            "pptxExporter": "python-pptx-native-shapes-v2",
+            "nativeChartTemplates": native_chart_templates,
+            "nativeShapeTemplates": native_shape_templates,
+            "shapeFallbackTemplates": shape_fallback_templates,
+            "routeSource": "specLock.pages -> slide.layout/renderHints/visualSpec.templateId",
+        },
+        "pages": pages,
+        "qaPolicy": {
+            "maxSameLayoutRun": 2,
+            "maxSameTemplateRun": 2,
+            "requireChartTemplateFor": ["metrics", "compare", "diagram", "process", "timeline"],
+            "requireSpecLockRouteAlignment": True,
+            "pptxNativeThreshold": "native_chart/native_shapes preferred; shape_fallback allowed for unsupported templates",
+            "exportLoop": ["spec_lock_route_alignment", "html_pdf_or_screenshot", "pptx_pdf", "overflow_scan", "layout_repetition_scan"],
+        },
+    }
+
+
+def _presentation_with_spec_lock(plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(plan, dict):
+        return plan
+    locked = dict(plan)
+    slides = locked.get("slides")
+    if isinstance(slides, list):
+        _presentation_apply_existing_spec_lock_routes(locked, config)
+        for idx, slide in enumerate(slides, start=1):
+            if not isinstance(slide, dict):
+                continue
+            layout = _field_value(slide.get("layout")) or _presentation_semantic_layout(slide, idx, config)
+            slide["layout"] = layout if layout in _PRESENTATION_LAYOUTS else "two_column"
+            _presentation_sync_visual_spec_for_slide(slide, slide["layout"], idx, config)
+    locked["specLock"] = _presentation_build_spec_lock(locked, config)
+    return locked
+
+
+def _presentation_append_hint(slide: dict[str, Any], hint: str) -> None:
+    if not hint:
+        return
+    hints = _presentation_list_strings(slide.get("renderHints"), limit=6)
+    key = hint.split("=", 1)[0]
+    if not any(row.split("=", 1)[0].strip() == key for row in hints):
+        hints.append(hint)
+    slide["renderHints"] = hints[:6]
+
+
+def _presentation_force_chart_template(slide: dict[str, Any], template_id: str) -> None:
+    clean = _presentation_canonical_template_id(template_id)
+    if not clean or clean not in _PRESENTATION_VISUAL_TEMPLATE_CATALOG:
+        return
+    slide["renderHints"] = [
+        row for row in _presentation_list_strings(slide.get("renderHints"), limit=6)
+        if row.split("=", 1)[0].strip() not in {"templateId", "chartTemplate", "visualTemplate"}
+    ]
+    _presentation_append_hint(slide, f"chartTemplate={clean}")
+    spec = _presentation_visual_spec(slide.get("visualSpec"))
+    spec["templateId"] = clean
+    spec["chartTemplate"] = clean
+    template = _presentation_template_def(clean)
+    if template:
+        spec["type"] = _field_value(template.get("visualType")) or _field_value(spec.get("type")) or "generic"
+    if _field_value(template.get("chartKind")):
+        chart = dict(spec.get("chart")) if isinstance(spec.get("chart"), dict) else {}
+        chart["kind"] = _field_value(template.get("chartKind"))
+        spec["chart"] = chart
+    slide["visualSpec"] = spec
+
+
+def _presentation_rows_from_bullets(slide: dict[str, Any], *, label_prefix: str = "步骤", limit: int = 6) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for idx, item in enumerate(_presentation_list_strings(slide.get("bullets"), limit=limit), start=1):
+        label, _, detail = item.partition("：")
+        if not detail:
+            label, _, detail = item.partition(":")
+        rows.append({
+            "label": (label or f"{label_prefix} {idx}")[:40],
+            "detail": (detail or item)[:180],
+        })
+    return rows
+
+
+def _presentation_columns_from_bullets(slide: dict[str, Any], *, limit: int = 4) -> list[dict[str, Any]]:
+    columns: list[dict[str, Any]] = []
+    for idx, item in enumerate(_presentation_list_strings(slide.get("bullets"), limit=limit), start=1):
+        label, _, detail = item.partition("：")
+        if not detail:
+            label, _, detail = item.partition(":")
+        detail = detail or item
+        pieces = [part.strip() for part in re.split(r"[、,，/；;]+", detail) if part.strip()]
+        columns.append({
+            "label": (label or f"对象 {idx}")[:40],
+            "detail": detail[:180],
+            "items": pieces[:5] or [detail[:80]],
+        })
+    return columns
+
+
+def _presentation_metrics_from_bullets(slide: dict[str, Any], *, limit: int = 5) -> list[dict[str, Any]]:
+    metrics: list[dict[str, Any]] = []
+    for idx, item in enumerate(_presentation_list_strings(slide.get("bullets"), limit=limit), start=1):
+        item = re.sub(r"^\s*\d+(?:\.\d+)*\s+", "", item).strip()
+        label, _, detail = item.partition("：")
+        if not detail:
+            label, _, detail = item.partition(":")
+        detail = detail or item
+        match = re.search(r"([-+]?\d+(?:\.\d+)?)\s*(%|％|亿|万|万元|元|人|家|个|项|次|倍|小时|天|周|月)?", detail)
+        value: str | float = "待补"
+        unit = ""
+        if match:
+            value = float(match.group(1))
+            unit = _field_value(match.group(2))
+        clean_label = re.sub(r"[-+]?\d+(?:\.\d+)?\s*(?:%|％|亿|万|万元|元|人|家|个|项|次|倍|小时|天|周|月)?", "", label or detail).strip(" ：:-")
+        metrics.append({
+            "label": (clean_label or f"指标 {idx}")[:40],
+            "value": value,
+            "unit": unit,
+            "detail": detail[:180],
+        })
+    return metrics
+
+
+def _presentation_numeric_metric_value(metric: dict[str, Any]) -> float | None:
+    value = metric.get("value") if isinstance(metric, dict) else None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = _field_value(value)
+    if not text or re.search(r"待补|待确认|n/?a|unknown", text, flags=re.I):
+        return None
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except Exception:
+        return None
+
+
+def _presentation_estimated_chart_values(count: int, *, index: int, chart_kind: str) -> list[float]:
+    count = max(2, min(8, count))
+    base = 42 + (index % 5) * 4
+    if chart_kind == "line":
+        return [float(min(96, base + step * (6 + (index % 3)))) for step in range(count)]
+    return [float(max(18, min(94, base + ((step % 3) - 1) * 11 + step * 4))) for step in range(count)]
+
+
+def _presentation_sync_chart_series_from_metrics(
+    spec: dict[str, Any],
+    metrics: list[dict[str, Any]],
+    *,
+    index: int,
+    config: dict[str, Any],
+) -> None:
+    chart = dict(spec.get("chart")) if isinstance(spec.get("chart"), dict) else {}
+    chart_kind = _field_value(chart.get("kind") or spec.get("type"))
+    if chart_kind not in {"bar", "line"} or chart.get("series"):
+        if chart:
+            spec["chart"] = chart
+        return
+    labels = [
+        (_field_value(metric.get("label")) or f"指标 {idx}")[:18]
+        for idx, metric in enumerate(metrics[:6], start=1)
+        if isinstance(metric, dict)
+    ]
+    if len(labels) < 2:
+        labels = ["现状", "试点", "规模化", "成熟运营"] if chart_kind == "line" else ["效率", "成本", "体验", "风险"]
+    values = [
+        value for value in (_presentation_numeric_metric_value(metric) for metric in metrics[:len(labels)])
+        if value is not None
+    ]
+    estimated = False
+    if len(values) < len(labels):
+        values = _presentation_estimated_chart_values(len(labels), index=index, chart_kind=chart_kind)
+        estimated = True
+    chart["labels"] = labels
+    chart["series"] = [{
+        "name": "示意趋势" if chart_kind == "line" else "当前值",
+        "values": values[:len(labels)],
+        "unit": "%",
+    }]
+    if estimated or config.get("chartLevel") == "rich":
+        chart.setdefault("source", "AIPPT 示意数据，等待用户或知识库补充真实来源")
+        chart.setdefault("methodology", "用于版式预览和口径确认；正式交付前应替换为业务系统或公开报告数据。")
+        chart.setdefault("estimated", True)
+    spec["chart"] = chart
+
+
+def _presentation_sync_visual_spec_for_slide(slide: dict[str, Any], layout: str, index: int, config: dict[str, Any]) -> None:
+    spec = _presentation_visual_spec(slide.get("visualSpec"))
+    template_id = _presentation_template_id_for_slide(slide, layout)
+    template = _presentation_template_def(template_id)
+    if template:
+        spec["templateId"] = template_id
+        spec["chartTemplate"] = template_id
+        spec["type"] = _field_value(template.get("visualType")) or _field_value(spec.get("type")) or "generic"
+        chart_kind = _field_value(template.get("chartKind"))
+        if chart_kind:
+            chart = dict(spec.get("chart")) if isinstance(spec.get("chart"), dict) else {}
+            chart["kind"] = chart_kind
+            spec["chart"] = chart
+    if (layout in {"process", "timeline", "checklist"} or template_id in {"process_flow", "pipeline_with_stages", "numbered_steps", "agenda_list", "timeline", "roadmap_vertical", "gantt_chart", "journey_map"}) and not isinstance(spec.get("rows"), list):
+        spec["rows"] = _presentation_rows_from_bullets(slide, label_prefix="阶段" if layout == "timeline" else "步骤", limit=8)
+    if template_id in {"comparison_table", "comparison_columns", "feature_matrix_table", "quadrant_text_bullets", "matrix_2x2", "business_model_canvas", "case_study_cards"} and not isinstance(spec.get("columns"), list):
+        spec["columns"] = _presentation_columns_from_bullets(slide, limit=4)
+    if template_id in {"layered_architecture", "hub_spoke", "system_map"} and not isinstance(spec.get("layers"), list):
+        spec["layers"] = _presentation_rows_from_bullets(slide, label_prefix="层级", limit=6)
+    chart = spec.get("chart") if isinstance(spec.get("chart"), dict) else {}
+    has_chart_series = bool(chart.get("series"))
+    if _field_value(template.get("slot")) == "chart" and not isinstance(spec.get("metrics"), list) and not has_chart_series:
+        metrics = _presentation_metrics_from_bullets(slide, limit=5)
+        if metrics:
+            spec["metrics"] = metrics
+    metrics = spec.get("metrics") if isinstance(spec.get("metrics"), list) else []
+    if metrics:
+        _presentation_sync_chart_series_from_metrics(spec, metrics, index=index, config=config)
+    if spec:
+        slide["visualSpec"] = spec
+
+
+def _presentation_apply_layout_route(slide: dict[str, Any], layout: str, index: int, config: dict[str, Any]) -> None:
+    route_keys = {"rhythm", "templateId", "chartTemplate", "visualTemplate"}
+    slide["renderHints"] = [
+        row for row in _presentation_list_strings(slide.get("renderHints"), limit=6)
+        if row.split("=", 1)[0].strip() not in route_keys
+    ]
+    _presentation_append_hint(slide, _presentation_layout_hint(layout))
+    _presentation_append_hint(slide, f"rhythm={_presentation_slide_rhythm(slide, layout, index, config)}")
+    chart_template = _presentation_chart_template(slide, layout)
+    if chart_template:
+        _presentation_append_hint(slide, f"chartTemplate={chart_template}")
+    _presentation_sync_visual_spec_for_slide(slide, layout, index, config)
+
+
+def _presentation_alternate_layout(slide: dict[str, Any], index: int, config: dict[str, Any], avoid: set[str]) -> str:
+    signal = _presentation_slide_signal(slide)
+    semantic_order = [
+        ("metrics", r"指标|数据|收益|效果|roi|kpi|数字|增长|转化|留存|成本|效率|规模|趋势|收入|利润"),
+        ("compare", r"对比|比较|差异|竞品|矩阵|左右|vs\b|versus|机会|问题|困境|方案"),
+        ("diagram", r"架构|地图|分层|能力|模型|图谱|因果|旅程|系统|组件|产品"),
+        ("timeline", r"时间线|里程碑|阶段|路线图|roadmap|季度|月份|周期"),
+        ("process", r"路径|流程|步骤|计划|操作|闭环|链路|落地|实施|推进"),
+        ("checklist", r"清单|检查|任务|待办|行动项|下一步|决策"),
+    ]
+    for layout, pattern in semantic_order:
+        if layout not in avoid and re.search(pattern, signal, flags=re.I):
+            return layout
+    style_bias = _presentation_style_contract(config.get("styleKey")).get("layout_bias") or []
+    cycle = [
+        layout for layout in [*style_bias, "compare", "metrics", "diagram", "process", "timeline", "checklist", "two_column"]
+        if layout in _PRESENTATION_LAYOUTS and layout not in {"cover", "section", "quote"}
+    ]
+    for offset in range(len(cycle)):
+        layout = cycle[(index + offset) % len(cycle)]
+        if layout not in avoid:
+            return layout
+    return "two_column"
+
+
+def _presentation_alternate_template(layout: str, current: str, index: int) -> str:
+    candidates = [
+        key for key, value in _PRESENTATION_VISUAL_TEMPLATE_CATALOG.items()
+        if _field_value(value.get("layout")) == layout and key not in {"cover", "section", "quote", current}
+    ]
+    if not candidates:
+        return current
+    return candidates[index % len(candidates)]
+
+
+def _presentation_enforce_layout_diversity(plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    slides = plan.get("slides")
+    if not isinstance(slides, list):
+        return plan
+    normalized: list[dict[str, Any]] = []
+    recent: list[str] = []
+    recent_templates: list[str] = []
+    total_slides = len([slide for slide in slides if isinstance(slide, dict)])
+    for idx, raw_slide in enumerate(slides, start=1):
+        if not isinstance(raw_slide, dict):
+            continue
+        slide = raw_slide
+        layout = _presentation_semantic_layout(slide, idx, config)
+        hard_template = _presentation_hard_locked_template_id(slide)
+        hard_template_layout = _field_value(_presentation_template_def(hard_template).get("layout"))
+        if hard_template_layout in _PRESENTATION_LAYOUTS:
+            layout = hard_template_layout
+        elif idx == 1:
+            layout = "cover"
+        elif idx == total_slides and layout not in {"cover", "section", "quote"}:
+            closing_signal = _presentation_slide_signal(slide)
+            if re.search(r"下一步|行动|计划|合作|联系|决策|待确认|call to action", closing_signal, flags=re.I):
+                layout = "checklist"
+            elif re.search(r"结束|谢谢|愿景|口号|总结|收束|closing|quote", closing_signal, flags=re.I):
+                layout = "quote"
+        protected = idx == 1 or layout in {"cover", "section", "quote"}
+        if len(recent) >= 2 and recent[-1] == recent[-2] == layout and not protected:
+            layout = _presentation_alternate_layout(slide, idx, config, {layout, recent[-1]})
+        slide["layout"] = layout if layout in _PRESENTATION_LAYOUTS else "two_column"
+        _presentation_apply_layout_route(slide, slide["layout"], idx, config)
+        preferred_template = ""
+        if hard_template and _field_value(_presentation_template_def(hard_template).get("layout")) == slide["layout"]:
+            preferred_template = hard_template
+        elif slide["layout"] not in {"cover", "section", "quote"}:
+            preferred_template = _presentation_pick_diverse_template(slide, slide["layout"], idx, config, recent_templates)
+        if preferred_template:
+            _presentation_force_chart_template(slide, preferred_template)
+        if not _field_value(slide.get("designIntent")) and slide["layout"] not in {"cover", "section"}:
+            slide["designIntent"] = f"版式编排器按叙事功能分配为 {slide['layout']}，避免整套页面节奏单一。"
+        recent.append(slide["layout"])
+        recent_templates.append(_presentation_template_id_for_slide(slide, slide["layout"]))
+        normalized.append(slide)
+
+    content_indexes = [
+        idx for idx, slide in enumerate(normalized)
+        if slide.get("layout") not in {"cover", "section", "quote"}
+    ]
+    if content_indexes:
+        max_two_column = max(1, math.ceil(len(content_indexes) * 0.35))
+        two_column_indexes = [idx for idx in content_indexes if normalized[idx].get("layout") == "two_column"]
+        for idx in two_column_indexes[max_two_column:]:
+            if _presentation_hard_locked_template_id(normalized[idx]):
+                continue
+            previous = _field_value(normalized[idx - 1].get("layout")) if idx > 0 else ""
+            next_layout = _presentation_alternate_layout(normalized[idx], idx + 1, config, {"two_column", previous})
+            normalized[idx]["layout"] = next_layout
+            _presentation_apply_layout_route(normalized[idx], next_layout, idx + 1, config)
+
+        max_dominant_layout = max(2, math.ceil(len(content_indexes) * 0.45))
+        layout_counts: dict[str, int] = {}
+        for idx in content_indexes:
+            layout = _field_value(normalized[idx].get("layout")) or "two_column"
+            layout_counts[layout] = layout_counts.get(layout, 0) + 1
+            if layout_counts[layout] <= max_dominant_layout:
+                continue
+            if _presentation_hard_locked_template_id(normalized[idx]):
+                continue
+            previous = _field_value(normalized[idx - 1].get("layout")) if idx > 0 else ""
+            next_layout = _presentation_alternate_layout(normalized[idx], idx + 1, config, {layout, previous})
+            normalized[idx]["layout"] = next_layout
+            layout_counts[next_layout] = layout_counts.get(next_layout, 0) + 1
+            _presentation_apply_layout_route(normalized[idx], next_layout, idx + 1, config)
+
+        for idx in content_indexes:
+            if idx < 2:
+                continue
+            slide = normalized[idx]
+            layout = _field_value(slide.get("layout")) or "two_column"
+            if layout in {"cover", "section", "quote"}:
+                continue
+            template = _presentation_template_id_for_slide(slide, layout)
+            prev_template = _presentation_template_id_for_slide(normalized[idx - 1], _field_value(normalized[idx - 1].get("layout")))
+            prev_two_template = _presentation_template_id_for_slide(normalized[idx - 2], _field_value(normalized[idx - 2].get("layout")))
+            if not template or template != prev_template or template != prev_two_template:
+                continue
+            previous = _field_value(normalized[idx - 1].get("layout")) if idx > 0 else ""
+            next_layout = _presentation_alternate_layout(slide, idx + 1, config, {layout, previous})
+            if next_layout != layout:
+                slide["layout"] = next_layout
+                _presentation_apply_layout_route(slide, next_layout, idx + 1, config)
+            next_template = _presentation_template_id_for_slide(slide, _field_value(slide.get("layout")))
+            if next_template == template:
+                alternate = _presentation_alternate_template(_field_value(slide.get("layout")), next_template, idx + 1)
+                if alternate != next_template:
+                    _presentation_force_chart_template(slide, alternate)
+
+    plan["slides"] = normalized
+    plan.pop("specLock", None)
+    return _presentation_with_spec_lock(plan, config)
+
+
+def _presentation_needs_delivery_layout_repair(plan: dict[str, Any]) -> bool:
+    slides = [slide for slide in plan.get("slides", []) if isinstance(slide, dict)]
+    if len(slides) < 4:
+        return False
+    layouts = [_field_value(slide.get("layout")) or "two_column" for slide in slides]
+    for idx in range(len(layouts) - 2):
+        if layouts[idx] == layouts[idx + 1] == layouts[idx + 2] and layouts[idx] not in {"cover", "section", "quote"}:
+            return True
+    templates = [_presentation_template_id_for_slide(slide, _field_value(slide.get("layout"))) for slide in slides]
+    for idx in range(len(templates) - 2):
+        if templates[idx] and templates[idx] == templates[idx + 1] == templates[idx + 2] and layouts[idx] not in {"cover", "section", "quote"}:
+            return True
+    content_layouts = [layout for layout in layouts if layout not in {"cover", "section", "quote"}]
+    if not content_layouts:
+        return False
+    if content_layouts.count("two_column") > max(1, math.ceil(len(content_layouts) * 0.45)):
+        return True
+    counts: dict[str, int] = {}
+    for layout in content_layouts:
+        counts[layout] = counts.get(layout, 0) + 1
+    return max(counts.values(), default=0) > max(2, math.ceil(len(content_layouts) * 0.55))
+
+
+def _presentation_prepare_delivery_plan(plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(plan, dict):
+        return plan
+    try:
+        safe_plan = json.loads(json.dumps(plan, ensure_ascii=False))
+    except Exception:
+        safe_plan = dict(plan)
+    return _presentation_enforce_layout_diversity(safe_plan, config)
+
+
+def _presentation_heuristic_plan(config: dict[str, Any]) -> dict[str, Any]:
+    seeds = _presentation_slide_seeds(config)
+    target = max(8, _presentation_int(config.get("pageCount"), 8, minimum=8, maximum=40))
+    expanded = [seeds[i] if i < len(seeds) else ("扩展", f"扩展专题 {i - len(seeds) + 1}", f"围绕{config['topic']}补充一个必要专题。", "专题分析图") for i in range(target)]
+    sections: list[dict[str, Any]] = []
+    section_ids: dict[str, str] = {}
+    for idx, seed in enumerate(expanded):
+        section_title = seed[0]
+        if section_title not in section_ids:
+            sid = f"section-{len(section_ids) + 1}"
+            section_ids[section_title] = sid
+            sections.append({"id": sid, "title": section_title, "purpose": f"承接第 {idx + 1} 页后的叙事推进。"})
+    knowledge = _presentation_knowledge(config)
+    slides: list[dict[str, Any]] = []
+    for idx, seed in enumerate(expanded):
+        title = seed[1]
+        layout = _presentation_infer_layout(title, seed[3], index=idx + 1, use_case=_field_value(config.get("useCase")) or "report")
+        slides.append({
+            "id": f"slide-{idx + 1}",
+            "sectionId": section_ids.get(seed[0], "section-1"),
+            "index": idx + 1,
+            "title": title,
+            "headline": seed[2],
+            "bullets": _presentation_bullets(config, title, idx + 1),
+            "visual": seed[3],
+            "layout": layout,
+            "knowledgeIds": ["k-topic", "k-audience" if idx % 3 == 0 else "k-data"],
+            "status": "confirmed" if idx < 2 else "draft",
+            "speakerNotes": f"讲述时先点明本页与「{config['topic']}」的关系，再展开 {seed[2]}。",
+        })
+    return {
+        "title": f"{config['topic']}｜{_PRESENTATION_USE_CASES.get(config['useCase'], '汇报')}演示",
+        "sections": sections,
+        "slides": slides,
+        "knowledge": knowledge,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _presentation_renderer_contract() -> dict[str, Any]:
+    return {
+        "a2ui_goal": "Agent 只生成可编辑 Deck Schema/画布节点；用户确认大纲和资料依赖后，再由 React/AntD + HTML renderer 与 PPTX exporter 分别生成可预览、可下载、可继续编辑的演示稿。",
+        "generation_pipeline": [
+            "phase_1_outline_canvas：生成章节、页面、知识依赖、layout、visualSpec，停在人工确认态。",
+            "phase_2_render_deck：基于确认后的 Deck Schema 生成 HTML-PPT / 可编辑 PPTX；不要在 phase_1 里输出 HTML 或 PPT 文件。",
+            "Deck Schema 是唯一事实源；自然语言 visual 描述必须尽量结构化到 visualSpec，避免导出层只能渲染成固定卡片。",
+        ],
+        "slide_optional_fields": {
+            "designIntent": "说明本页为什么采用该版式，以及希望观众形成的判断。",
+            "renderHints": "给 HTML renderer 的 1-4 条可执行短提示，优先使用 key=value，例如 leftLabel=现状、rightLabel=方案、chart=scorecard、rhythm=dense、chartTemplate=kpi_cards。",
+            "visualSpec": "结构化视觉协议；当 visual 里出现三列矩阵、分层架构、折线+指标卡等复合设计时必须输出，让 renderer 能真实落图。",
+            "evidenceRole": "说明本页需要哪类证据支撑，例如权威来源、客户案例、产品截图、统计数据、流程示意。",
+        },
+        "visual_spec_schema": {
+            "type": "matrix|architecture|combo_metrics|scorecard|bar|line|generic",
+            "matrix": {"columns": [{"label": "对比对象", "items": ["能力项"], "score": "high|medium|low"}]},
+            "architecture": {"layers": [{"label": "层级名称", "detail": "技术组件或职责"}], "callouts": ["反馈闭环"]},
+            "combo_metrics": {"chart": {"kind": "line", "labels": ["M1"], "series": [{"name": "MRR", "values": [1], "unit": "%"}], "source": "数据来源", "methodology": "统计口径", "estimated": False}, "metrics": [{"label": "留存率", "value": "94%", "detail": "口径说明"}]},
+        },
+        "visual_template_catalog": {
+            "version": _PRESENTATION_TEMPLATE_CATALOG_VERSION,
+            "size": len(_PRESENTATION_VISUAL_TEMPLATE_CATALOG),
+            "highFrequencyTemplateIds": sorted(_PRESENTATION_HIGH_FREQUENCY_TEMPLATES),
+            "items": _presentation_template_catalog_for_prompt(),
+        },
+        "spec_lock_v2": {
+            "required": ["style", "font", "color", "rhythm", "layoutPlan", "pageTemplates", "pageCharts", "imagePolicy", "exportPolicy"],
+            "rule": "生成阶段只产出 Deck Schema；保存/导出前由 normalize 生成 aippt-spec-lock-v2，任何模板变化都要能被 HTML、Designer、PPTX exporter 共同解释。",
+        },
+        "render_hint_vocabulary": [
+            "leftLabel=... / rightLabel=...：用于 compare 和 two_column 的两侧命名。",
+            "chart=scorecard|bar|line|matrix|funnel|roadmap：用于 metrics、compare、timeline、diagram 的图形倾向；scorecard=数字卡片，bar=柱状对比，line=趋势折线。",
+            "数据页写法：用户已给出或资料中可确认的数字可以写入 bullets；缺少可信数字时 bullets 写指标口径/待补资料，knowledge 标 missing，不要编造数值。",
+            "emphasis=...：本页要被放大的结论或转折。",
+            "flow=step|timeline|loop：用于 process/timeline/diagram 的结构关系。",
+            "callout=...：需要在视觉区强调的一句话。",
+            "rhythm=anchor|dense|breathing：anchor 用于封面/章节/关键判断，dense 用于数据/对比/矩阵，breathing 用于单概念/低密度停顿页。",
+            "chartTemplate=kpi_cards|line_chart|bar_chart|grouped_bar_chart|horizontal_bar_chart|comparison_table|comparison_columns|feature_matrix_table|layered_architecture|process_flow|pipeline_with_stages|timeline|roadmap_vertical|numbered_steps：用于把 visualSpec 路由到具体 HTML/PPTX 结构。",
+        ],
+        "layout_route_contract": {
+            "principle": "先判断页面叙事功能，再选择 layout、rhythm、chartTemplate；不要把同一 layout 渲染成同一种页面。",
+            "story_roles": "封面必须是 cover；章节转折可用 section；最后一页若是行动/合作/联系应使用 checklist，若是愿景/结束/金句应使用 quote。指标、对比、架构、流程、路线图页必须有不同的 chartTemplate 节奏。",
+            "rhythm": {
+                "anchor": "结构锚点或强结论页；少卡片、强标题、留白更多。",
+                "dense": "信息密度高的页面；允许图表、矩阵、指标卡、多列结构。",
+                "breathing": "低密度解释页；用留白、单核心视觉、少量要点承接节奏。",
+            },
+            "chart_template_examples": {
+                "metrics": "kpi_cards / line_chart / bar_chart / grouped_bar_chart / horizontal_bar_chart",
+                "compare": "comparison_table / comparison_columns / feature_matrix_table / quadrant_text_bullets",
+                "diagram": "layered_architecture / hub_spoke",
+                "process": "process_flow / pipeline_with_stages / numbered_steps",
+                "timeline": "timeline / roadmap_vertical / gantt_chart",
+            },
+        },
+        "layouts": {
+            "cover": "封面/主张页；bullets 应表达主题、对象和价值承诺。",
+            "section": "章节转场页；bullets 应收束为本章节要回答的问题。",
+            "two_column": "默认内容页；适合观点 + 依据、问题 + 建议、现状 + 动作。",
+            "compare": "双边对比页；renderHints 必须给出左右两侧标签，bullets 要能被自然拆为两组。",
+            "metrics": "指标/成果页；必须在 renderHints 指定 chart=scorecard/bar/line；没有可信数字时只能写指标口径和待补数据，不要编造具体数值。",
+            "process": "流程/操作步骤页；bullets 应按动作顺序排列。",
+            "timeline": "阶段/里程碑页；bullets 应按时间或阶段推进排列。",
+            "diagram": "架构/能力图/关系图页；visual 要描述图形结构，而不是只写泛泛的“示意图”；分层架构必须给 visualSpec.type=architecture。",
+            "checklist": "行动清单/检查标准页；bullets 应是可执行或可核验条目。",
+            "quote": "收束/强调页；headline 应是一句可传播的结论。",
+        },
+        "style_keys": {
+            "executive_blue": "高管汇报：结论前置、证据可信、行动明确。",
+            "tech_launch": "路演发布：机会感、产品差异、视觉冲击和行动号召。",
+            "teaching_clear": "培训课程：循序渐进、概念拆解、示例和练习并重。",
+        },
+        "knowledge_policy": [
+            "ready 表示用户已给出或可由常识稳定确认的资料。",
+            "assumption 表示 Agent 做出的合理假设，需在画布上允许用户确认。",
+            "missing 表示会影响可信度的资料缺口；detail 必须写明要找什么、为什么需要、优先来源类型。",
+            "联网补充按钮会携带 config + slide + knowledge 上下文，所以 knowledge.detail 要像研究任务说明，而不是一句空泛备注。",
+        ],
+        "data_provenance_policy": [
+            "visualSpec.chart 只要出现数值，就必须尽量填写 source、unit、methodology、estimated。",
+            "source 写资料来源或用户给定来源；methodology 写统计口径、样本范围或计算方式；estimated=true 表示估算/假设数据。",
+            "没有可信数字时不要编造 values，用 metrics.value=待补，并把需要补充的数据写进 missing knowledge。",
+        ],
+        "pptx_export_policy": [
+            "每页标题和 bullets 要短句化，避免把长段落塞进一个文本框；复杂信息用 visualSpec.columns/layers/metrics/chart 表达。",
+            "需要可编辑 PPTX 时，优先给原生可转译的视觉：矩阵、架构层、流程、时间线、指标卡、柱状图、折线图。",
+            "不要只在 visual 字段写“二列对比卡、三列矩阵”等文字，必须同步给 layout/renderHints/visualSpec。",
+            "最终 Deck Schema 会生成 specLock；layout、rhythm、chartTemplate、style tokens 和 imagePolicy 都要可锁定、可复现、可导出。",
+        ],
+        "layout_diversity": "整套 deck 要按叙事功能混合多种 layout、rhythm 和 chartTemplate。two_column 只是默认页，不应该成为主要版式；同一章节内尽量出现对比、指标、流程、结构图或行动清单。禁止连续 3 页同 layout，也禁止连续 3 页同 chartTemplate/templateId。涉及收益、成本、效率、增长、转化、覆盖率、趋势变化时，优先使用 metrics + chart hint + chartTemplate。",
+    }
+
+
+def _presentation_style_contract(style_key: Any) -> dict[str, Any]:
+    style = _field_value(style_key) or "executive_blue"
+    contracts = {
+        "executive_blue": {
+            "tone": "管理层汇报：结论前置、证据可信、行动收束。",
+            "layout_bias": ["metrics", "compare", "timeline", "checklist"],
+            "html_token_intent": "克制蓝绿配色，优先用指标卡、决策对比、里程碑和行动清单表达。",
+            "avoid": "不要写成培训课件或发布会口号，不要滥用大段愿景词。",
+        },
+        "tech_launch": {
+            "tone": "路演发布：机会感、产品差异、节奏强、结尾有行动号召。",
+            "layout_bias": ["cover", "compare", "diagram", "metrics", "quote"],
+            "html_token_intent": "高对比深色科技感，优先用主张大字、能力结构图、差异矩阵和结尾金句。",
+            "avoid": "不要写成行政汇报流水账，不要每页都是左右两列。",
+        },
+        "teaching_clear": {
+            "tone": "培训课程：概念拆解、路径清晰、示例练习、可复用方法。",
+            "layout_bias": ["section", "process", "diagram", "checklist", "timeline"],
+            "html_token_intent": "清晰绿色教学感，优先用学习路径、步骤、结构图、练习清单表达。",
+            "avoid": "不要写成市场宣传稿，不要只有结论没有操作方法。",
+        },
+    }
+    return contracts.get(style, contracts["executive_blue"])
+
+
+def _presentation_agent_system_message() -> str:
+    return (
+        "你是 Atlas 的 AIPPT AI2UIAgent，负责把用户的一句话 PPT 需求生成可编辑画布数据，而不是直接生成最终文件。"
+        "你必须只返回一个合法 JSON 对象，禁止 Markdown、代码围栏、解释、前后缀文本、注释、JSON 字符串外壳。"
+        "固定 JSON Schema：{\"title\":\"string\",\"sections\":[{\"title\":\"string\",\"purpose\":\"string\"}],"
+        "\"slides\":[{\"section\":\"string\",\"title\":\"string\",\"headline\":\"string\",\"bullets\":[\"string\"],\"visual\":\"string\",\"layout\":\"cover|section|two_column|compare|metrics|process|timeline|diagram|checklist|quote\",\"speakerNotes\":\"string\",\"designIntent\":\"string\",\"renderHints\":[\"string\"],\"visualSpec\":{\"type\":\"matrix|architecture|combo_metrics|scorecard|bar|line|generic\"},\"evidenceRole\":\"string\"}],"
+        "\"knowledge\":[{\"title\":\"string\",\"source\":\"string\",\"detail\":\"string\",\"status\":\"ready|missing|assumption\"}]}。"
+        "不要输出空泛模板，要结合用户主题生成完整初稿内容。缺少事实数据时以 missing 知识依赖表达，不要编造具体数字。"
+        "输出要紧凑：title 不超过 36 字，每页 bullets 2-3 条且每条不超过 34 字，speakerNotes 不超过 80 字，renderHints 1-4 条。"
+        "每页 layout 必须与 visual、bullets、renderHints 匹配；renderHints 要用可被 React/HTML 渲染器执行的短提示，优先 key=value。"
+        "每页 renderHints 应尽量包含 rhythm=anchor|dense|breathing；图表/矩阵/架构/流程页应包含 chartTemplate=...，且和 visualSpec 一致。"
+        "涉及数字、收益、效率、成本、增长、转化、覆盖率、趋势时，优先用 metrics，并在 renderHints 写 chart=scorecard/bar/line；无可信数字不要编造。"
+        "visualSpec.chart 只要出现 values，就必须尽量填写 source、unit、methodology、estimated；估算数据 estimated=true。"
+        "当 visual 描述三列矩阵、四层架构、左折线右指标卡等复合视觉时，必须给 visualSpec，让 HTML renderer 不只显示文字。"
+        "整套 deck 要体现风格差异和页面节奏，不要大量输出 two_column，也不要连续 3 页使用同一 layout 或同一 chartTemplate/templateId。"
+        "不要把规则机械化套用，优先根据用户意图、受众和叙事功能判断版式。"
+    )
+
+
+def _presentation_agent_prompt(*, query: str, config: dict[str, Any]) -> str:
+    min_slides = max(8, _presentation_int(config.get("pageCount"), 8, minimum=8, maximum=40))
+    payload = {
+        "task": "generate_deck_plan_json",
+        "query": query,
+        "config": {
+            "topic": config.get("topic"),
+            "useCase": config.get("useCase"),
+            "audience": config.get("audience"),
+            "slidesMin": min_slides,
+            "style": config.get("styleKey"),
+            "density": config.get("density"),
+            "chartLevel": config.get("chartLevel"),
+        },
+        "renderer_contract": _presentation_renderer_contract(),
+        "style_contract": _presentation_style_contract(config.get("styleKey")),
+        "rules": [
+            f"slides 至少 {min_slides} 页，最多 16 页。",
+            "sections 要覆盖完整叙事，slide.section 必须对应某个 section.title。",
+            "每页 bullets 2-3 条，必须具体、有初稿内容，不要占位；单条尽量短，便于画布和 HTML 渲染。",
+            "每页必须给 layout、designIntent、renderHints、evidenceRole；renderHints 最多 4 条，并尽量使用 leftLabel/rightLabel/chart/emphasis/flow/rhythm/chartTemplate。",
+            "复合视觉必须输出 visualSpec：三列/多列对比用 type=matrix+columns；分层/架构/链路用 type=architecture+layers；左图右指标用 type=combo_metrics+chart+metrics。",
+            "renderHints 中 rhythm 负责页面节奏，chartTemplate 负责具体视觉模板：metrics 选 kpi_cards/line_chart/bar_chart/grouped_bar_chart/horizontal_bar_chart；compare 选 comparison_table/comparison_columns/feature_matrix_table；diagram 选 layered_architecture；process/timeline 选 process_flow/timeline/roadmap_vertical/numbered_steps。",
+            "首尾页要承担明确叙事角色：第一页必须 cover；最后一页若是行动/合作/联系则 checklist，若是愿景/总结/金句则 quote；章节过渡页用 section，不要把它们做成普通 two_column。",
+            "同一 layout 内也要换模板：metrics 在 kpi_cards、metric_dashboard、line_chart、bar_chart、horizontal_bar_chart、funnel_chart、unit_economics 中择一；compare 在 comparison_table、comparison_columns、feature_matrix_table、quadrant_text_bullets 中择一；diagram 在 layered_architecture、hub_spoke、system_map、business_model_canvas 中择一。",
+            "版式要服务叙事：封面给主张，compare 给差异，metrics 给指标口径，diagram 给结构关系，process/timeline 给推进路径，checklist 给动作收束。",
+            "涉及收益、成本、效率、增长、转化、覆盖率、趋势变化的页面，优先 layout=metrics，并给 chart=scorecard/bar/line；有真实数字才写数字，缺数据则写口径并补 missing knowledge。",
+            "visualSpec.chart 有 values 时必须尽量给 source、unit、methodology、estimated；估算或演示样例必须 estimated=true。",
+            "不要连续 3 页使用同一 layout，也不要连续 3 页使用同一 chartTemplate/templateId；two_column 可以使用，但不应成为主要版式。",
+            "knowledge 3-5 条，status 只能是 ready/missing/assumption；missing 的 detail 必须能直接作为联网检索任务。",
+            "控制输出长度：不要写长段落，不要生成完整演讲稿，不要重复解释 schema。",
+            "不要生成 PPT 文件、HTML 或说明，只输出 JSON。",
+        ],
+    }
+    return (
+        "请生成 AIPPT DeckPlan。最终回复只能是 JSON 对象。\n"
+        f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+    )
+
+
+def _presentation_stream_system_message() -> str:
+    return (
+        "你是 Atlas 的 AIPPT AI2UIAgent，负责把 PPT 需求拆成可编辑画布，而不是直接生成最终文件。"
+        "你必须输出 NDJSON：每一行都是一个独立合法 JSON 对象；禁止 Markdown、代码围栏、解释文字。"
+        "第一行必须立刻输出 type=meta，不要先寒暄或解释；随后输出 section 和 slide；每完成一页立即输出一行 slide。"
+        "允许 type=meta/section/slide/knowledge/done。每行末尾换行，不要把多行包进数组，不要等待全部内容完成后再一次性输出。"
+        "slide 字段：section,title,headline,bullets,visual,layout,speakerNotes,designIntent,renderHints,visualSpec,evidenceRole。"
+        "layout 只能是 cover/section/two_column/compare/metrics/process/timeline/diagram/checklist/quote；要与 visual、renderHints 匹配，不要连续 3 页使用同一 layout 或同一 chartTemplate/templateId。"
+        "knowledge 字段：title,source,detail,status，其中 status 只能是 ready/missing/assumption；missing.detail 必须说明检索目标、缺口原因和优先来源。"
+        "输出要紧凑：每页 bullets 2-3 条且每条不超过 34 字，speakerNotes 不超过 80 字，renderHints 1-4 条。"
+        "renderHints 优先使用 key=value 短提示，例如 leftLabel=现状、rightLabel=方案、chart=scorecard、chart=bar、chart=line、rhythm=dense、chartTemplate=kpi_cards、flow=timeline、callout=关键判断。"
+        "每页尽量输出 rhythm=anchor|dense|breathing；图表/矩阵/架构/流程页输出 chartTemplate，并确保同一 layout 下也有不同模板变化。"
+        "第一页必须是 cover；最后一页如果是行动/合作/联系用 checklist，如果是愿景/总结/金句用 quote；章节过渡用 section，不要退化成普通 two_column。"
+        "复合视觉必须输出 visualSpec：三列/多列对比用 type=matrix+columns；分层架构用 type=architecture+layers；左图右指标用 type=combo_metrics+chart+metrics。"
+        "涉及收益、效率、成本、增长、转化、覆盖率、趋势时，优先 layout=metrics 并给 chart hint；没有可信数字时不要编造，改写指标口径并标记 missing knowledge。"
+        "visualSpec.chart 有 values 时必须尽量给 source、unit、methodology、estimated；估算或样例数据 estimated=true。"
+    )
+
+
+def _presentation_stream_prompt(*, query: str, config: dict[str, Any]) -> str:
+    min_slides = max(8, _presentation_int(config.get("pageCount"), 8, minimum=8, maximum=40))
+    payload = {
+        "task": "stream_presentation_canvas_as_ndjson",
+        "query": query,
+        "config": {
+            "topic": config.get("topic"),
+            "useCase": config.get("useCase"),
+            "audience": config.get("audience"),
+            "slidesMin": min_slides,
+            "style": config.get("styleKey"),
+            "density": config.get("density"),
+            "chartLevel": config.get("chartLevel"),
+        },
+        "renderer_contract": _presentation_renderer_contract(),
+        "style_contract": _presentation_style_contract(config.get("styleKey")),
+        "output_examples": [
+            {"type": "meta", "title": "面向企业管理层的 A2UI 汇报"},
+            {"type": "section", "title": "开场", "purpose": "说明为什么现在需要 A2UI。"},
+            {"type": "slide", "section": "开场", "title": "业务背景", "headline": "从工具调用走向可操作界面。", "bullets": ["用户不只需要答案，还需要可确认、可编辑的中间过程。", "A2UI 把 Agent 决策转化为卡片、表单和画布节点。", "人工确认后再进入最终交付，降低返工。"], "visual": "问题到方案对照图", "layout": "compare", "speakerNotes": "强调交互形态变化。", "designIntent": "用双边对比让听众快速理解交互范式变化。", "renderHints": ["leftLabel=传统 Agent", "rightLabel=A2UI Agent", "rhythm=dense", "chartTemplate=comparison_table"], "evidenceRole": "需要用户旅程或效率对比案例支撑。"},
+            {"type": "slide", "section": "验证", "title": "价值指标", "headline": "先用可验证指标定义成效。", "bullets": ["效率提升口径：从需求输入到初稿完成的耗时。", "返工下降口径：确认卡补字段后的二次修改次数。", "覆盖范围口径：可支持的文档与演示场景数量。"], "visual": "数字卡片与柱状图", "layout": "metrics", "speakerNotes": "没有真实日志时只讲口径，不报具体数值。", "designIntent": "用指标卡让听众先理解价值衡量方式。", "renderHints": ["chart=scorecard", "rhythm=dense", "chartTemplate=kpi_cards"], "visualSpec": {"type": "scorecard", "metrics": [{"label": "效率提升", "value": "待补", "detail": "从需求输入到初稿完成的耗时"}, {"label": "返工下降", "value": "待补", "detail": "确认卡补字段后的二次修改次数"}]}, "evidenceRole": "需要产品日志或试点案例补充真实数值。"},
+            {"type": "knowledge", "title": "用户旅程样本", "source": "产品验证", "detail": "检索或补充真实用户从需求输入到交付确认的路径、耗时、返工次数，用于支撑业务背景页的 A2UI 价值判断；优先使用产品日志、访谈纪要或案例复盘。", "status": "missing"},
+            {"type": "done"},
+        ],
+        "rules": [
+            f"slide 行至少输出 {min_slides} 行，最多 16 行。",
+            "section.title 要和 slide.section 对齐。",
+            "每页 bullets 2-3 条，必须是可直接放进初稿的具体内容，避免长句。",
+            "每页 slide 必须输出 layout、designIntent、renderHints、evidenceRole；renderHints 最多 4 条，并尽量使用 leftLabel/rightLabel/chart/emphasis/flow/rhythm/chartTemplate。",
+            "复合视觉必须输出 visualSpec：matrix/architecture/combo_metrics 三类要给结构字段，不能只写在 visual 文本里。",
+            "首尾页要承担明确叙事角色：第一页必须 cover；最后一页若是行动/合作/联系则 checklist，若是愿景/总结/金句则 quote；章节过渡页用 section。",
+            "同一 layout 内也要换模板：metrics、compare、diagram、process、timeline 都必须选择适合内容的 chartTemplate，不要连续重复同一种卡片。",
+            "涉及收益、效率、成本、增长、转化、覆盖率、趋势的页面，优先 layout=metrics，并给 chart=scorecard/bar/line；缺数据时写指标口径，不能编造数值。",
+            "整套 deck 要有页面节奏，two_column 不应成为主要版式；不能连续 3 页同一 layout，也不能连续 3 页同一 chartTemplate/templateId。",
+            "缺少事实数据时输出 knowledge missing，不要编造具体数字；missing.detail 必须能直接指导联网补充；knowledge 总数 3-5 条。",
+            "每行只能一个 JSON 对象，不要输出数组，不要输出总 JSON；第一行立即输出 meta。",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _presentation_agent_json_repair_prompt(raw_text: str, config: dict[str, Any]) -> str:
+    payload = {
+        "task": "repair_presentation_canvas_output_to_json",
+        "target_schema": {
+            "config_patch": {},
+            "plan": {
+                "title": "string",
+                "sections": [],
+                "slides": [],
+                "knowledge": [],
+            },
+            "generation_notes": [],
+        },
+        "rules": [
+            "只返回一个合法 JSON 对象。",
+            "不得输出 Markdown、代码围栏、解释、注释。",
+            "保留原输出中的章节、页面、要点和知识依赖。",
+            f"slides 不少于 {max(8, _presentation_int(config.get('pageCount'), 10, minimum=8, maximum=40))} 页。",
+            "如果无法保留全部字段，至少保证 title、sections、slides、knowledge 可解析。",
+            "修复结果要紧凑：每页 bullets 2-3 条，renderHints 最多 4 条，knowledge 3-5 条。",
+            "尽量保留或补齐 renderHints 中的 rhythm=anchor|dense|breathing 和 chartTemplate=...；不要把 visualSpec 退化成纯文字 visual。",
+        ],
+        "raw_model_output": raw_text[:12000],
+    }
+    return (
+        "你刚才的 AIPPT 输出不能被 JSON 解析器稳定解析。请把 raw_model_output 修复为指定 schema。\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _presentation_strict_json_repair_prompt(
+    raw_text: str,
+    *,
+    task: str,
+    target_schema: dict[str, Any],
+    rules: list[str],
+    context: dict[str, Any] | None = None,
+) -> str:
+    payload = {
+        "task": task,
+        "target_schema": target_schema,
+        "context": context or {},
+        "rules": [
+            "只返回一个合法 JSON 对象。",
+            "不得输出 Markdown、代码围栏、解释、注释或多余前后缀。",
+            "优先保留 raw_model_output 中已经生成的真实内容，不要改写任务方向。",
+            *rules,
+        ],
+        "raw_model_output": raw_text[:9000],
+    }
+    return (
+        "你刚才的结构化输出不能被 JSON 解析器稳定解析。"
+        "请只做格式修复和字段归位，输出必须能被 json.loads 直接解析。\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _presentation_normalize_agent_plan(parsed: dict[str, Any], base_config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    config = dict(base_config)
+    patch = parsed.get("config_patch")
+    if isinstance(patch, dict):
+        config = _presentation_config_from_input(config.get("topic", ""), {**config, **patch})
+    plan_obj = parsed.get("plan") if isinstance(parsed.get("plan"), dict) else parsed
+    if not isinstance(plan_obj, dict):
+        return None
+    raw_slides = plan_obj.get("slides")
+    if not isinstance(raw_slides, list):
+        return None
+    min_slides = max(8, _presentation_int(config.get("pageCount"), 8, minimum=8, maximum=40))
+    if not raw_slides:
+        return None
+
+    sections: list[dict[str, Any]] = []
+    section_id_by_raw: dict[str, str] = {}
+    section_id_by_title: dict[str, str] = {}
+
+    def add_section(raw_id: Any, title: Any, purpose: Any = "") -> str:
+        clean_title = _field_value(title)[:80] or f"章节 {len(sections) + 1}"
+        key = clean_title.lower()
+        if key in section_id_by_title:
+            sid = section_id_by_title[key]
+        else:
+            sid = f"section-{len(sections) + 1}"
+            section_id_by_title[key] = sid
+            sections.append({"id": sid, "title": clean_title, "purpose": _field_value(purpose)[:220] or f"承接「{config['topic']}」的叙事推进。"})
+        raw_key = _field_value(raw_id)
+        if raw_key:
+            section_id_by_raw[raw_key] = sid
+        return sid
+
+    raw_sections = plan_obj.get("sections")
+    if isinstance(raw_sections, list):
+        for item in raw_sections[:24]:
+            if isinstance(item, dict):
+                add_section(item.get("id"), item.get("title") or item.get("name"), item.get("purpose") or item.get("summary"))
+            else:
+                add_section("", item)
+    for slide in raw_slides[:40]:
+        if isinstance(slide, dict):
+            title = slide.get("section") or slide.get("sectionTitle") or slide.get("section_title")
+            if title:
+                add_section(slide.get("sectionId") or slide.get("section_id"), title)
+    if not sections:
+        add_section("section-1", "开场", "建立演示叙事起点。")
+
+    raw_knowledge = plan_obj.get("knowledge")
+    knowledge: list[dict[str, Any]] = []
+    knowledge_id_map: dict[str, str] = {}
+    if isinstance(raw_knowledge, list):
+        for idx, item in enumerate(raw_knowledge[:18], start=1):
+            if isinstance(item, dict):
+                raw_id = _field_value(item.get("id")) or f"k-raw-{idx}"
+                kid = f"k-{idx}"
+                knowledge_id_map[raw_id] = kid
+                status = _field_value(item.get("status")) or "assumption"
+                if status not in _PRESENTATION_KNOWLEDGE_STATUSES:
+                    status = "assumption"
+                knowledge.append({
+                    "id": kid,
+                    "title": (_field_value(item.get("title")) or f"知识依赖 {idx}")[:80],
+                    "source": (_field_value(item.get("source")) or "Agent 推断")[:80],
+                    "detail": (_field_value(item.get("detail") or item.get("summary") or item.get("description")) or "需要进一步确认或补充资料。")[:360],
+                    "status": status,
+                })
+    if len(knowledge) < 3:
+        for item in _presentation_knowledge(config):
+            if len(knowledge) >= 3:
+                break
+            if item["id"] not in {row["id"] for row in knowledge}:
+                knowledge.append(item)
+    if not knowledge:
+        knowledge = _presentation_knowledge(config)
+
+    slides: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw_slides[:40], start=1):
+        if not isinstance(item, dict):
+            continue
+        raw_section_id = _field_value(item.get("sectionId") or item.get("section_id"))
+        section_title = _field_value(item.get("section") or item.get("sectionTitle") or item.get("section_title"))
+        section_id = section_id_by_raw.get(raw_section_id) or (section_id_by_title.get(section_title.lower()) if section_title else "")
+        if not section_id:
+            section_id = sections[min(len(sections) - 1, max(0, idx - 1))]["id"]
+        title = (_field_value(item.get("title")) or f"第 {idx} 页")[:120]
+        bullets = _presentation_list_strings(item.get("bullets") or item.get("points") or item.get("content"), limit=5)
+        if len(bullets) < 2:
+            bullets = _presentation_bullets(config, title, idx)
+        layout = _field_value(item.get("layout"))
+        if layout not in _PRESENTATION_LAYOUTS:
+            layout = _presentation_infer_layout(title, _field_value(item.get("visual") or item.get("visualSuggestion") or item.get("chart")), index=idx, use_case=_field_value(config.get("useCase")) or "report")
+        render_hints = _presentation_list_strings(
+            item.get("renderHints") or item.get("render_hints") or item.get("designHints") or item.get("design_hints"),
+            limit=4,
+        )
+        status = _field_value(item.get("status")) or ("confirmed" if idx <= 2 else "draft")
+        if status not in _PRESENTATION_STATUSES:
+            status = "draft"
+        raw_kids = item.get("knowledgeIds") or item.get("knowledge_ids") or item.get("knowledge")
+        k_ids: list[str] = []
+        if isinstance(raw_kids, list):
+            for raw in raw_kids:
+                value = _field_value(raw)
+                mapped = knowledge_id_map.get(value) or value
+                if mapped in {row["id"] for row in knowledge}:
+                    k_ids.append(mapped)
+        if not k_ids:
+            k_ids = [knowledge[0]["id"]]
+            if len(knowledge) > 1 and idx % 2 == 0:
+                k_ids.append(knowledge[1]["id"])
+        slides.append({
+            "id": f"slide-{len(slides) + 1}",
+            "sectionId": section_id,
+            "index": len(slides) + 1,
+            "title": title,
+            "headline": (_field_value(item.get("headline") or item.get("subtitle") or item.get("summary")) or title)[:220],
+            "bullets": bullets,
+            "visual": (_field_value(item.get("visual") or item.get("visualSuggestion") or item.get("chart")) or "内容版式")[:160],
+            "layout": layout,
+            "knowledgeIds": list(dict.fromkeys(k_ids))[:4],
+            "status": status,
+            "speakerNotes": (_field_value(item.get("speakerNotes") or item.get("speaker_notes") or item.get("notes")) or f"围绕「{title}」展开讲述。")[:360],
+            "designIntent": (_field_value(item.get("designIntent") or item.get("design_intent") or item.get("renderIntent") or item.get("render_intent")) or "")[:220],
+            "renderHints": render_hints,
+            "visualSpec": _presentation_visual_spec(item.get("visualSpec") or item.get("visual_spec") or item.get("uiSpec") or item.get("visual_specification")),
+            "evidenceRole": (_field_value(item.get("evidenceRole") or item.get("evidence_role") or item.get("evidence")) or "")[:180],
+        })
+    if len(slides) < min_slides:
+        return config, _presentation_enforce_layout_diversity({
+            "title": (_field_value(plan_obj.get("title")) or f"{config['topic']}｜{_PRESENTATION_USE_CASES.get(config['useCase'], '汇报')}演示")[:160],
+            "sections": sections,
+            "slides": slides,
+            "knowledge": knowledge,
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+        }, config)
+    used_sections = {slide["sectionId"] for slide in slides}
+    sections = [section for section in sections if section["id"] in used_sections] or sections[:1]
+    valid_section_ids = {section["id"] for section in sections}
+    if slides and slides[0]["sectionId"] not in valid_section_ids:
+        first = sections[0]["id"]
+        slides = [{**slide, "sectionId": slide["sectionId"] if slide["sectionId"] in valid_section_ids else first} for slide in slides]
+    plan = {
+        "title": (_field_value(plan_obj.get("title")) or f"{config['topic']}｜{_PRESENTATION_USE_CASES.get(config['useCase'], '汇报')}演示")[:160],
+        "sections": sections,
+        "slides": slides,
+        "knowledge": knowledge,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    return config, _presentation_enforce_layout_diversity(plan, config)
+
+
+def _presentation_complete_partial_plan(plan: dict[str, Any], config: dict[str, Any], *, min_slides: int) -> dict[str, Any]:
+    completed = json.loads(json.dumps(plan or {}, ensure_ascii=False))
+    heuristic = _presentation_heuristic_plan(config)
+    completed["title"] = _field_value(completed.get("title")) or heuristic.get("title") or f"{config.get('topic') or 'AIPPT'}"
+    sections = completed.setdefault("sections", [])
+    if not isinstance(sections, list):
+        sections = []
+        completed["sections"] = sections
+
+    def clean(value: Any) -> str:
+        return _field_value(value)
+
+    def add_section(title: str, purpose: str = "") -> str:
+        clean_title = clean(title)[:80] or f"章节 {len(sections) + 1}"
+        for row in sections:
+            if isinstance(row, dict) and clean(row.get("title")).lower() == clean_title.lower():
+                return clean(row.get("id")) or "section-1"
+        sid = f"section-{len(sections) + 1}"
+        sections.append({
+            "id": sid,
+            "title": clean_title,
+            "purpose": clean(purpose)[:220] or f"承接「{config.get('topic') or '主题'}」的叙事推进。",
+        })
+        return sid
+
+    if not sections:
+        add_section("开场", "建立演示叙事起点。")
+    section_ids = {clean(row.get("id")) for row in sections if isinstance(row, dict)}
+    first_section_id = clean(sections[0].get("id")) if sections and isinstance(sections[0], dict) else add_section("开场")
+
+    knowledge = completed.setdefault("knowledge", [])
+    if not isinstance(knowledge, list):
+        knowledge = []
+        completed["knowledge"] = knowledge
+    existing_kids = {clean(row.get("id")) for row in knowledge if isinstance(row, dict)}
+    existing_ktitles = {clean(row.get("title")).lower() for row in knowledge if isinstance(row, dict)}
+    for item in heuristic.get("knowledge") or []:
+        if len(knowledge) >= 6 or not isinstance(item, dict):
+            continue
+        title_key = clean(item.get("title")).lower()
+        if title_key in existing_ktitles:
+            continue
+        row = dict(item)
+        kid = clean(row.get("id")) or f"k-{len(knowledge) + 1}"
+        if kid in existing_kids:
+            kid = f"k-{len(knowledge) + 1}"
+        row["id"] = kid
+        knowledge.append(row)
+        existing_kids.add(kid)
+        existing_ktitles.add(title_key)
+    if not knowledge:
+        knowledge.extend(_presentation_knowledge(config))
+        existing_kids = {clean(row.get("id")) for row in knowledge if isinstance(row, dict)}
+    first_kid = clean(knowledge[0].get("id")) if knowledge and isinstance(knowledge[0], dict) else "k-topic"
+
+    slides = completed.setdefault("slides", [])
+    if not isinstance(slides, list):
+        slides = []
+        completed["slides"] = slides
+    existing_titles = {clean(row.get("title")).lower() for row in slides if isinstance(row, dict)}
+    normalized_slides: list[dict[str, Any]] = []
+    for slide in slides:
+        if not isinstance(slide, dict):
+            continue
+        next_slide = dict(slide)
+        next_slide["id"] = f"slide-{len(normalized_slides) + 1}"
+        next_slide["index"] = len(normalized_slides) + 1
+        if clean(next_slide.get("sectionId")) not in section_ids:
+            next_slide["sectionId"] = first_section_id
+        raw_kids = next_slide.get("knowledgeIds")
+        valid_kids = [clean(kid) for kid in raw_kids if clean(kid) in existing_kids] if isinstance(raw_kids, list) else []
+        next_slide["knowledgeIds"] = valid_kids[:4] or [first_kid]
+        normalized_slides.append(next_slide)
+    slides = normalized_slides
+    completed["slides"] = slides
+
+    heuristic_sections = {
+        clean(row.get("id")): row
+        for row in heuristic.get("sections") or []
+        if isinstance(row, dict)
+    }
+    for item in heuristic.get("slides") or []:
+        if len(slides) >= min_slides or not isinstance(item, dict):
+            continue
+        title = clean(item.get("title")) or f"补充页 {len(slides) + 1}"
+        title_key = title.lower()
+        if title_key in existing_titles:
+            continue
+        h_section = heuristic_sections.get(clean(item.get("sectionId"))) or {}
+        sid = add_section(clean(h_section.get("title")) or "补充内容", clean(h_section.get("purpose")))
+        section_ids.add(sid)
+        raw_kids = item.get("knowledgeIds")
+        valid_kids = [clean(kid) for kid in raw_kids if clean(kid) in existing_kids] if isinstance(raw_kids, list) else []
+        slides.append({
+            **item,
+            "id": f"slide-{len(slides) + 1}",
+            "index": len(slides) + 1,
+            "sectionId": sid,
+            "knowledgeIds": valid_kids[:4] or [first_kid],
+            "status": "draft",
+        })
+        existing_titles.add(title_key)
+
+    while len(slides) < min_slides:
+        idx = len(slides) + 1
+        title = f"补充专题 {idx}"
+        visual = "专题分析图"
+        sid = add_section("补充内容", "补齐演示所需的关键页面。")
+        slides.append({
+            "id": f"slide-{idx}",
+            "sectionId": sid,
+            "index": idx,
+            "title": title,
+            "headline": f"围绕{config.get('topic') or '主题'}补充必要论证。",
+            "bullets": _presentation_bullets(config, title, idx),
+            "visual": visual,
+            "layout": _presentation_infer_layout(title, visual, index=idx, use_case=clean(config.get("useCase")) or "report"),
+            "knowledgeIds": [first_kid],
+            "status": "draft",
+            "speakerNotes": f"结合前文内容补充「{title}」。",
+        })
+
+    used_sections = {clean(slide.get("sectionId")) for slide in slides if isinstance(slide, dict)}
+    completed["sections"] = [row for row in sections if isinstance(row, dict) and clean(row.get("id")) in used_sections] or sections[:1]
+    completed["slides"] = slides
+    completed["knowledge"] = knowledge
+    completed["generatedAt"] = datetime.now(timezone.utc).isoformat()
+    return _presentation_enforce_layout_diversity(completed, config)
+
+
+async def _presentation_collect_agent_text(
+    db: Session,
+    p: Principal,
+    *,
+    prompt: str,
+    system_message: str,
+    timeout_seconds: float | None = None,
+) -> str:
+    target = await hermes_client.resolve_target(db, p.tenant.id)
+    session = await hermes_client.create_session(target, title=f"AIPPT生成-{_uuid.uuid4().hex[:8]}")
+    session_id = _official_hermes_session_id(session)
+    if not session_id:
+        return ""
+    timeout_seconds = timeout_seconds or _presentation_agent_timeout_seconds()
+    try:
+        if await hermes_client.supports_run_events(target):
+            run = await hermes_client.create_run(
+                target,
+                session_id=session_id,
+                message=prompt,
+                system_message=system_message,
+                model="hermes-agent",
+            )
+            run_id = _official_hermes_run_id(run)
+            if run_id:
+                text = await _official_collect_run_event_text(target, run_id, timeout_seconds=timeout_seconds)
+                if text:
+                    return text
+    except Exception:
+        pass
+
+    parts: list[str] = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    stream = hermes_client.stream_chat(
+        target,
+        session_id,
+        message=prompt,
+        system_message=system_message,
+    )
+    agen = stream.__aiter__()
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                ev = await asyncio.wait_for(agen.__anext__(), timeout=min(remaining, 10.0))
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                break
+            name = ev.get("event") or ""
+            data = ev.get("data")
+            if name == "error":
+                break
+            if isinstance(data, dict):
+                msg_obj = data.get("message") if isinstance(data.get("message"), dict) else {}
+                delta = (
+                    data.get("delta")
+                    or data.get("content")
+                    or data.get("text")
+                    or data.get("output")
+                    or data.get("final_response")
+                    or msg_obj.get("content")
+                    or msg_obj.get("delta")
+                    or ""
+                )
+                if isinstance(delta, str) and delta:
+                    parts.append(delta)
+                if name == "run.completed":
+                    for item in data.get("messages") or []:
+                        if isinstance(item, dict) and item.get("role") == "assistant":
+                            content = item.get("content") or item.get("text") or ""
+                            if isinstance(content, str) and content:
+                                parts.append(content)
+            elif isinstance(data, str) and data:
+                parts.append(data)
+    finally:
+        try:
+            await agen.aclose()
+        except Exception:
+            pass
+    return "".join(parts).strip()
+
+
+async def _presentation_agent_plan(
+    db: Session,
+    p: Principal,
+    *,
+    query: str,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    if not _presentation_agent_enabled():
+        return None, config, ["Presentation Agent 已被环境变量关闭。"]
+    system_message = _presentation_agent_system_message()
+    prompt = _presentation_agent_prompt(query=query, config=config)
+    text = ""
+    timeout_seconds = max(90.0, _presentation_agent_timeout_seconds())
+    try:
+        target = await hermes_client.resolve_target(db, p.tenant.id)
+        completion = await hermes_client.create_chat_completion(
+            target,
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt},
+            ],
+            model="hermes-agent",
+            temperature=0.2,
+            timeout=timeout_seconds,
+        )
+        text = _official_chat_completion_text(completion)
+    except Exception as exc:
+        warnings.append(f"Hermes chat completion 调用失败：{exc.__class__.__name__}")
+        try:
+            text = await _presentation_collect_agent_text(
+                db,
+                p,
+                prompt=prompt,
+                system_message=system_message,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as stream_exc:
+            warnings.append(f"Hermes stream 调用失败：{stream_exc.__class__.__name__}")
+    parsed = _official_json_object_from_text(text)
+    if not parsed and text:
+        repair_prompt = _presentation_agent_json_repair_prompt(text, config)
+        repair_text = ""
+        try:
+            target = await hermes_client.resolve_target(db, p.tenant.id)
+            repair_completion = await hermes_client.create_chat_completion(
+                target,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                model="hermes-agent",
+                temperature=0,
+                timeout=max(60.0, _presentation_agent_timeout_seconds() / 2),
+            )
+            repair_text = _official_chat_completion_text(repair_completion)
+        except Exception as exc:
+            warnings.append(f"Hermes JSON 修复失败：{exc.__class__.__name__}")
+        parsed = _official_json_object_from_text(repair_text)
+    if not parsed:
+        warnings.append("Hermes 未返回可解析的 DeckPlan JSON。")
+        return None, config, warnings
+    normalized = _presentation_normalize_agent_plan(parsed, config)
+    if not normalized:
+        warnings.append("Hermes DeckPlan 未通过结构校验，请调整需求或重试。")
+        return None, config, warnings
+    next_config, plan = normalized
+    min_slides = max(8, _presentation_int(config.get("pageCount"), 8, minimum=8, maximum=40))
+    slide_count = len(plan.get("slides") or [])
+    if slide_count < min_slides:
+        warnings.append(f"Hermes DeckPlan 只返回 {slide_count}/{min_slides} 页，已保留真实草案，没有生成替代草案。")
+    return plan, next_config, warnings
+
+
+async def _presentation_call_json_agent(
+    db: Session,
+    p: Principal,
+    *,
+    system_message: str,
+    prompt: str,
+    timeout: float,
+    temperature: float = 0.15,
+    repair_task: str | None = None,
+    repair_schema: dict[str, Any] | None = None,
+    repair_rules: list[str] | None = None,
+    repair_context: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    warnings: list[str] = []
+    text = ""
+    used_repair = False
+    try:
+        target = await hermes_client.resolve_target(db, p.tenant.id)
+        completion = await hermes_client.create_chat_completion(
+            target,
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": prompt},
+            ],
+            model="hermes-agent",
+            temperature=temperature,
+            timeout=timeout,
+        )
+        text = _official_chat_completion_text(completion)
+    except Exception as exc:
+        warnings.append(f"Hermes JSON Agent 调用失败：{exc.__class__.__name__}")
+        try:
+            text = await _presentation_collect_agent_text(
+                db,
+                p,
+                prompt=prompt,
+                system_message=system_message,
+                timeout_seconds=timeout,
+            )
+        except Exception as stream_exc:
+            warnings.append(f"Hermes JSON Agent 流式收集失败：{stream_exc.__class__.__name__}")
+    parsed = _official_json_object_from_text(text)
+    if not parsed and text and repair_task and repair_schema:
+        used_repair = True
+        repair_prompt = _presentation_strict_json_repair_prompt(
+            text,
+            task=repair_task,
+            target_schema=repair_schema,
+            rules=repair_rules or [],
+            context=repair_context,
+        )
+        repair_text = ""
+        repair_timeout = max(35.0, min(75.0, timeout * 0.65))
+        try:
+            target = await hermes_client.resolve_target(db, p.tenant.id)
+            repair_completion = await hermes_client.create_chat_completion(
+                target,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                model="hermes-agent",
+                temperature=0,
+                timeout=repair_timeout,
+            )
+            repair_text = _official_chat_completion_text(repair_completion)
+        except Exception as exc:
+            warnings.append(f"Hermes JSON Agent 结构化修复失败：{exc.__class__.__name__}")
+            try:
+                repair_text = await _presentation_collect_agent_text(
+                    db,
+                    p,
+                    prompt=repair_prompt,
+                    system_message=system_message,
+                    timeout_seconds=repair_timeout,
+                )
+            except Exception as stream_exc:
+                warnings.append(f"Hermes JSON Agent 结构化修复流式收集失败：{stream_exc.__class__.__name__}")
+        parsed = _official_json_object_from_text(repair_text)
+    if not parsed:
+        warnings.append("Hermes JSON Agent 未返回可解析 JSON。")
+        return None, warnings
+    if used_repair:
+        warnings.append("Hermes JSON Agent 已通过结构化修复返回 JSON。")
+    return parsed, warnings
+
+
+def _presentation_outline_system_message() -> str:
+    return (
+        "你是 Atlas 的 AIPPT Outline Agent。你只负责先生成轻量大纲骨架，不生成完整讲稿。"
+        "必须只返回合法 JSON 对象，禁止 Markdown、代码围栏、解释、注释。"
+        "Schema：{\"title\":\"string\",\"sections\":[{\"title\":\"string\",\"purpose\":\"string\"}],"
+        "\"slides\":[{\"section\":\"string\",\"title\":\"string\",\"headline\":\"string\",\"layout\":\"cover|section|two_column|compare|metrics|process|timeline|diagram|checklist|quote\",\"visual\":\"string\",\"renderHints\":[\"string\"],\"visualSpec\":{\"type\":\"matrix|architecture|combo_metrics|scorecard|bar|line|generic\"},\"evidenceRole\":\"string\"}],"
+        "\"knowledge\":[{\"title\":\"string\",\"source\":\"string\",\"detail\":\"string\",\"status\":\"ready|missing|assumption\"}]}。"
+        "输出要短：每页只写标题、主张、版式和证据角色；不要写 bullets、speakerNotes 或长段落。"
+        "layout 要按叙事功能和风格分配，two_column 只是默认页，不要成为主要版式。"
+        "第一页必须是 cover；最后一页如果是行动/合作/联系用 checklist，如果是愿景/总结/金句用 quote；章节过渡用 section。"
+        "涉及收益、效率、成本、增长、转化、覆盖率、趋势时，优先 layout=metrics，并在 renderHints 写 chart=scorecard/bar/line；缺数据时不要编造。"
+        "三列矩阵、分层架构、左折线右指标卡这类复合视觉必须输出 visualSpec 结构。"
+        "visualSpec.chart 有 values 时必须尽量给 source、unit、methodology、estimated；估算或样例数据 estimated=true。"
+    )
+
+
+def _presentation_outline_prompt(*, query: str, config: dict[str, Any]) -> str:
+    min_slides = max(8, _presentation_int(config.get("pageCount"), 8, minimum=8, maximum=40))
+    payload = {
+        "task": "plan_aippt_outline_first",
+        "query": query,
+        "config": {
+            "topic": config.get("topic"),
+            "useCase": config.get("useCase"),
+            "audience": config.get("audience"),
+            "slidesMin": min_slides,
+            "slidesMax": min(16, max(min_slides, _presentation_int(config.get("pageCount"), min_slides, minimum=8, maximum=40) + 2)),
+            "style": config.get("styleKey"),
+            "density": config.get("density"),
+            "chartLevel": config.get("chartLevel"),
+        },
+        "renderer_contract": {
+            "goal": "先生成可编辑画布大纲，用户确认后可继续逐页补全和生成 HTML PPT。",
+            "layouts": list(_PRESENTATION_LAYOUTS),
+            "layout_diversity": _presentation_renderer_contract()["layout_diversity"],
+            "knowledge_policy": _presentation_renderer_contract()["knowledge_policy"],
+            "data_provenance_policy": _presentation_renderer_contract()["data_provenance_policy"],
+        },
+        "style_contract": _presentation_style_contract(config.get("styleKey")),
+        "rules": [
+            f"slides 至少 {min_slides} 页，最多 16 页。",
+            "章节要形成完整叙事，slide.section 必须匹配 sections.title。",
+            "headline 要是本页结论句，不要写空泛标题。",
+            "layout 要根据叙事功能选择，不要连续 3 页相同；chartTemplate/templateId 也不要连续 3 页相同；two_column 可以使用，但不应超过半数。",
+            "visual 要具体描述可渲染结构，如差异矩阵、能力地图、里程碑、指标卡、柱状图、折线图、流程链路、学习路径。",
+            "数据/收益/趋势页使用 layout=metrics，并给 renderHints，例如 chart=scorecard、chart=bar 或 chart=line。",
+            "矩阵/架构/组合指标页必须给 visualSpec，不要只把结构写进 visual 字符串。",
+            "visualSpec.chart 有 values 时必须尽量给 source、unit、methodology、estimated；估算或样例数据 estimated=true。",
+            "knowledge 3-5 条；missing.detail 必须像联网检索任务。",
+            "只输出 JSON 对象。",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _presentation_section_title_by_id(plan: dict[str, Any], section_id: str) -> str:
+    for section in plan.get("sections") or []:
+        if isinstance(section, dict) and _field_value(section.get("id")) == section_id:
+            return _field_value(section.get("title"))
+    return ""
+
+
+def _presentation_normalize_outline_plan(parsed: dict[str, Any], config: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(parsed, dict):
+        return None
+    raw_slides = parsed.get("slides")
+    if not isinstance(raw_slides, list) or not raw_slides:
+        return None
+    sections: list[dict[str, Any]] = []
+    section_ids_by_title: dict[str, str] = {}
+
+    def add_section(title: Any, purpose: Any = "") -> str:
+        clean_title = _field_value(title)[:80] or f"章节 {len(sections) + 1}"
+        key = clean_title.lower()
+        if key in section_ids_by_title:
+            return section_ids_by_title[key]
+        sid = f"section-{len(sections) + 1}"
+        section_ids_by_title[key] = sid
+        sections.append({
+            "id": sid,
+            "title": clean_title,
+            "purpose": (_field_value(purpose) or f"推进「{config.get('topic') or '主题'}」的叙事。")[:220],
+        })
+        return sid
+
+    raw_sections = parsed.get("sections")
+    if isinstance(raw_sections, list):
+        for item in raw_sections[:20]:
+            if isinstance(item, dict):
+                add_section(item.get("title") or item.get("name"), item.get("purpose") or item.get("summary"))
+            else:
+                add_section(item)
+    if not sections:
+        add_section("开场", "建立演示叙事起点。")
+
+    raw_knowledge = parsed.get("knowledge")
+    knowledge: list[dict[str, Any]] = []
+    if isinstance(raw_knowledge, list):
+        for item in raw_knowledge[:8]:
+            if not isinstance(item, dict):
+                continue
+            title = _field_value(item.get("title") or item.get("name"))
+            if not title:
+                continue
+            status = _field_value(item.get("status")) or "assumption"
+            if status not in _PRESENTATION_KNOWLEDGE_STATUSES:
+                status = "assumption"
+            knowledge.append({
+                "id": f"k-{len(knowledge) + 1}",
+                "title": title[:80],
+                "source": (_field_value(item.get("source")) or "Agent 推断")[:80],
+                "detail": (_field_value(item.get("detail") or item.get("summary")) or "需要进一步确认或补充资料。")[:360],
+                "status": status,
+            })
+    if not knowledge:
+        knowledge = _presentation_knowledge(config)[:3]
+    first_kid = knowledge[0]["id"] if knowledge else ""
+
+    slides: list[dict[str, Any]] = []
+    for item in raw_slides[:40]:
+        if not isinstance(item, dict):
+            continue
+        title = _field_value(item.get("title") or item.get("name"))
+        if not title:
+            continue
+        section_title = _field_value(item.get("section") or item.get("sectionTitle") or item.get("section_title")) or sections[min(len(sections) - 1, len(slides))]["title"]
+        section_id = add_section(section_title)
+        layout = _field_value(item.get("layout"))
+        visual = _field_value(item.get("visual") or item.get("visualSuggestion") or item.get("chart"))
+        if layout not in _PRESENTATION_LAYOUTS:
+            layout = _presentation_infer_layout(title, visual, index=len(slides) + 1, use_case=_field_value(config.get("useCase")) or "report")
+        slides.append({
+            "id": f"slide-{len(slides) + 1}",
+            "sectionId": section_id,
+            "index": len(slides) + 1,
+            "title": title[:120],
+            "headline": (_field_value(item.get("headline") or item.get("subtitle") or item.get("summary")) or title)[:220],
+            "bullets": _presentation_list_strings(item.get("bullets"), limit=3),
+            "visual": (visual or "待设计视觉")[:160],
+            "layout": layout,
+            "knowledgeIds": [first_kid] if first_kid else [],
+            "status": "needs_source" if any(row.get("status") == "missing" for row in knowledge) else "draft",
+            "speakerNotes": "",
+            "designIntent": "",
+            "renderHints": _presentation_list_strings(item.get("renderHints") or item.get("render_hints") or item.get("designHints") or item.get("design_hints"), limit=2),
+            "visualSpec": _presentation_visual_spec(item.get("visualSpec") or item.get("visual_spec") or item.get("uiSpec") or item.get("visual_specification")),
+            "evidenceRole": (_field_value(item.get("evidenceRole") or item.get("evidence_role") or item.get("evidence")) or "待补充证据角色")[:180],
+        })
+    if not slides:
+        return None
+    used_section_ids = {slide["sectionId"] for slide in slides}
+    sections = [section for section in sections if section["id"] in used_section_ids] or sections[:1]
+    return {
+        "title": (_field_value(parsed.get("title")) or f"{config.get('topic') or 'AIPPT'}")[:160],
+        "sections": sections,
+        "slides": slides,
+        "knowledge": knowledge,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _presentation_segmented_outline_plan(
+    db: Session,
+    p: Principal,
+    *,
+    query: str,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    parsed, warnings = await _presentation_call_json_agent(
+        db,
+        p,
+        system_message=_presentation_outline_system_message(),
+        prompt=_presentation_outline_prompt(query=query, config=config),
+        timeout=max(55.0, min(95.0, _presentation_agent_timeout_seconds() * 0.75)),
+        temperature=0.12,
+        repair_task="repair_aippt_outline_json",
+        repair_schema={
+            "title": "string",
+            "sections": [{"title": "string", "purpose": "string"}],
+            "slides": [{"section": "string", "title": "string", "headline": "string", "layout": "string", "visual": "string", "renderHints": ["string"], "visualSpec": {"type": "string"}, "evidenceRole": "string"}],
+            "knowledge": [{"title": "string", "source": "string", "detail": "string", "status": "ready|missing|assumption"}],
+        },
+        repair_rules=[
+            f"slides 至少 {max(8, _presentation_int(config.get('pageCount'), 8, minimum=8, maximum=40))} 页。",
+            "slide.section 必须能匹配 sections.title。",
+            "layout 必须从允许枚举中选择。",
+        ],
+        repair_context={"topic": config.get("topic"), "useCase": config.get("useCase")},
+    )
+    if not parsed:
+        return None, warnings
+    plan = _presentation_normalize_outline_plan(parsed, config)
+    if not plan:
+        warnings.append("Hermes 分段大纲未通过结构校验。")
+        return None, warnings
+    return plan, warnings
+
+
+def _presentation_slide_detail_system_message() -> str:
+    return (
+        "你是 Atlas 的 AIPPT Slide Agent。你一次只补全一页，必须保持与给定大纲一致。"
+        "必须只返回合法 JSON 对象，禁止 Markdown、代码围栏、解释、注释。"
+        "Schema：{\"headline\":\"string\",\"bullets\":[\"string\"],\"visual\":\"string\","
+        "\"layout\":\"cover|section|two_column|compare|metrics|process|timeline|diagram|checklist|quote\","
+        "\"speakerNotes\":\"string\",\"designIntent\":\"string\",\"renderHints\":[\"string\"],\"visualSpec\":{\"type\":\"matrix|architecture|combo_metrics|scorecard|bar|line|generic\"},\"evidenceRole\":\"string\",\"knowledgeTitles\":[\"string\"]}。"
+        "输出要短而可用：bullets 2-3 条，每条不超过 34 字；speakerNotes 不超过 80 字；renderHints 1-2 条。"
+        "renderHints 优先使用 key=value 短提示，让 HTML renderer 能直接改变左右标签、图形倾向、强调层级和流程形态。"
+        "涉及收益、效率、成本、增长、转化、覆盖率、趋势时，优先 layout=metrics，并给 chart=scorecard/bar/line；没有可信数字时不要编造。"
+        "复合视觉必须输出 visualSpec，让 renderer 能画出矩阵、架构或组合指标布局。"
+        "visualSpec.chart 有 values 时必须尽量给 source、unit、methodology、estimated；估算或样例数据 estimated=true。"
+    )
+
+
+def _presentation_slide_detail_prompt(
+    *,
+    query: str,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    slide: dict[str, Any],
+) -> str:
+    section_title = _presentation_section_title_by_id(plan, _field_value(slide.get("sectionId")))
+    renderer_contract = _presentation_renderer_contract()
+    payload = {
+        "task": "fill_one_aippt_slide",
+        "query": query,
+        "config": {
+            "topic": config.get("topic"),
+            "useCase": config.get("useCase"),
+            "audience": config.get("audience"),
+            "style": config.get("styleKey"),
+            "density": config.get("density"),
+            "chartLevel": config.get("chartLevel"),
+        },
+        "style_contract": _presentation_style_contract(config.get("styleKey")),
+        "renderer_hints": {
+            "vocabulary": renderer_contract.get("render_hint_vocabulary"),
+            "layout_diversity": renderer_contract.get("layout_diversity"),
+        },
+        "deck_context": {
+            "title": plan.get("title"),
+            "sections": [{"title": s.get("title"), "purpose": s.get("purpose")} for s in (plan.get("sections") or []) if isinstance(s, dict)],
+            "slideTitles": [_field_value(s.get("title")) for s in (plan.get("slides") or []) if isinstance(s, dict)],
+            "knowledge": [{"title": k.get("title"), "status": k.get("status"), "detail": k.get("detail")} for k in (plan.get("knowledge") or []) if isinstance(k, dict)],
+        },
+        "slide": {
+            "index": slide.get("index"),
+            "section": section_title,
+            "title": slide.get("title"),
+            "headline": slide.get("headline"),
+            "layout": slide.get("layout"),
+            "visual": slide.get("visual"),
+            "evidenceRole": slide.get("evidenceRole"),
+        },
+        "rules": [
+            "只补全当前页，不要改其他页。",
+            "bullets 必须是可直接放入初稿的具体内容，不要写占位符。",
+            "缺少事实数据时，写清指标口径或待补资料，不要编造具体数字。",
+            "layout 可微调，但必须符合当前页叙事功能。",
+            "renderHints 要能被 HTML renderer 执行，优先使用 leftLabel/rightLabel/chart/emphasis/flow/callout。",
+            "数据/收益/趋势页优先 layout=metrics，并给 chart=scorecard/bar/line；bar 用于横向对比，line 用于时间趋势，scorecard 用于关键数字卡片。",
+            "如果 visual 描述三列矩阵、分层架构、左图右指标卡，要输出 visualSpec.columns/layers/chart/metrics。",
+            "visualSpec.chart 有 values 时必须尽量给 source、unit、methodology、estimated；估算或样例数据 estimated=true。",
+            "如果当前页适合更明确的 compare、metrics、diagram、process、timeline、checklist，允许从 two_column 调整过去。",
+            "只输出 JSON 对象。",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+async def _presentation_agent_slide_patch(
+    db: Session,
+    p: Principal,
+    *,
+    query: str,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    slide: dict[str, Any],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    parsed, warnings = await _presentation_call_json_agent(
+        db,
+        p,
+        system_message=_presentation_slide_detail_system_message(),
+        prompt=_presentation_slide_detail_prompt(query=query, config=config, plan=plan, slide=slide),
+        timeout=max(35.0, min(75.0, _presentation_agent_timeout_seconds() * 0.55)),
+        temperature=0.18,
+        repair_task="repair_single_aippt_slide_patch_json",
+        repair_schema={
+            "headline": "string",
+            "bullets": ["string", "string"],
+            "visual": "string",
+            "layout": "string",
+            "speakerNotes": "string",
+            "designIntent": "string",
+            "renderHints": ["string"],
+            "visualSpec": {"type": "string"},
+            "evidenceRole": "string",
+            "knowledgeTitles": ["string"],
+        },
+        repair_rules=[
+            "只修复当前页补丁，不要输出 plan、slides 数组或其他页面。",
+            "bullets 必须 2-3 条，每条可以直接放入初稿。",
+            "layout 必须从允许枚举中选择。",
+        ],
+        repair_context={
+            "slide": {
+                "index": slide.get("index"),
+                "id": slide.get("id"),
+                "title": slide.get("title"),
+                "layout": slide.get("layout"),
+            },
+        },
+    )
+    if not parsed:
+        return None, warnings
+    return parsed, warnings
+
+
+def _presentation_slide_batch_system_message() -> str:
+    return (
+        "你是 Atlas 的 AIPPT Slide Batch Agent。你一次补全 2-4 页，必须保持与给定大纲一致。"
+        "必须只返回合法 JSON 对象，禁止 Markdown、代码围栏、解释、注释。"
+        "Schema：{\"slides\":[{\"index\":1,\"id\":\"string\",\"headline\":\"string\",\"bullets\":[\"string\"],"
+        "\"visual\":\"string\",\"layout\":\"cover|section|two_column|compare|metrics|process|timeline|diagram|checklist|quote\","
+        "\"speakerNotes\":\"string\",\"designIntent\":\"string\",\"renderHints\":[\"string\"],\"visualSpec\":{\"type\":\"matrix|architecture|combo_metrics|scorecard|bar|line|generic\"},"
+        "\"evidenceRole\":\"string\",\"knowledgeTitles\":[\"string\"]}]}。"
+        "slides 数组必须与输入 slides 一一对应，并保留原始 index/id。"
+        "每页 bullets 2-3 条，每条不超过 34 字；speakerNotes 不超过 80 字；renderHints 1-2 条。"
+        "renderHints 优先使用 key=value 短提示，让 HTML renderer 能直接改变左右标签、图形倾向、强调层级和流程形态。"
+        "涉及收益、效率、成本、增长、转化、覆盖率、趋势时，优先 layout=metrics，并给 chart=scorecard/bar/line；没有可信数字时不要编造。"
+        "复合视觉必须输出 visualSpec，让 renderer 能画出矩阵、架构或组合指标布局。"
+        "visualSpec.chart 有 values 时必须尽量给 source、unit、methodology、estimated；估算或样例数据 estimated=true。"
+    )
+
+
+def _presentation_slide_batch_prompt(
+    *,
+    query: str,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    slides: list[tuple[int, dict[str, Any]]],
+) -> str:
+    slide_payload: list[dict[str, Any]] = []
+    for idx, slide in slides:
+        section_title = _presentation_section_title_by_id(plan, _field_value(slide.get("sectionId")))
+        slide_payload.append({
+            "position": idx + 1,
+            "index": slide.get("index") or idx + 1,
+            "id": slide.get("id"),
+            "section": section_title,
+            "title": slide.get("title"),
+            "headline": slide.get("headline"),
+            "layout": slide.get("layout"),
+            "visual": slide.get("visual"),
+            "evidenceRole": slide.get("evidenceRole"),
+        })
+    renderer_contract = _presentation_renderer_contract()
+    payload = {
+        "task": "fill_aippt_slide_batch",
+        "query": query,
+        "config": {
+            "topic": config.get("topic"),
+            "useCase": config.get("useCase"),
+            "audience": config.get("audience"),
+            "style": config.get("styleKey"),
+            "density": config.get("density"),
+            "chartLevel": config.get("chartLevel"),
+        },
+        "style_contract": _presentation_style_contract(config.get("styleKey")),
+        "renderer_hints": {
+            "vocabulary": renderer_contract.get("render_hint_vocabulary"),
+            "layout_diversity": renderer_contract.get("layout_diversity"),
+        },
+        "deck_context": {
+            "title": plan.get("title"),
+            "sections": [{"title": s.get("title"), "purpose": s.get("purpose")} for s in (plan.get("sections") or []) if isinstance(s, dict)],
+            "knowledge": [{"title": k.get("title"), "status": k.get("status"), "detail": k.get("detail")} for k in (plan.get("knowledge") or []) if isinstance(k, dict)][:8],
+        },
+        "slides": slide_payload,
+        "rules": [
+            "只补全输入 slides，不要新增、删除或重排页面。",
+            "返回 slides 数组数量必须等于输入 slides 数量；每项必须保留原始 index/id。",
+            "bullets 必须是可直接放入初稿的具体内容，不要写占位符。",
+            "缺少事实数据时，写清指标口径或待补资料，不要编造具体数字。",
+            "layout 可微调，但必须符合当前页叙事功能，并避免批次内版式全部相同。",
+            "renderHints 要能被 HTML renderer 执行，优先使用 leftLabel/rightLabel/chart/emphasis/flow/callout。",
+            "数据/收益/趋势页优先 layout=metrics，并给 chart=scorecard/bar/line；bar 用于横向对比，line 用于时间趋势，scorecard 用于关键数字卡片。",
+            "如果 visual 描述三列矩阵、分层架构、左图右指标卡，要输出 visualSpec.columns/layers/chart/metrics。",
+            "visualSpec.chart 有 values 时必须尽量给 source、unit、methodology、estimated；估算或样例数据 estimated=true。",
+            "批次内如果有多页 two_column，要主动判断是否应改为 compare、metrics、diagram、process、timeline 或 checklist。",
+            "只输出 JSON 对象。",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+async def _presentation_agent_slide_batch_patches(
+    db: Session,
+    p: Principal,
+    *,
+    query: str,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    slides: list[tuple[int, dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    parsed, warnings = await _presentation_call_json_agent(
+        db,
+        p,
+        system_message=_presentation_slide_batch_system_message(),
+        prompt=_presentation_slide_batch_prompt(query=query, config=config, plan=plan, slides=slides),
+        timeout=max(45.0, min(105.0, _presentation_agent_timeout_seconds() * 0.75)),
+        temperature=0.18,
+        repair_task="repair_aippt_slide_batch_patch_json",
+        repair_schema={
+            "slides": [
+                {
+                    "index": 1,
+                    "id": "string",
+                    "headline": "string",
+                    "bullets": ["string", "string"],
+                    "visual": "string",
+                    "layout": "string",
+                    "speakerNotes": "string",
+                    "designIntent": "string",
+                    "renderHints": ["string"],
+                    "visualSpec": {"type": "string"},
+                    "evidenceRole": "string",
+                    "knowledgeTitles": ["string"],
+                }
+            ]
+        },
+        repair_rules=[
+            f"slides 数组数量必须等于 {len(slides)}。",
+            "每个 slides[i] 必须保留输入里的 index 和 id。",
+            "每页 bullets 必须 2-3 条，每条可以直接放入初稿。",
+            "不要新增、删除或重排页面。",
+        ],
+        repair_context={
+            "expectedSlides": [
+                {"index": (slide.get("index") or idx + 1), "id": slide.get("id"), "title": slide.get("title")}
+                for idx, slide in slides
+            ],
+        },
+    )
+    if not parsed:
+        return [], warnings
+    raw_slides = parsed.get("slides") or parsed.get("patches") or parsed.get("items")
+    if not isinstance(raw_slides, list):
+        warnings.append("Hermes Slide Batch Agent 未返回 slides 数组。")
+        return [], warnings
+    patches = [item for item in raw_slides if isinstance(item, dict)]
+    if not patches:
+        warnings.append("Hermes Slide Batch Agent 返回的 slides 数组为空。")
+    return patches, warnings
+
+
+def _presentation_pick_batch_patch(
+    patches: list[dict[str, Any]],
+    *,
+    slide: dict[str, Any],
+    slide_index: int,
+    fallback_order: int,
+) -> dict[str, Any] | None:
+    slide_id = _field_value(slide.get("id"))
+    slide_number = _presentation_int(slide.get("index"), slide_index + 1, minimum=1, maximum=999)
+    for patch in patches:
+        if slide_id and _field_value(patch.get("id") or patch.get("slideId") or patch.get("slide_id")) == slide_id:
+            return patch
+    for patch in patches:
+        patch_index = _presentation_int(
+            patch.get("index") or patch.get("position") or patch.get("slideIndex") or patch.get("slide_index"),
+            -1,
+            minimum=-1,
+            maximum=999,
+        )
+        if patch_index in {slide_index + 1, slide_number}:
+            return patch
+    if fallback_order < len(patches):
+        return patches[fallback_order]
+    return None
+
+
+def _presentation_apply_slide_patch(
+    plan: dict[str, Any],
+    slide_index: int,
+    patch: dict[str, Any],
+    config: dict[str, Any],
+) -> bool:
+    slides = plan.get("slides") if isinstance(plan.get("slides"), list) else []
+    if slide_index < 0 or slide_index >= len(slides) or not isinstance(patch, dict):
+        return False
+    slide = slides[slide_index]
+    if not isinstance(slide, dict):
+        return False
+    title = _field_value(slide.get("title")) or f"第 {slide_index + 1} 页"
+    layout = _field_value(patch.get("layout")) or _field_value(slide.get("layout"))
+    if layout not in _PRESENTATION_LAYOUTS:
+        layout = _presentation_infer_layout(title, _field_value(patch.get("visual") or slide.get("visual")), index=slide_index + 1, use_case=_field_value(config.get("useCase")) or "report")
+    bullets = _presentation_list_strings(patch.get("bullets"), limit=3)
+    if len(bullets) < 2:
+        return False
+    render_hints = _presentation_list_strings(patch.get("renderHints") or patch.get("render_hints"), limit=2)
+    knowledge_titles = {_field_value(item).lower() for item in _presentation_list_strings(patch.get("knowledgeTitles") or patch.get("knowledge_titles"), limit=4)}
+    knowledge_ids = []
+    if knowledge_titles:
+        for item in plan.get("knowledge") or []:
+            if isinstance(item, dict) and _field_value(item.get("title")).lower() in knowledge_titles:
+                knowledge_ids.append(_field_value(item.get("id")))
+    slide.update({
+        "headline": (_field_value(patch.get("headline")) or _field_value(slide.get("headline")) or title)[:220],
+        "bullets": bullets,
+        "visual": (_field_value(patch.get("visual")) or _field_value(slide.get("visual")) or "内容版式")[:160],
+        "layout": layout,
+        "speakerNotes": (_field_value(patch.get("speakerNotes") or patch.get("speaker_notes")) or _field_value(slide.get("speakerNotes")) or f"围绕「{title}」展开讲述。")[:360],
+        "designIntent": (_field_value(patch.get("designIntent") or patch.get("design_intent")) or _field_value(slide.get("designIntent")) or "")[:220],
+        "renderHints": render_hints,
+        "visualSpec": _presentation_visual_spec(patch.get("visualSpec") or patch.get("visual_spec") or patch.get("uiSpec") or patch.get("visual_specification")) or slide.get("visualSpec") or {},
+        "evidenceRole": (_field_value(patch.get("evidenceRole") or patch.get("evidence_role")) or _field_value(slide.get("evidenceRole")) or "")[:180],
+        "knowledgeIds": list(dict.fromkeys([kid for kid in knowledge_ids if kid] or slide.get("knowledgeIds") or []))[:4],
+        "status": "draft",
+    })
+    plan["generatedAt"] = datetime.now(timezone.utc).isoformat()
+    return True
+
+
+def _presentation_designer_action_system_message() -> str:
+    return (
+        "你是 Atlas AIPPT Designer Agent，负责对单页 Deck Schema 做低代码编辑补丁。"
+        "你不是 HTML 作者，不要输出 HTML/CSS；只返回合法 JSON 对象。"
+        "Schema：{\"slide_patch\":{\"title\":\"string\",\"headline\":\"string\",\"bullets\":[\"string\"],"
+        "\"visual\":\"string\",\"layout\":\"cover|section|two_column|compare|metrics|process|timeline|diagram|checklist|quote\","
+        "\"speakerNotes\":\"string\",\"designIntent\":\"string\",\"renderHints\":[\"string\"],"
+        "\"visualSpec\":{\"type\":\"matrix|architecture|combo_metrics|scorecard|bar|line|generic\"},"
+        "\"evidenceRole\":\"string\",\"status\":\"draft|confirmed|needs_source|locked\"},"
+        "\"rationale\":\"string\",\"warnings\":[\"string\"]}。"
+        "只改当前页，不要新增、删除或重排页面。"
+        "涉及图表时必须补 visualSpec；缺少真实数字时使用清晰占位或口径说明，不要编造业务事实。"
+    )
+
+
+def _presentation_slide_neighbors(plan: dict[str, Any], slide: dict[str, Any]) -> dict[str, Any]:
+    slides = [s for s in (plan.get("slides") or []) if isinstance(s, dict)]
+    slide_id = _field_value(slide.get("id"))
+    index = next((i for i, item in enumerate(slides) if _field_value(item.get("id")) == slide_id), -1)
+    def compact(item: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not item:
+            return None
+        return {
+            "id": item.get("id"),
+            "index": item.get("index"),
+            "title": item.get("title"),
+            "headline": item.get("headline"),
+            "layout": item.get("layout"),
+            "visual": item.get("visual"),
+        }
+    return {
+        "previous": compact(slides[index - 1]) if index > 0 else None,
+        "current": compact(slide),
+        "next": compact(slides[index + 1]) if 0 <= index < len(slides) - 1 else None,
+        "totalSlides": len(slides),
+    }
+
+
+def _presentation_linked_knowledge(plan: dict[str, Any], slide: dict[str, Any]) -> list[dict[str, Any]]:
+    knowledge = [k for k in (plan.get("knowledge") or []) if isinstance(k, dict)]
+    ids = {_field_value(item) for item in (slide.get("knowledgeIds") or slide.get("knowledge_ids") or [])}
+    linked = [item for item in knowledge if _field_value(item.get("id")) in ids]
+    rows = linked or knowledge[:4]
+    return [
+        {
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "source": item.get("source"),
+            "status": item.get("status"),
+            "detail": item.get("detail"),
+        }
+        for item in rows[:6]
+    ]
+
+
+def _presentation_designer_action_policy(action: str, config: dict[str, Any]) -> dict[str, Any]:
+    use_case = _field_value(config.get("useCase")) or "report"
+    base = {
+        "rewrite": "优化当前页表达，保留原叙事位置，只改本页 schema。",
+        "enhance_chart": "补强 visualSpec 和数据表达，缺真实数字时必须标注待补来源。",
+        "roadshow_style": "强化投资人语言、商业指标、差异化价值和行动号召，不编造事实。",
+    }.get(action, "根据 instruction 修改当前页 schema。")
+    use_case_policy = {
+        "report": "偏高管汇报：结论先行、结构克制、强调决策和执行。",
+        "roadshow": "偏投资人路演：强调机会、壁垒、增长质量、商业化路径。",
+        "training": "偏培训课件：强调概念递进、例子、练习和记忆点。",
+    }.get(use_case, "遵循当前 useCase 的语气和受众。")
+    return {
+        "action": base,
+        "useCase": use_case_policy,
+        "mustKeep": ["id", "sectionId", "index"],
+        "forbidden": ["HTML", "CSS", "完整 deck", "新增页面", "删除页面", "编造事实数据"],
+    }
+
+
+def _presentation_designer_action_prompt(
+    *,
+    action: str,
+    instruction: str,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    slide: dict[str, Any],
+) -> str:
+    action_rules = {
+        "rewrite": [
+            "重写本页：让标题、核心观点和 bullets 更像可直接汇报的初稿。",
+            "保留原页叙事位置，不要把它改成另一页。",
+            "bullets 3-5 条，具体、短句、面向当前受众。",
+        ],
+        "enhance_chart": [
+            "增强图表：把当前页改成更强的数据/图表表达。",
+            "优先 layout=metrics；根据语义选择 visualSpec.type=scorecard/bar/line/combo_metrics。",
+            "必须输出 chart.labels、chart.series 或 metrics；没有真实数据时用待补占位并在 evidenceRole 说明需要补资料。",
+        ],
+        "roadshow_style": [
+            "改成路演风格：表达更有机会感、差异化和行动号召。",
+            "保持事实克制，不要编造融资金额、客户或收入。",
+            "renderHints 中加入 emphasis/callout，visualSpec 尽量让页面更有视觉锚点。",
+        ],
+    }.get(action, ["根据用户 instruction 对当前页做结构化 schema 修改。"])
+    payload = {
+        "task": "edit_one_aippt_slide_schema",
+        "action": action,
+        "instruction": instruction,
+        "config": {
+            "topic": config.get("topic"),
+            "useCase": config.get("useCase"),
+            "audience": config.get("audience"),
+            "styleKey": config.get("styleKey"),
+            "density": config.get("density"),
+            "chartLevel": config.get("chartLevel"),
+        },
+        "deck_context": {
+            "title": plan.get("title"),
+            "sections": [{"id": s.get("id"), "title": s.get("title"), "purpose": s.get("purpose")} for s in (plan.get("sections") or []) if isinstance(s, dict)],
+            "neighbors": _presentation_slide_neighbors(plan, slide),
+            "linkedKnowledge": _presentation_linked_knowledge(plan, slide),
+        },
+        "current_slide": slide,
+        "action_policy": _presentation_designer_action_policy(action, config),
+        "renderer_contract": _presentation_renderer_contract(),
+        "style_contract": _presentation_style_contract(config.get("styleKey")),
+        "rules": [
+            *action_rules,
+            "不要输出 HTML，不要解释，只输出 JSON 对象。",
+            "layout 必须从允许枚举中选择。",
+            "title 不超过 32 字；headline 是一句结论，不超过 60 字。",
+            "bullets 2-5 条；每条尽量不超过 36 字。",
+            "visual 要具体到最终渲染器能理解的结构。",
+            "renderHints 使用 key=value，例如 chart=line、emphasis=增长飞轮、callout=下一步行动。",
+            "如果生成矩阵/架构/图表，visualSpec 必须有 columns/layers/chart/metrics 等结构字段。",
+            "visualSpec.chart 有 values 时必须尽量给 source、unit、methodology、estimated；估算或样例数据 estimated=true。",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _presentation_normalize_designer_slide_patch(parsed: dict[str, Any], slide: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    source = parsed.get("slide_patch") if isinstance(parsed.get("slide_patch"), dict) else parsed
+    if not isinstance(source, dict):
+        return {}
+    title = _field_value(source.get("title")) or _field_value(slide.get("title"))
+    layout = _field_value(source.get("layout")) or _field_value(slide.get("layout")) or "two_column"
+    if layout not in _PRESENTATION_LAYOUTS:
+        layout = _presentation_infer_layout(title, _field_value(source.get("visual") or slide.get("visual")), index=_presentation_int(slide.get("index"), 1), use_case=_field_value(config.get("useCase")) or "report")
+    status = _field_value(source.get("status")) or _field_value(slide.get("status")) or "draft"
+    if status not in _PRESENTATION_STATUSES:
+        status = "draft"
+    patch: dict[str, Any] = {
+        "title": title[:120],
+        "headline": (_field_value(source.get("headline")) or _field_value(slide.get("headline")) or title)[:220],
+        "bullets": _presentation_list_strings(source.get("bullets") or slide.get("bullets"), limit=5),
+        "visual": (_field_value(source.get("visual")) or _field_value(slide.get("visual")) or "内容版式")[:180],
+        "layout": layout,
+        "speakerNotes": (_field_value(source.get("speakerNotes") or source.get("speaker_notes")) or _field_value(slide.get("speakerNotes")) or "")[:500],
+        "designIntent": (_field_value(source.get("designIntent") or source.get("design_intent")) or _field_value(slide.get("designIntent")) or "")[:280],
+        "renderHints": _presentation_list_strings(source.get("renderHints") or source.get("render_hints") or slide.get("renderHints"), limit=5),
+        "evidenceRole": (_field_value(source.get("evidenceRole") or source.get("evidence_role")) or _field_value(slide.get("evidenceRole")) or "")[:240],
+        "status": status,
+    }
+    visual_spec = _presentation_visual_spec(source.get("visualSpec") or source.get("visual_spec") or source.get("uiSpec"))
+    if visual_spec:
+        patch["visualSpec"] = visual_spec
+    if not patch["bullets"]:
+        patch["bullets"] = _presentation_list_strings(slide.get("bullets"), limit=5) or [patch["headline"]]
+    return patch
+
+
+def _presentation_designer_slide_action_fallback(action: str, slide: dict[str, Any]) -> dict[str, Any]:
+    title = _field_value(slide.get("title")) or "当前页面"
+    bullets = _presentation_list_strings(slide.get("bullets"), limit=5)
+    if action == "enhance_chart":
+        labels = [re.sub(r"^\d+[.、]?\s*", "", item).split("，")[0][:10] or f"指标{i + 1}" for i, item in enumerate(bullets[:4])]
+        return {
+            "layout": "metrics",
+            "visual": "图表 + 指标卡，展示本页关键证据",
+            "renderHints": ["chart=scorecard", "emphasis=关键指标"],
+            "visualSpec": {
+                "type": "scorecard",
+                "metrics": [{"label": label, "value": "待补", "detail": "请补充真实数据口径"} for label in labels or ["关键指标"]],
+            },
+            "evidenceRole": "需要补充真实指标、来源和口径。",
+            "status": "needs_source",
+        }
+    if action == "roadshow_style":
+        return {
+            "headline": _field_value(slide.get("headline")) or f"{title}需要转化为可投资、可落地的增长叙事",
+            "visual": _field_value(slide.get("visual")) or "机会感标题 + 差异化证据卡",
+            "renderHints": ["emphasis=差异化价值", "callout=下一步行动"],
+            "designIntent": "用路演语言强化机会、壁垒和行动号召，同时保留事实克制。",
+            "status": "draft",
+        }
+    return {
+        "title": title,
+        "headline": _field_value(slide.get("headline")) or f"围绕「{title}」给出清晰结论",
+        "bullets": bullets or ["先给出本页结论。", "补充关键证据或案例。", "说明下一步行动。"],
+        "speakerNotes": _field_value(slide.get("speakerNotes")) or "先讲结论，再讲证据，最后落到行动。",
+        "status": "draft",
+    }
+
+
+def _presentation_patch_changed_fields(slide: dict[str, Any], patch: dict[str, Any]) -> list[str]:
+    fields = ["title", "headline", "bullets", "visual", "layout", "speakerNotes", "designIntent", "renderHints", "visualSpec", "evidenceRole", "status"]
+    changed: list[str] = []
+    for field in fields:
+        if field in patch and json.dumps(slide.get(field), ensure_ascii=False, sort_keys=True) != json.dumps(patch.get(field), ensure_ascii=False, sort_keys=True):
+            changed.append(field)
+    return changed
+
+
+def _presentation_patch_diff_summary(slide: dict[str, Any], patch: dict[str, Any]) -> list[str]:
+    labels = {
+        "title": "标题",
+        "headline": "核心观点",
+        "bullets": "内容要点",
+        "visual": "视觉提示词",
+        "layout": "页面版式",
+        "speakerNotes": "演讲备注",
+        "designIntent": "设计意图",
+        "renderHints": "渲染提示词",
+        "visualSpec": "visualSpec",
+        "evidenceRole": "证据角色",
+        "status": "页面状态",
+    }
+    summary: list[str] = []
+    for field in _presentation_patch_changed_fields(slide, patch):
+        before = _field_value(slide.get(field))
+        after = _field_value(patch.get(field))
+        if field in {"bullets", "renderHints"}:
+            before = f"{len(slide.get(field) or [])} 项"
+            after = f"{len(patch.get(field) or [])} 项"
+        elif field == "visualSpec":
+            before = _field_value((slide.get("visualSpec") or {}).get("type")) if isinstance(slide.get("visualSpec"), dict) else "无"
+            after = _field_value((patch.get("visualSpec") or {}).get("type")) if isinstance(patch.get("visualSpec"), dict) else "无"
+        summary.append(f"{labels.get(field, field)}：{before or '空'} -> {after or '空'}")
+    return summary[:8]
+
+
+async def _presentation_designer_slide_action(
+    db: Session,
+    p: Principal,
+    *,
+    action: str,
+    instruction: str,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    slide: dict[str, Any],
+) -> tuple[dict[str, Any], str, list[str], str]:
+    parsed, warnings = await _presentation_call_json_agent(
+        db,
+        p,
+        system_message=_presentation_designer_action_system_message(),
+        prompt=_presentation_designer_action_prompt(action=action, instruction=instruction, config=config, plan=plan, slide=slide),
+        timeout=max(45.0, min(90.0, _presentation_agent_timeout_seconds() * 0.65)),
+        temperature=0.18 if action != "roadshow_style" else 0.24,
+        repair_task="repair_aippt_designer_slide_action_json",
+        repair_schema={
+            "slide_patch": {
+                "title": "string",
+                "headline": "string",
+                "bullets": ["string"],
+                "visual": "string",
+                "layout": "string",
+                "speakerNotes": "string",
+                "designIntent": "string",
+                "renderHints": ["string"],
+                "visualSpec": {"type": "string"},
+                "evidenceRole": "string",
+                "status": "draft",
+            },
+            "rationale": "string",
+            "warnings": ["string"],
+        },
+        repair_rules=[
+            "只返回当前页 slide_patch，不要返回完整 deck。",
+            "不要输出 Markdown 或代码围栏。",
+            "visualSpec 必须是对象。",
+        ],
+        repair_context={"action": action, "slide": {"id": slide.get("id"), "title": slide.get("title")}},
+    )
+    rationale = ""
+    if parsed:
+        patch = _presentation_normalize_designer_slide_patch(parsed, slide, config)
+        rationale = _field_value(parsed.get("rationale"))
+        extra_warnings = parsed.get("warnings")
+        if isinstance(extra_warnings, list):
+            warnings.extend(_field_value(item)[:240] for item in extra_warnings if _field_value(item))
+        if patch:
+            source = "hermes-repaired" if any("结构化修复" in item for item in warnings) else "hermes"
+            return patch, rationale or "Hermes 已生成当前页 schema 补丁。", warnings, source
+    fallback = _presentation_designer_slide_action_fallback(action, slide)
+    warnings.append("Hermes 未返回稳定补丁，已提供最小 schema 增强建议。")
+    return fallback, "已提供最小 schema 增强建议。", warnings, "fallback"
+
+
+def _presentation_stream_delta(event: dict[str, Any]) -> str:
+    data = event.get("data")
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, dict):
+        return ""
+    msg_obj = data.get("message") if isinstance(data.get("message"), dict) else {}
+    value = (
+        data.get("delta")
+        or data.get("content")
+        or data.get("text")
+        or data.get("output")
+        or data.get("final_response")
+        or data.get("raw")
+        or msg_obj.get("delta")
+        or msg_obj.get("content")
+        or ""
+    )
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+    if isinstance(value, dict):
+        text = value.get("text") or value.get("content") or ""
+        return text if isinstance(text, str) else ""
+    return value if isinstance(value, str) else ""
+
+
+def _presentation_json_lines_from_buffer(buffer: str, *, flush: bool = False) -> tuple[list[dict[str, Any]], str]:
+    clean = buffer.replace("```json", "").replace("```", "")
+    if flush:
+        lines = clean.splitlines()
+        rest = ""
+    else:
+        lines = clean.splitlines()
+        rest = ""
+        if clean and not clean.endswith(("\n", "\r")):
+            rest = lines.pop() if lines else clean
+    items: list[dict[str, Any]] = []
+    for line in lines:
+        text = line.strip()
+        if not text or text in {"[", "]", ","}:
+            continue
+        if text.startswith("data:"):
+            text = text[5:].strip()
+        if text.endswith(","):
+            text = text[:-1].strip()
+        if not text:
+            continue
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = _official_json_object_from_text(text)
+        if isinstance(parsed, dict):
+            items.append(parsed)
+    return items, rest
+
+
+def _presentation_stream_empty_plan(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": f"{config.get('topic') or 'AIPPT'} · 大纲生成中",
+        "sections": [],
+        "slides": [],
+        "knowledge": [],
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _presentation_stream_section_id(plan: dict[str, Any], title: str) -> str:
+    sections = plan.setdefault("sections", [])
+    for section in sections:
+        if _field_value(section.get("title")).lower() == title.lower():
+            return _field_value(section.get("id")) or "section-1"
+    sid = f"section-{len(sections) + 1}"
+    sections.append({
+        "id": sid,
+        "title": title[:80] or f"章节 {len(sections) + 1}",
+        "purpose": "承接演示叙事推进。",
+    })
+    return sid
+
+
+def _presentation_apply_stream_item(plan: dict[str, Any], item: dict[str, Any], config: dict[str, Any]) -> bool:
+    item_type = _field_value(item.get("type") or item.get("event") or item.get("kind")).lower()
+    if item_type == "meta":
+        title = _field_value(item.get("title"))
+        if title:
+            plan["title"] = title[:160]
+            return True
+        return False
+
+    if item_type == "section":
+        title = _field_value(item.get("title") or item.get("name"))
+        if not title:
+            return False
+        before = len(plan.get("sections") or [])
+        sid = _presentation_stream_section_id(plan, title[:80])
+        for section in plan.get("sections") or []:
+            if section.get("id") == sid:
+                purpose = _field_value(item.get("purpose") or item.get("summary"))
+                if purpose:
+                    section["purpose"] = purpose[:220]
+        return len(plan.get("sections") or []) != before or bool(item.get("purpose"))
+
+    if item_type == "knowledge":
+        title = _field_value(item.get("title") or item.get("name"))
+        if not title:
+            return False
+        knowledge = plan.setdefault("knowledge", [])
+        for row in knowledge:
+            if _field_value(row.get("title")).lower() == title.lower():
+                return False
+        status = _field_value(item.get("status")) or "assumption"
+        if status not in _PRESENTATION_KNOWLEDGE_STATUSES:
+            status = "assumption"
+        knowledge.append({
+            "id": f"k-{len(knowledge) + 1}",
+            "title": title[:80],
+            "source": (_field_value(item.get("source")) or "Agent 推断")[:80],
+            "detail": (_field_value(item.get("detail") or item.get("summary") or item.get("description")) or "需要进一步确认。")[:360],
+            "status": status,
+        })
+        return True
+
+    if item_type == "slide":
+        title = _field_value(item.get("title") or item.get("name"))
+        if not title:
+            return False
+        slides = plan.setdefault("slides", [])
+        for row in slides:
+            if _field_value(row.get("title")).lower() == title.lower():
+                return False
+        section_title = _field_value(item.get("section") or item.get("sectionTitle") or item.get("section_title")) or "主体内容"
+        section_id = _presentation_stream_section_id(plan, section_title[:80])
+        knowledge = plan.setdefault("knowledge", [])
+        if not knowledge:
+            for row in _presentation_knowledge(config)[:2]:
+                knowledge.append(row)
+        layout = _field_value(item.get("layout"))
+        if layout not in _PRESENTATION_LAYOUTS:
+            layout = _presentation_infer_layout(title, _field_value(item.get("visual") or item.get("visualSuggestion") or item.get("chart")), index=len(slides) + 1, use_case=_field_value(config.get("useCase")) or "report")
+        bullets = _presentation_list_strings(item.get("bullets") or item.get("points") or item.get("content"), limit=5)
+        if len(bullets) < 2:
+            bullets = _presentation_bullets(config, title, len(slides) + 1)
+        render_hints = _presentation_list_strings(
+            item.get("renderHints") or item.get("render_hints") or item.get("designHints") or item.get("design_hints"),
+            limit=4,
+        )
+        slides.append({
+            "id": f"slide-{len(slides) + 1}",
+            "sectionId": section_id,
+            "index": len(slides) + 1,
+            "title": title[:120],
+            "headline": (_field_value(item.get("headline") or item.get("subtitle") or item.get("summary")) or title)[:220],
+            "bullets": bullets,
+            "visual": (_field_value(item.get("visual") or item.get("visualSuggestion") or item.get("chart")) or "内容版式")[:160],
+            "layout": layout,
+            "knowledgeIds": [knowledge[0]["id"]] if knowledge else [],
+            "status": "draft",
+            "speakerNotes": (_field_value(item.get("speakerNotes") or item.get("speaker_notes") or item.get("notes")) or f"围绕「{title}」展开讲述。")[:360],
+            "designIntent": (_field_value(item.get("designIntent") or item.get("design_intent") or item.get("renderIntent") or item.get("render_intent")) or "")[:220],
+            "renderHints": render_hints,
+            "visualSpec": _presentation_visual_spec(item.get("visualSpec") or item.get("visual_spec") or item.get("uiSpec") or item.get("visual_specification")),
+            "evidenceRole": (_field_value(item.get("evidenceRole") or item.get("evidence_role") or item.get("evidence")) or "")[:180],
+        })
+        return True
+    return False
+
+
+def _strip_html_text(value: str) -> str:
+    text = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", value or "", flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", _html.unescape(text)).strip()
+
+
+def _presentation_web_search(query: str, *, limit: int = 5) -> list[dict[str, str]]:
+    q = re.sub(r"\s+", " ", (query or "").strip())[:300]
+    if not q:
+        return []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; OpenAtlasResearch/1.0)",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+    }
+    last_error: Exception | None = None
+    responded = False
+    try:
+        url = "https://lite.duckduckgo.com/lite/?" + urlencode({"q": q})
+        req = UrlRequest(url, headers=headers)
+        with urlopen(req, timeout=12) as resp:
+            page = resp.read().decode("utf-8", errors="ignore")
+        responded = True
+        rows = _presentation_filter_search_results(_presentation_parse_duckduckgo_results(page, limit=limit + 5), q, limit=limit)
+        if rows:
+            return rows
+    except Exception as exc:
+        last_error = exc
+
+    try:
+        url = "https://www.bing.com/search?" + urlencode({"q": q, "mkt": "zh-CN"})
+        req = UrlRequest(url, headers=headers)
+        with urlopen(req, timeout=12) as resp:
+            page = resp.read().decode("utf-8", errors="ignore")
+        responded = True
+        rows = _presentation_filter_search_results(_presentation_parse_bing_results(page, limit=limit + 5), q, limit=limit)
+        if rows:
+            return rows
+    except Exception as exc:
+        last_error = exc
+
+    if responded:
+        return []
+    if last_error:
+        raise last_error
+    return []
+
+
+def _presentation_parse_duckduckgo_results(page: str, *, limit: int = 5) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    blocks = re.split(r"<tr>|<div[^>]+class=[\"'][^\"']*result[^\"']*[\"'][^>]*>", page, flags=re.I)
+    pending: dict[str, str] | None = None
+    for block in blocks:
+        link_match = re.search(r"<a[^>]+(?:class=[\"'][^\"']*(?:result__a|result-link)[^\"']*[\"'][^>]*href=[\"']([^\"']+)[\"']|href=[\"']([^\"']+)[\"'][^>]*class=[\"'][^\"']*(?:result__a|result-link)[^\"']*[\"'])[^>]*>([\s\S]*?)</a>", block, flags=re.I)
+        if not link_match:
+            snippet_match = re.search(r"<(?:a|td|div)[^>]+class=[\"'][^\"']*(?:result__snippet|result-snippet)[^\"']*[\"'][^>]*>([\s\S]*?)</(?:a|td|div)>", block, flags=re.I)
+            if pending and snippet_match:
+                pending["snippet"] = _strip_html_text(snippet_match.group(1))[:300]
+                rows.append(pending)
+                pending = None
+                if len(rows) >= limit:
+                    break
+            continue
+        raw_url = _html.unescape(link_match.group(1) or link_match.group(2) or "")
+        parsed = urlparse(raw_url)
+        if parsed.netloc.endswith("duckduckgo.com"):
+            uddg = parse_qs(parsed.query).get("uddg", [""])[0]
+            if uddg:
+                raw_url = unquote(uddg)
+        if raw_url.startswith("//"):
+            raw_url = "https:" + raw_url
+        title = _strip_html_text(link_match.group(3))
+        snippet_match = re.search(r"<a[^>]+class=[\"'][^\"']*result__snippet[^\"']*[\"'][^>]*>([\s\S]*?)</a>|<div[^>]+class=[\"'][^\"']*result__snippet[^\"']*[\"'][^>]*>([\s\S]*?)</div>", block, flags=re.I)
+        snippet = _strip_html_text((snippet_match.group(1) or snippet_match.group(2)) if snippet_match else "")
+        if title and raw_url:
+            pending = {"title": title[:180], "url": raw_url[:500], "snippet": snippet[:300]}
+            if snippet:
+                rows.append(pending)
+                pending = None
+        if len(rows) >= limit:
+            break
+    if pending and len(rows) < limit:
+        rows.append(pending)
+    return rows
+
+
+def _presentation_parse_bing_results(page: str, *, limit: int = 5) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    blocks = re.findall(r"<li[^>]+class=[\"'][^\"']*b_algo[^\"']*[\"'][^>]*>[\s\S]*?</li>", page or "", flags=re.I)
+    for block in blocks:
+        link_match = re.search(r"<h2[^>]*>[\s\S]*?<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>([\s\S]*?)</a>[\s\S]*?</h2>", block, flags=re.I)
+        if not link_match:
+            continue
+        raw_url = _html.unescape(link_match.group(1) or "")
+        if not raw_url.startswith(("http://", "https://")):
+            continue
+        parsed = urlparse(raw_url)
+        if parsed.netloc.endswith("bing.com"):
+            continue
+        title = _strip_html_text(link_match.group(2))
+        snippet_match = re.search(r"<p[^>]*>([\s\S]*?)</p>", block, flags=re.I)
+        snippet = _strip_html_text(snippet_match.group(1) if snippet_match else "")
+        if title and raw_url:
+            rows.append({"title": title[:180], "url": raw_url[:500], "snippet": snippet[:300]})
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _presentation_search_terms(query: str) -> list[str]:
+    q = query or ""
+    terms: list[str] = []
+    terms.extend(re.findall(r"[A-Za-z][A-Za-z0-9+_.-]{1,}", q))
+    important_phrases = [
+        "OpenAtlas", "AI2UI", "A2UI", "AI Agent", "Agent", "CIO",
+        "公文写作", "AIPPT", "缺资料", "联网补充", "智能体", "数智员工",
+        "文档自动化", "办公自动化", "企业级", "大模型", "工作流", "交付闭环",
+        "市场数据", "行业趋势", "研究报告", "白皮书", "产品文档", "客户案例",
+    ]
+    for phrase in important_phrases:
+        if phrase.lower() in q.lower():
+            terms.append(phrase)
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,12}", q):
+        if chunk in {"研究任务", "可信资料", "返回可用于", "知识卡", "页面修改建议", "优先补充", "权威来源", "官方材料"}:
+            continue
+        if len(chunk) >= 4:
+            terms.append(chunk)
+    seen: set[str] = set()
+    result: list[str] = []
+    for term in terms:
+        key = term.lower()
+        if key not in seen:
+            result.append(term)
+            seen.add(key)
+    return result[:24]
+
+
+def _presentation_filter_search_results(rows: list[dict[str, str]], query: str, *, limit: int = 5) -> list[dict[str, str]]:
+    terms = _presentation_search_terms(query)
+    if not rows or not terms:
+        return rows[:limit]
+    generic_titles = ("企业 微信", "企查查", "国家 企业 信用信息", "爱企查", "天眼查", "AI 工具集官网")
+
+    def score(row: dict[str, str]) -> int:
+        text = f"{row.get('title', '')} {row.get('snippet', '')}".lower()
+        value = 0
+        for term in terms:
+            key = term.lower()
+            if not key or key not in text:
+                continue
+            if re.fullmatch(r"[A-Za-z0-9+_.-]+", term):
+                value += 3 if len(term) >= 4 else 1
+            elif len(term) >= 6:
+                value += 3
+            else:
+                value += 1
+        title = row.get("title", "")
+        if any(item in title for item in generic_titles) and value < 5:
+            value -= 4
+        return value
+
+    scored = [(score(row), row) for row in rows]
+    filtered = [row for value, row in scored if value >= 3]
+    filtered.sort(key=lambda row: score(row), reverse=True)
+    return filtered[:limit]
+
+
+def _presentation_research_context(config: dict[str, Any], knowledge: dict[str, Any], slide: dict[str, Any], raw_query: str) -> dict[str, Any]:
+    use_case = _field_value(config.get("useCase")) or "report"
+    layout = _field_value(slide.get("layout")) or "two_column"
+    return {
+        "deck": {
+            "topic": _field_value(config.get("topic")),
+            "useCase": _PRESENTATION_USE_CASES.get(use_case, use_case),
+            "audience": _field_value(config.get("audience")),
+            "styleKey": _field_value(config.get("styleKey")),
+            "density": _field_value(config.get("density")),
+            "chartLevel": _field_value(config.get("chartLevel")),
+        },
+        "slide": {
+            "index": _presentation_int(slide.get("index"), 1, minimum=1, maximum=80),
+            "title": _field_value(slide.get("title")),
+            "headline": _field_value(slide.get("headline")),
+            "layout": layout,
+            "visual": _field_value(slide.get("visual")),
+            "bullets": _presentation_list_strings(slide.get("bullets"), limit=5),
+            "designIntent": _field_value(slide.get("designIntent") or slide.get("design_intent")),
+            "renderHints": _presentation_list_strings(slide.get("renderHints") or slide.get("render_hints"), limit=4),
+            "evidenceRole": _field_value(slide.get("evidenceRole") or slide.get("evidence_role")),
+        },
+        "knowledge": {
+            "title": _field_value(knowledge.get("title")),
+            "source": _field_value(knowledge.get("source")),
+            "detail": _field_value(knowledge.get("detail")),
+            "status": _field_value(knowledge.get("status")),
+        },
+        "user_prompt": _field_value(raw_query)[:1000],
+        "research_goal": (
+            f"为「{_field_value(config.get('topic'))}」中第 {_presentation_int(slide.get('index'), 1, minimum=1, maximum=80)} 页"
+            f"「{_field_value(slide.get('title')) or _field_value(knowledge.get('title'))}」补充可信资料，"
+            f"服务于{_PRESENTATION_USE_CASES.get(use_case, use_case)}场景和{_field_value(config.get('audience')) or '目标受众'}。"
+        ),
+        "source_policy": [
+            "优先找权威网页、官方资料、产品文档、新闻稿、研究报告、可引用案例。",
+            "如果没有稳定数字，返回可引用观点和来源，不要编造数值。",
+            "输出应帮助当前页形成更可信的 bullets 和 speakerNotes。",
+        ],
+    }
+
+
+def _presentation_research_query(config: dict[str, Any], knowledge: dict[str, Any], slide: dict[str, Any], raw_query: str) -> str:
+    context = _presentation_research_context(config, knowledge, slide, raw_query)
+    slide_ctx = context["slide"]
+    knowledge_ctx = context["knowledge"]
+    raw = _field_value(raw_query)
+    original_need = ""
+    if raw:
+        match = re.search(r"用户原始需求[:：]\s*([\s\S]+)$", raw)
+        original_need = _field_value(match.group(1) if match else raw)
+        original_need = re.sub(r"^(研究任务|资料卡|当前说明|场景|受众|版式|视觉表达|页面主张)[:：].*$", "", original_need, flags=re.M).strip()
+
+    terms = [
+        knowledge_ctx.get("title"),
+        knowledge_ctx.get("detail"),
+        slide_ctx.get("evidenceRole"),
+        slide_ctx.get("title"),
+        slide_ctx.get("headline"),
+        slide_ctx.get("visual"),
+        context["deck"].get("topic"),
+        context["deck"].get("audience"),
+    ]
+    if original_need and len(" ".join(_field_value(term) for term in terms if term)) < 180:
+        terms.append(original_need[:120])
+    query_seed = " ".join(_field_value(term) for term in terms if _field_value(term))
+    source_terms = ["官方资料", "案例", "来源"]
+    if re.search(r"数据|市场|规模|趋势|效率|质量|ROI|成本|增长|份额|调研|研究", query_seed):
+        source_terms = ["研究报告", "白皮书", "数据", "案例"]
+    elif re.search(r"截图|界面|产品|功能|版本|上线|发布", query_seed):
+        source_terms = ["官方资料", "新闻稿", "产品文档", "案例"]
+    query = f"{query_seed} {' '.join(source_terms)}"
+    query = re.sub(r"\s+", " ", query).strip()
+    if not re.search(r"资料|案例|数据|来源|报告|新闻|官方|白皮书|产品文档", query):
+        query = f"{query} 资料 案例 来源"
+    return query[:300]
+
+
+def _presentation_research_agent_system_message() -> str:
+    return (
+        "你是 Atlas AIPPT Research Agent，负责把 WebSearch 结果转成 AIPPT 可用的知识卡和当前页修改建议。"
+        "你必须只返回一个合法 JSON 对象，禁止 Markdown、代码围栏、解释、注释。"
+        "只能引用 sources 中提供的 title、url、snippet，不允许引用外部常识、记忆或未列出的机构报告。"
+        "不要夸大来源，不要编造未在 sources 中出现的事实或数字。"
+        "如果来源不足或不相关，status 必须是 missing 或 assumption，并把 warning 写清楚。"
+    )
+
+
+def _presentation_research_agent_prompt(context: dict[str, Any], sources: list[dict[str, str]]) -> str:
+    payload = {
+        "task": "synthesize_research_for_presentation_slide",
+        "context": context,
+        "sources": sources[:5],
+        "target_schema": {
+            "knowledge": {
+                "title": "string",
+                "source": "WebSearch + Hermes",
+                "detail": "string, include concise source-backed summary and citation names",
+                "status": "ready|missing|assumption",
+            },
+            "slide_patch": {
+                "status": "draft|needs_source",
+                "bullets": ["string"],
+                "speakerNotes": "string",
+            },
+            "source_notes": [{"title": "string", "url": "string", "usage": "string"}],
+            "warnings": ["string"],
+        },
+        "rules": [
+            "只能使用 sources 数组中的信息；source_notes.url 必须来自 sources.url。",
+            "如果你想引用 Forrester、Gartner、IDC、信通院、政府网站或厂商材料，但它们不在 sources 中，不能写成事实，只能写入 warnings 作为待补来源。",
+            "knowledge.detail 要能被用户直接审阅，保留来源名称或链接线索。",
+            "slide_patch.bullets 只能基于 sources 做轻量增强，保留原页叙事，不要重写成另一页。",
+            "如果当前页是 compare/metrics/process/timeline/diagram/checklist，要让 bullets 更贴合该版式。",
+            "来源不足时 status 用 missing 或 assumption，并说明还缺什么。",
+            "最终只输出 JSON 对象。",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _presentation_filter_source_notes(source_notes: Any, sources: list[dict[str, str]]) -> list[dict[str, str]]:
+    if not isinstance(source_notes, list) or not sources:
+        return []
+    allowed_urls = {_field_value(item.get("url")) for item in sources if _field_value(item.get("url"))}
+    allowed_titles = {_field_value(item.get("title")) for item in sources if _field_value(item.get("title"))}
+    notes: list[dict[str, str]] = []
+    for note in source_notes:
+        if not isinstance(note, dict):
+            continue
+        url = _field_value(note.get("url"))
+        title = _field_value(note.get("title"))
+        if url and url in allowed_urls:
+            notes.append({
+                "title": title or next((_field_value(item.get("title")) for item in sources if _field_value(item.get("url")) == url), "来源"),
+                "url": url,
+                "usage": _field_value(note.get("usage"))[:240],
+            })
+            continue
+        if title and any(title == allowed or (len(title) >= 6 and title in allowed) or (len(allowed) >= 6 and allowed in title) for allowed in allowed_titles):
+            matched = next((item for item in sources if title == _field_value(item.get("title")) or title in _field_value(item.get("title")) or _field_value(item.get("title")) in title), {})
+            notes.append({
+                "title": title,
+                "url": _field_value(matched.get("url")) or url,
+                "usage": _field_value(note.get("usage"))[:240],
+            })
+    return notes[:5]
+
+
+async def _presentation_agent_research_payload(
+    db: Session,
+    p: Principal,
+    *,
+    config: dict[str, Any],
+    knowledge: dict[str, Any],
+    slide: dict[str, Any],
+    sources: list[dict[str, str]],
+    warnings: list[str],
+    raw_query: str,
+) -> dict[str, Any] | None:
+    if not sources or not _presentation_agent_enabled():
+        return None
+    context = _presentation_research_context(config, knowledge, slide, raw_query)
+    prompt = _presentation_research_agent_prompt(context, sources)
+    try:
+        target = await hermes_client.resolve_target(db, p.tenant.id)
+        completion = await hermes_client.create_chat_completion(
+            target,
+            messages=[
+                {"role": "system", "content": _presentation_research_agent_system_message()},
+                {"role": "user", "content": prompt},
+            ],
+            model="hermes-agent",
+            temperature=0.1,
+            timeout=max(60.0, min(120.0, _presentation_agent_timeout_seconds())),
+        )
+        text = _official_chat_completion_text(completion)
+    except Exception as exc:
+        warnings.append(f"Hermes 资料归纳失败：{exc.__class__.__name__}")
+        return None
+    parsed = _official_json_object_from_text(text)
+    if not parsed:
+        warnings.append("Hermes 资料归纳未返回可解析 JSON。")
+        return None
+
+    payload = _presentation_research_payload(config, knowledge, slide, sources, warnings)
+    knowledge_patch = parsed.get("knowledge") if isinstance(parsed.get("knowledge"), dict) else {}
+    if knowledge_patch:
+        status = _field_value(knowledge_patch.get("status")) or payload["knowledge"]["status"]
+        if status not in _PRESENTATION_KNOWLEDGE_STATUSES:
+            status = payload["knowledge"]["status"]
+        payload["knowledge"] = {
+            **payload["knowledge"],
+            "title": (_field_value(knowledge_patch.get("title")) or payload["knowledge"]["title"])[:80],
+            "source": (_field_value(knowledge_patch.get("source")) or "WebSearch + Hermes")[:80],
+            "detail": (_field_value(knowledge_patch.get("detail")) or payload["knowledge"]["detail"])[:1200],
+            "status": status,
+        }
+
+    slide_patch = parsed.get("slide_patch") if isinstance(parsed.get("slide_patch"), dict) else {}
+    if slide_patch:
+        bullets = _presentation_list_strings(slide_patch.get("bullets"), limit=5)
+        status = _field_value(slide_patch.get("status")) or payload["slide_patch"]["status"]
+        if status not in _PRESENTATION_STATUSES:
+            status = payload["slide_patch"]["status"]
+        payload["slide_patch"] = {
+            **payload["slide_patch"],
+            "status": status,
+            "bullets": bullets or payload["slide_patch"]["bullets"],
+            "speakerNotes": (_field_value(slide_patch.get("speakerNotes") or slide_patch.get("speaker_notes")) or payload["slide_patch"]["speakerNotes"])[:500],
+        }
+
+    source_notes = parsed.get("source_notes")
+    filtered_notes = _presentation_filter_source_notes(source_notes, sources)
+    if filtered_notes:
+        payload["source_notes"] = filtered_notes
+    elif isinstance(source_notes, list) and source_notes:
+        warnings.append("Hermes 资料归纳引用了 sources 之外的来源，已降级为待补充。")
+        payload["knowledge"] = {
+            **payload["knowledge"],
+            "status": "missing",
+            "detail": (
+                f"{_field_value(knowledge.get('detail')) or '当前资料仍需补充。'}"
+                "（联网结果未提供足够可核验来源，已拒绝使用未出现在 sources 中的引用。）"
+            )[:1200],
+        }
+        payload["slide_patch"] = {**payload["slide_patch"], "status": "needs_source"}
+    extra_warnings = _presentation_list_strings(parsed.get("warnings"), limit=4)
+    if extra_warnings:
+        payload["warnings"] = list(dict.fromkeys([*warnings, *extra_warnings]))[:8]
+    return payload
+
+
+def _presentation_research_payload(
+    config: dict[str, Any],
+    knowledge: dict[str, Any],
+    slide: dict[str, Any],
+    sources: list[dict[str, str]],
+    warnings: list[str],
+) -> dict[str, Any]:
+    current_detail = _field_value(knowledge.get("detail")) or "需要进一步补充资料。"
+    if sources:
+        source_lines = [f"{idx}. {item['title']}：{item.get('snippet') or item.get('url')}" for idx, item in enumerate(sources[:3], start=1)]
+        detail = "联网检索摘要：" + " ".join(source_lines)
+        source_name = "WebSearch"
+        status = "ready"
+    else:
+        detail = f"{current_detail}（暂未检索到稳定来源，请人工补充或稍后重试。）"
+        source_name = _field_value(knowledge.get("source")) or "待补充"
+        status = "missing"
+    bullets = _presentation_list_strings(slide.get("bullets"), limit=5)
+    if sources:
+        evidence_bullet = f"可引用外部资料：{sources[0]['title']}。"
+        if evidence_bullet not in bullets:
+            bullets = (bullets + [evidence_bullet])[:5]
+    return {
+        "knowledge": {
+            "id": _field_value(knowledge.get("id")) or f"k-{_uuid.uuid4().hex[:8]}",
+            "title": _field_value(knowledge.get("title")) or "联网补充资料",
+            "source": source_name,
+            "detail": detail[:900],
+            "status": status,
+        },
+        "slide_patch": {
+            "status": "draft" if sources else "needs_source",
+            "bullets": bullets or _presentation_bullets(config, _field_value(slide.get("title")) or "资料补充", _presentation_int(slide.get("index"), 1, minimum=1, maximum=80)),
+            "speakerNotes": (
+                (_field_value(slide.get("speakerNotes")) or "")
+                + (" 可在本页讲述时引用右侧知识依赖中的联网来源。" if sources else " 本页仍缺少可引用来源，建议补充权威资料。")
+            ).strip()[:500],
+        },
+        "sources": sources,
+        "warnings": warnings,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _presentation_agent_plan_stream(
+    db: Session,
+    p: Principal,
+    *,
+    query: str,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any], list[str], str]:
+    warnings: list[str] = []
+    if not _presentation_agent_enabled():
+        return None, config, ["Presentation Agent 已被环境变量关闭。"], "hermes-disabled"
+    target = await hermes_client.resolve_target(db, p.tenant.id)
+    session = await hermes_client.create_session(target, title=f"AIPPT流式生成-{_uuid.uuid4().hex[:8]}")
+    session_id = _official_hermes_session_id(session)
+    if not session_id:
+        return None, config, ["Hermes 未返回可用 session_id。"], "hermes-error"
+    system_message = _presentation_stream_system_message()
+    prompt = _presentation_stream_prompt(query=query, config=config)
+    plan = _presentation_stream_empty_plan(config)
+    raw_parts: list[str] = []
+    buffer = ""
+    timeout_seconds = _presentation_agent_timeout_seconds()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    try:
+        stream = hermes_client.stream_chat(
+            target,
+            session_id,
+            message=prompt,
+            system_message=system_message,
+        )
+        agen = stream.__aiter__()
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    warnings.append("Hermes 流式生成超时，已保留已生成内容。")
+                    break
+                try:
+                    ev = await asyncio.wait_for(agen.__anext__(), timeout=min(remaining, 10.0))
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    warnings.append("Hermes 流式生成等待超时。")
+                    break
+                if ev.get("event") == "error":
+                    warnings.append("Hermes 流式生成返回 error 事件。")
+                    break
+                delta = _presentation_stream_delta(ev)
+                if not delta:
+                    continue
+                raw_parts.append(delta)
+                buffer += delta
+                items, buffer = _presentation_json_lines_from_buffer(buffer)
+                for item in items:
+                    _presentation_apply_stream_item(plan, item, config)
+        finally:
+            try:
+                await agen.aclose()
+            except Exception:
+                pass
+    except Exception as exc:
+        warnings.append(f"Hermes 流式生成失败：{exc.__class__.__name__}")
+
+    items, buffer = _presentation_json_lines_from_buffer(buffer, flush=True)
+    for item in items:
+        _presentation_apply_stream_item(plan, item, config)
+
+    min_slides = max(8, _presentation_int(config.get("pageCount"), 8, minimum=8, maximum=40))
+    if len(plan.get("slides") or []) >= min_slides:
+        if not plan.get("knowledge"):
+            plan["knowledge"] = _presentation_knowledge(config)
+        return plan, config, warnings, "hermes-stream"
+
+    raw_text = "".join(raw_parts).strip()
+    parsed = _official_json_object_from_text(raw_text)
+    if parsed:
+        normalized = _presentation_normalize_agent_plan(parsed, config)
+        if normalized:
+            next_config, normalized_plan = normalized
+            return normalized_plan, next_config, warnings, "hermes"
+
+    if plan.get("slides"):
+        generated_count = len(plan.get("slides") or [])
+        warnings.append(f"Hermes 只流式生成 {generated_count}/{min_slides} 页，已保留真实草案，没有生成替代草案。")
+        return plan, config, warnings, "hermes-stream-partial"
+    else:
+        warnings.append("Hermes 未流式输出可解析画布内容。")
+    return None, config, warnings, "hermes-error"
+
+
+async def _official_agent_intent_fields(
+    db: Session,
+    p: Principal,
+    *,
+    query: str,
+) -> dict[str, Any] | None:
+    if not _official_agent_enabled():
+        return None
+    try:
+        system_message = _official_intent_agent_system_message()
+        prompt = _official_intent_agent_prompt(query=query, tenant_name=p.tenant.name)
+        text = ""
+        try:
+            target = await hermes_client.resolve_target(db, p.tenant.id)
+            completion = await hermes_client.create_chat_completion(
+                target,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": prompt},
+                ],
+                model="hermes-agent",
+                temperature=0,
+                timeout=max(20.0, _official_agent_timeout_seconds() + 12.0),
+            )
+            text = _official_chat_completion_text(completion)
+        except Exception:
+            text = await _official_collect_agent_text(
+                db,
+                p,
+                prompt=prompt,
+                title="公文字段识别",
+                system_message=system_message,
+            )
+        parsed = _official_json_object_from_text(text)
+        if not parsed and text:
+            repair_prompt = _official_intent_json_repair_prompt(text)
+            try:
+                target = await hermes_client.resolve_target(db, p.tenant.id)
+                repair_completion = await hermes_client.create_chat_completion(
+                    target,
+                    messages=[
+                        {"role": "system", "content": system_message},
+                        {"role": "user", "content": repair_prompt},
+                    ],
+                    model="hermes-agent",
+                    temperature=0,
+                    timeout=max(20.0, _official_agent_timeout_seconds() + 12.0),
+                )
+                repair_text = _official_chat_completion_text(repair_completion)
+            except Exception:
+                repair_text = await _official_collect_agent_text(
+                    db,
+                    p,
+                    prompt=repair_prompt,
+                    title="公文字段识别JSON修复",
+                    system_message=system_message,
+                )
+            parsed = _official_json_object_from_text(repair_text)
+        if not parsed:
+            return None
+        doc_type = str(parsed.get("doc_type") or "").strip()
+        forced_publicity_doc_type = _official_publicity_doc_type_from_query(query)
+        if forced_publicity_doc_type:
+            doc_type = forced_publicity_doc_type
+        elif doc_type not in _OFFICIAL_DOC_TYPES:
+            doc_type = _official_doc_type_from_query(query)
+        patch = parsed.get("fields_patch")
+        if not isinstance(patch, dict):
+            patch = {}
+        safe_patch = {str(k): v for k, v in patch.items() if str(k).strip() and not str(k).startswith("__")}
+        if parsed.get("scenario") and not safe_patch.get("scenario"):
+            safe_patch["scenario"] = str(parsed.get("scenario") or "").strip()
+        for key in ("writing_intent", "channel", "audience"):
+            value = _field_value(parsed.get(key))
+            if value and not _field_value(safe_patch.get(key)):
+                safe_patch[key] = value
+        missing = parsed.get("missing")
+        safe_missing = [str(item).strip() for item in missing if str(item).strip()] if isinstance(missing, list) else []
+        return {
+            "doc_type": doc_type,
+            "confidence": parsed.get("confidence"),
+            "scenario": str(parsed.get("scenario") or "").strip(),
+            "summary": _field_value(parsed.get("summary"))[:240],
+            "fields_patch": safe_patch,
+            "evidence": parsed.get("evidence") if isinstance(parsed.get("evidence"), list) else [],
+            "missing": safe_missing[:12],
+        }
+    except Exception:
+        return None
+
+
+def _official_agent_prompt(
+    *,
+    mode: str,
+    doc_type: str,
+    template_key: str,
+    fields: dict[str, Any],
+    query: str = "",
+    instruction: str = "",
+    previous_text: str = "",
+) -> str:
+    meta = _official_doc_meta(doc_type)
+    previous_doc_type = _field_value(fields.get("__previous_doc_type"))
+    doc_type_changed = bool(previous_doc_type and previous_doc_type != doc_type)
+    type_guidance = {
+        "notice": "通知应交代背景、事项、执行要求和时间安排，语气明确，可分条列项。",
+        "request": "请示应一文一事，说明背景、依据、拟办事项和请示事项，结尾应体现请示审批语气。",
+        "report": "报告应重在情况、进展、成效、问题和下一步安排，不向上级提出审批请求。",
+        "letter": "函应开门见山，说明来意、事项、协作需求和回复要求，语气平实得体。",
+        "publicity_article": "宣传稿应突出事件事实、能力亮点、场景价值和传播口径；外宣稿要面向外部读者，避免写成内部通知。",
+        "intranet_news": "内网新闻宣传稿应有新闻感，突出事实、亮点、行动和价值，避免夸张口号。",
+        "wechat_article": "微信公众号应有清晰导语、小节节奏和传播表达，但仍需保持事实稳健。",
+    }
+    payload = {
+        "mode": mode,
+        "doc_type": doc_type,
+        "doc_type_label": meta["label"],
+        "group": meta["group"],
+        "template_key": template_key,
+        "user_query": query,
+        "revision_instruction": instruction,
+        "revision_context": {
+            "doc_type_changed": doc_type_changed,
+            "previous_doc_type": previous_doc_type,
+            "target_doc_type": doc_type,
+        },
+        "fields": {k: v for k, v in fields.items() if not str(k).startswith("__")},
+        "previous_draft": previous_text[:6000],
+        "output_contract": {
+            "title": "string, 12-80 个中文字符，不能空",
+            "paragraphs": "array<string>, 3-8 个完整正文段落，不能只给提纲，不能包含标题/落款/日期",
+            "summary": "string, 说明本次生成或修改的重点，30 字以内",
+            "fields_patch": "object, 仅回填从 query 或上下文中可靠提取的字段",
+        },
+        "writing_rules": {
+            "general": [
+                "输出完整初稿正文，不是模板说明，也不是待填占位符。",
+                "语言符合党政机关/企业正式文书习惯，避免口语化。",
+                "可使用“一、二、三”等段内结构，但每个数组元素必须是可直接渲染的正文段落。",
+                "不要编造具体数字、人名、政策文件号、会议名；缺失信息使用稳健泛化表达。",
+                "不要使用“请补充”“待完善”“此处填写”“[占位]”等提示语。",
+            ],
+            "type_specific": type_guidance.get(doc_type, ""),
+            "revision": [
+                "mode=revise 时保留 previous_draft 中未被修改指令影响的事实和结构。",
+                "如果 revision_instruction 要求改成公众号、推文、宣传稿、外宣稿、新闻稿、通知、请示、报告或函，必须按 target_doc_type 重新组织完整初稿，而不是沿用原文种结构。",
+                "revision_instruction 是最高优先级，但不能破坏文种规范。",
+                "修改后仍返回完整初稿 paragraphs，不要只返回差异。",
+            ],
+        },
+        "json_example": {
+            "title": "关于开展安全生产专项检查工作的通知",
+            "paragraphs": [
+                "为进一步压实安全生产责任，排查整治重点领域风险隐患，现就开展安全生产专项检查工作有关事项通知如下。",
+                "一、检查范围。各部门要围绕办公区域、生产现场、设备设施、消防通道和应急物资等重点环节开展自查，全面梳理风险点和薄弱项。",
+                "二、工作要求。请各部门明确责任人和完成时限，形成问题清单、整改措施和闭环记录，确保检查工作取得实效。",
+            ],
+            "summary": "已生成通知初稿",
+            "fields_patch": {"tone": "正式稳健"},
+        },
+    }
+    return (
+        "任务：根据以下上下文生成或修改公文完整初稿，并稳定输出供 A2UI 渲染器消费的 JSON。\n"
+        "硬性要求：最终回复必须只包含一个 JSON 对象，不能包含 Markdown、解释文本或代码围栏。\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _official_agent_json_repair_prompt(raw_text: str) -> str:
+    payload = {
+        "task": "repair_to_json",
+        "target_schema": {
+            "title": "string",
+            "paragraphs": ["string"],
+            "summary": "string",
+            "fields_patch": {},
+        },
+        "rules": [
+            "只返回一个合法 JSON 对象。",
+            "不得输出 Markdown、代码围栏、解释、注释。",
+            "保留原文中的标题、正文段落和版本说明。",
+            "paragraphs 至少 3 段；不要包含标题、落款、日期。",
+            "无法可靠提取的 fields_patch 置为空对象。",
+        ],
+        "raw_model_output": raw_text[:8000],
+    }
+    return (
+        "你刚才的输出不能被 JSON 解析器稳定解析。请把 raw_model_output 修复为指定 schema。\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+async def _official_agent_draft_fields(
+    db: Session,
+    p: Principal,
+    *,
+    doc_type: str,
+    template_key: str,
+    fields: dict[str, Any],
+    query: str = "",
+    instruction: str = "",
+    previous_text: str = "",
+) -> tuple[dict[str, Any], str] | None:
+    try:
+        system_message = _official_agent_system_message()
+        prompt = _official_agent_prompt(
+            mode="revise" if instruction else "create",
+            doc_type=doc_type,
+            template_key=template_key,
+            fields=fields,
+            query=query,
+            instruction=instruction,
+            previous_text=previous_text,
+        )
+        text = ""
+        try:
+            target = await hermes_client.resolve_target(db, p.tenant.id)
+            completion = await hermes_client.create_chat_completion(
+                target,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": prompt},
+                ],
+                model="hermes-agent",
+                temperature=0,
+                timeout=max(45.0, _official_agent_timeout_seconds() + 20.0),
+            )
+            text = _official_chat_completion_text(completion)
+        except Exception:
+            text = await _official_collect_agent_text(
+                db,
+                p,
+                prompt=prompt,
+                title=_field_value(fields.get("title")) or "公文写作",
+                system_message=system_message,
+            )
+        parsed = _official_json_object_from_text(text)
+        if not parsed and text:
+            repair_prompt = _official_agent_json_repair_prompt(text)
+            try:
+                target = await hermes_client.resolve_target(db, p.tenant.id)
+                repair_completion = await hermes_client.create_chat_completion(
+                    target,
+                    messages=[
+                        {"role": "system", "content": system_message},
+                        {"role": "user", "content": repair_prompt},
+                    ],
+                    model="hermes-agent",
+                    temperature=0,
+                    timeout=max(35.0, _official_agent_timeout_seconds() + 15.0),
+                )
+                repair_text = _official_chat_completion_text(repair_completion)
+            except Exception:
+                repair_text = await _official_collect_agent_text(
+                    db,
+                    p,
+                    prompt=repair_prompt,
+                    title="公文JSON修复",
+                    system_message=system_message,
+                )
+            parsed = _official_json_object_from_text(repair_text)
+        if not parsed:
+            return None
+        paragraphs = _official_clean_agent_paragraphs(parsed.get("paragraphs"))
+        if len(paragraphs) < 2:
+            return None
+        next_fields = dict(fields)
+        patch = parsed.get("fields_patch")
+        if isinstance(patch, dict):
+            next_fields.update({str(k): v for k, v in patch.items() if not str(k).startswith("__")})
+        title = _field_value(parsed.get("title"))
+        if title:
+            next_fields["title"] = _official_normalize_title_for_doc_type(doc_type, title, next_fields, query=query)[:160]
+        next_fields["__draft_paragraphs"] = paragraphs
+        next_fields["__draft_source"] = "agent"
+        if instruction:
+            next_fields["__last_revision_instruction"] = instruction[:500]
+        summary = _field_value(parsed.get("summary")) or ("Agent 已修改初稿" if instruction else "Agent 已生成完整初稿")
+        return next_fields, summary[:500]
+    except Exception:
+        return None
+
+
+def _official_body_from_existing_text(text: str, fields: dict[str, Any]) -> list[str]:
+    title = _field_value(fields.get("title"))
+    issuer = _field_value(fields.get("issuer"))
+    rows: list[str] = []
+    for raw in re.split(r"[\r\n]+", text or ""):
+        line = raw.strip()
+        if not line:
+            continue
+        if title and line == title:
+            continue
+        if issuer and line == issuer:
+            continue
+        if re.fullmatch(r"\d{4}年\d{1,2}月\d{1,2}日", line):
+            continue
+        if line.endswith("：") and len(line) <= 40:
+            continue
+        if line.startswith("来源：") or line.startswith("发布对象："):
+            continue
+        rows.append(line)
+    return rows
+
+
+def _official_strip_runtime_draft_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    blocked = {
+        "__draft_paragraphs",
+        "__draft_source",
+        "__last_revision_instruction",
+        "__previous_doc_type",
+        "__revision_template_changed",
+    }
+    return {k: v for k, v in fields.items() if k not in blocked}
+
+
+def _official_instruction_field_patch(instruction: str, doc_type: str) -> dict[str, Any]:
+    ins = _official_clean_user_query(instruction)
+    patch: dict[str, Any] = {}
+    company = _extract_after_markers(
+        ins,
+        (
+            "公司名称修改为",
+            "公司名称改为",
+            "公司改成",
+            "公司改为",
+            "公司用",
+            "单位名称修改为",
+            "单位名称改为",
+            "单位改成",
+            "单位改为",
+        ),
+        50,
+    )
+    source = _extract_after_markers(
+        ins,
+        (
+            "最后的来源改成",
+            "最后来源改成",
+            "来源修改为",
+            "来源改为",
+            "来源改成",
+            "来源设为",
+            "发布单位修改为",
+            "发布单位改为",
+            "发布单位改成",
+        ),
+        50,
+    )
+    issuer = source or company
+    if issuer:
+        issuer = re.sub(r"^(为|成|：|:)", "", issuer).strip(" ：:，。,。；;")
+        if issuer:
+            patch["issuer"] = issuer
+            patch["company_name"] = issuer
+    if doc_type == "wechat_article":
+        patch.update({
+            "channel": "微信公众号",
+            "audience": patch.get("audience") or "关注 OpenAtlas 的读者",
+            "style": "正式清爽，兼具传播感",
+            "outline": "开篇导语；能力亮点；场景价值；使用建议；结尾号召",
+        })
+    elif doc_type == "intranet_news":
+        patch["channel"] = "公司内网"
+        patch["style"] = patch.get("style") or "正式稳健"
+    elif doc_type == "publicity_article":
+        patch["channel"] = patch.get("channel") or "对外宣传"
+        patch["audience"] = patch.get("audience") or "公众、客户或外部合作伙伴"
+        patch["style"] = patch.get("style") or "正式清晰，兼具传播感"
+    return patch
+
+
+def _official_heuristic_revision_paragraphs(
+    *,
+    doc_type: str,
+    fields: dict[str, Any],
+    instruction: str,
+    previous_text: str,
+) -> list[str]:
+    stripped_fields = _official_strip_runtime_draft_fields(fields)
+    ins = _official_clean_user_query(instruction)
+    if any(word in ins for word in ("微信公众号", "公众号", "微信文章", "微信推文", "推文")) or fields.get("__previous_doc_type"):
+        return _official_body_paragraphs(doc_type, stripped_fields)[:12]
+    rows = _official_body_from_existing_text(previous_text, stripped_fields) or _official_body_paragraphs(doc_type, stripped_fields)
+    if any(word in ins for word in ("精简", "简短", "压缩")) and len(rows) > 4:
+        rows = rows[:3] + [rows[-1]]
+    replacement_name = _field_value(fields.get("company_name") or fields.get("issuer"))
+    if replacement_name and any(word in ins for word in ("公司", "单位")) and not any(word in ins for word in ("来源", "发布单位")):
+        rows = [
+            row if replacement_name in row else row.replace("全体员工", f"{replacement_name}全体员工").replace("公司", replacement_name).replace("本单位", replacement_name)
+            for row in rows
+        ]
+    if any(word in ins for word in ("正式", "严肃", "规范")):
+        rows = [
+            row.replace("我们想和", "现就相关事项与")
+               .replace("聊聊", "说明")
+               .replace("欢迎持续关注", "请持续关注相关工作进展")
+            for row in rows
+        ]
+    if "三条" in ins or "3条" in ins or "三项" in ins:
+        insert_at = max(1, min(len(rows), len(rows) - 1))
+        additions = [
+            "一是压实主体责任。各相关单位应明确责任人和时间节点，确保任务有人抓、过程有人管、结果有人验。",
+            "二是加强过程跟踪。建立工作台账，及时记录推进情况、问题清单和整改结果，形成闭环管理。",
+            "三是强化协同反馈。涉及跨部门事项的，应主动沟通、及时反馈，确保工作衔接顺畅、执行到位。",
+        ]
+        rows = rows[:insert_at] + additions + rows[insert_at:]
+    if any(word in ins for word in ("补充", "增加", "加入")) and not ("三条" in ins or "3条" in ins or "三项" in ins):
+        rows.insert(max(1, len(rows) - 1), f"根据修改意见，补充说明如下：{ins[:180]}。相关内容将纳入后续执行和审阅重点。")
+    return rows[:12]
+
+
+async def _official_prepare_draft_fields(
+    db: Session,
+    p: Principal,
+    *,
+    doc_type: str,
+    template_key: str,
+    fields: dict[str, Any],
+    query: str = "",
+    instruction: str = "",
+    previous_text: str = "",
+) -> tuple[dict[str, Any], str]:
+    agent_result = await _official_agent_draft_fields(
+        db,
+        p,
+        doc_type=doc_type,
+        template_key=template_key,
+        fields=fields,
+        query=query,
+        instruction=instruction,
+        previous_text=previous_text,
+    )
+    if agent_result:
+        return agent_result
+
+    fallback_fields = dict(fields)
+    fallback_fields["__draft_source"] = "rule"
+    if instruction:
+        fallback_fields["__draft_paragraphs"] = _official_heuristic_revision_paragraphs(
+            doc_type=doc_type,
+            fields=fields,
+            instruction=instruction,
+            previous_text=previous_text,
+        )
+        fallback_fields["__last_revision_instruction"] = instruction[:500]
+        return fallback_fields, "已根据修改意见生成新版本（规则兜底）"
+    fallback_fields["__draft_paragraphs"] = _official_body_paragraphs(doc_type, fields)
+    return fallback_fields, "已生成完整初稿（规则兜底）"
+
+
+def _create_official_docx(target_path: Path, doc_type: str, fields: dict[str, Any]) -> tuple[str, int]:
+    try:
+        from docx import Document  # type: ignore
+        from docx.shared import Mm, Pt  # type: ignore
+        from docx.oxml.ns import qn  # type: ignore
+    except Exception as exc:
+        raise HTTPException(500, f"python-docx unavailable: {exc}")
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = Document()
+    section = doc.sections[0]
+    section.page_width = Mm(210)
+    section.page_height = Mm(297)
+    section.top_margin = Mm(37)
+    section.bottom_margin = Mm(35)
+    section.left_margin = Mm(28)
+    section.right_margin = Mm(26)
+    try:
+        style = doc.styles["Normal"]
+        style.font.name = "仿宋_GB2312"
+        style.font.size = Pt(16)
+        style._element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋_GB2312")
+    except Exception:
+        pass
+
+    meta = _official_doc_meta(doc_type)
+    title = _field_value(fields.get("title")) or _official_title_for(doc_type, "未命名事项")
+    issuer = _field_value(fields.get("issuer")) or "本单位"
+    recipient = _field_value(fields.get("recipient"))
+    generated_date = datetime.now(timezone.utc).astimezone().strftime("%Y年%m月%d日")
+
+    _add_docx_paragraph(doc, title, bold=True, align="center", size_pt=22)
+    if meta["group"] == "official" and recipient:
+        _add_docx_paragraph(doc, f"{recipient}：", align="left", size_pt=16)
+    elif meta["group"] == "publicity":
+        channel = _field_value(fields.get("channel") or fields.get("audience"))
+        if channel:
+            _add_docx_paragraph(doc, f"发布对象：{channel}", align="center", size_pt=12)
+
+    for paragraph in _official_body_paragraphs(doc_type, fields):
+        _add_docx_paragraph(doc, paragraph, align="left", size_pt=16 if meta["group"] == "official" else 14)
+
+    if meta["group"] == "official":
+        _add_docx_paragraph(doc, issuer, align="right", size_pt=16)
+        _add_docx_paragraph(doc, generated_date, align="right", size_pt=16)
+    else:
+        _add_docx_paragraph(doc, f"来源：{issuer}", align="right", size_pt=12)
+        _add_docx_paragraph(doc, generated_date, align="right", size_pt=12)
+
+    doc.save(str(target_path))
+    extracted = _extract_text_from_file(str(target_path), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    return extracted, target_path.stat().st_size
+
+
+def _official_version_to_dict(row: OfficialDocumentVersion) -> dict:
+    return {
+        "id": row.id,
+        "document_id": row.document_id,
+        "version_no": row.version_no,
+        "kind": row.kind,
+        "name": row.name,
+        "mime_type": row.mime_type,
+        "size": row.size,
+        "extracted_chars": len(row.extracted_text or ""),
+        "change_summary": row.change_summary,
+        "preview_url": f"/api/official-documents/versions/{quote(row.id)}/preview",
+        "download_url": f"/api/official-documents/versions/{quote(row.id)}/download",
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _official_document_a2ui_payload(
+    row: OfficialDocument,
+    *,
+    fields: dict[str, Any],
+    compliance: list[Any],
+    versions: list[OfficialDocumentVersion],
+) -> dict[str, Any]:
+    meta = _official_doc_meta(row.doc_type)
+    latest = versions[0] if versions else None
+    excerpt = (latest.extracted_text or "")[:1200] if latest else ""
+    return {
+        "schema_version": "a2ui.official.v1",
+        "surface_id": f"official-document-{row.id}",
+        "renderer": "react-antd",
+        "component_registry": {
+            "render_card": "OfficialA2UICard",
+            "render_review_panel": "OfficialA2UIReviewPanel",
+            "render_actions": "OfficialA2UIActions",
+        },
+        "state": {
+            "current": "draft_review",
+            "doc_type": row.doc_type,
+            "template_key": row.template_key,
+            "version_no": latest.version_no if latest else 0,
+            "can_revise": bool(latest),
+        },
+        "state_machine": {
+            "draft_review": {
+                "on": {
+                    "official_doc.preview": "draft_review",
+                    "official_doc.download": "draft_review",
+                    "official_doc.revise": "draft_revising",
+                }
+            },
+            "draft_revising": {"on": {"official_doc.revised": "draft_review"}},
+        },
+        "validation": {"mode": "review_only", "rules": {}, "missing": []},
+        "ui_blocks": [
+            {
+                "id": "document-summary",
+                "type": "render_card",
+                "variant": "document_summary",
+                "title": row.title,
+                "subtitle": f"{meta['label']} · {row.template_key}",
+                "icon": row.doc_type,
+                "accent": meta["accent"],
+                "badges": [
+                    {"label": f"v{latest.version_no}" if latest else "待生成", "tone": "green" if latest else "default"},
+                    {"label": fields.get("__draft_source") or "draft", "tone": "blue"},
+                ],
+            },
+            {
+                "id": "draft-review",
+                "type": "render_review_panel",
+                "variant": "draft_review",
+                "title": "初稿审阅区",
+                "content": excerpt,
+                "compliance": compliance if isinstance(compliance, list) else [],
+            },
+            {
+                "id": "review-actions",
+                "type": "render_actions",
+                "actions": [
+                    {"id": "preview_current", "label": "预览当前版", "intent": "official_doc.preview", "style": "primary", "icon": "preview"},
+                    {"id": "download_current", "label": "下载 DOCX", "intent": "official_doc.download", "style": "default", "icon": "download"},
+                    {"id": "revise_current", "label": "继续修改", "intent": "official_doc.revise", "style": "default", "icon": "form"},
+                ],
+            },
+        ],
+    }
+
+
+def _official_document_to_dict(db: Session, row: OfficialDocument, *, include_detail: bool = False) -> dict:
+    versions = db.query(OfficialDocumentVersion).filter(
+        OfficialDocumentVersion.document_id == row.id,
+        OfficialDocumentVersion.tenant_id == row.tenant_id,
+    ).order_by(OfficialDocumentVersion.version_no.desc(), OfficialDocumentVersion.created_at.desc()).all()
+    fields = _json_loads_obj(row.fields_json, {})
+    compliance = _json_loads_obj(row.compliance_json, [])
+    payload = {
+        "id": row.id,
+        "title": row.title,
+        "doc_type": row.doc_type,
+        "doc_type_label": _official_doc_meta(row.doc_type)["label"],
+        "template_key": row.template_key,
+        "status": row.status,
+        "query": row.query,
+        "summary": row.summary,
+        "current_version_id": row.current_version_id,
+        "version_count": len(versions),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+    if versions:
+        payload["draft_excerpt"] = (versions[0].extracted_text or "")[:2400]
+    payload["a2ui"] = _official_document_a2ui_payload(row, fields=fields, compliance=compliance, versions=versions)
+    if include_detail:
+        payload["fields"] = fields
+        payload["compliance"] = compliance
+        payload["versions"] = [_official_version_to_dict(v) for v in versions]
+    return payload
+
+
+def _create_official_document_version(
+    db: Session,
+    p: Principal,
+    document: OfficialDocument,
+    *,
+    fields: dict[str, Any],
+    doc_type: str,
+    template_key: str,
+) -> OfficialDocumentVersion:
+    root = _official_storage_root(p, document.id)
+    root.mkdir(parents=True, exist_ok=True)
+    latest_no = db.query(OfficialDocumentVersion).filter(OfficialDocumentVersion.document_id == document.id).count()
+    version_no = latest_no + 1
+    safe_title = _safe_filename(_field_value(fields.get("title")) or document.title or "公文草稿")
+    name = f"{safe_title}_v{version_no}.docx"
+    path = root / name
+    extracted, size = _create_official_docx(path, doc_type, fields)
+    version = OfficialDocumentVersion(
+        document_id=document.id,
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        version_no=version_no,
+        kind="docx",
+        name=name,
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        storage_path=str(path),
+        size=size,
+        extracted_text=extracted,
+        change_summary=f"{_official_doc_meta(doc_type)['label']} · {template_key} · {'Agent 起草' if fields.get('__draft_source') == 'agent' else '规则起草'}",
+    )
+    db.add(version)
+    db.flush()
+    return version
+
+
+_CONTRACT_MAX_FILE_BYTES = 10 * 1024 * 1024
+_CONTRACT_MAX_UNZIPPED_BYTES = 50 * 1024 * 1024
+_CONTRACT_MAX_ZIP_MEMBERS = 2000
+_CONTRACT_SUPPORTED_EXTS = {".docx", ".pdf"}
+_CONTRACT_SKILL_SLUG = "docx-contract-review"
+_CONTRACT_REVIEW_CATEGORIES = [
+    ("主体信息", ("甲方", "乙方", "授权代表", "签署", "营业执照"), "合同主体、授权代表或签署信息不完整，可能影响合同效力和后续追责。"),
+    ("标的范围", ("服务内容", "项目范围", "交付范围", "工作内容", "规格"), "标的和范围不清，容易引发交付边界争议。"),
+    ("付款结算", ("付款", "价款", "费用", "结算", "发票"), "付款节点、开票条件或结算方式不清，可能影响现金流与履约判断。"),
+    ("交付验收", ("交付", "验收", "验收标准", "交付物", "确认"), "交付和验收标准不明确，可能导致交付完成时间和质量认定争议。"),
+    ("违约责任", ("违约", "违约金", "赔偿", "逾期", "责任"), "违约责任约定不足或过于笼统，可能降低合同约束力。"),
+    ("知识产权", ("知识产权", "著作权", "专利", "商标", "源代码", "成果归属"), "知识产权归属或使用范围不明确，可能影响成果复用和商业化。"),
+    ("保密义务", ("保密", "商业秘密", "秘密信息", "披露"), "保密范围、期限或违约责任不明确，可能造成商业信息泄露风险。"),
+    ("解除终止", ("解除", "终止", "提前终止", "单方解除"), "解除/终止条件不清，可能导致退出机制不可执行。"),
+    ("争议解决", ("争议", "仲裁", "诉讼", "管辖", "法院"), "争议解决方式或管辖约定不明确，可能增加维权成本。"),
+]
+_CONTRACT_TYPE_PROFILES: dict[str, dict[str, Any]] = {
+    "sales": {
+        "label": "销售合同",
+        "checks": [
+            ("销售回款", ("回款", "收款", "尾款", "开票", "应收"), "销售合同应重点保护回款节奏、开票前置条件和逾期收款救济。", "补充回款节点、开票条件、逾期付款违约金、暂停交付或停止服务权。"),
+            ("售后与质保", ("售后", "质保", "维修", "退换", "保修"), "售后/质保边界不清会放大销售方持续履约成本。", "明确质保范围、期限、响应时限、排除情形和客户配合义务。"),
+            ("所有权与风险转移", ("所有权", "风险转移", "交付风险", "货权"), "货物/成果所有权与风险转移节点不明，容易引发价款和损失承担争议。", "明确所有权保留、风险转移时间、签收验收文件和毁损灭失责任。"),
+        ],
+    },
+    "purchase": {
+        "label": "采购合同",
+        "checks": [
+            ("供应保障", ("供货", "供应", "备货", "缺货", "采购订单"), "采购合同需要保障供货稳定性、替代供货和延迟交付救济。", "补充供货计划、缺货通知、替代采购、差价赔偿和紧急供货机制。"),
+            ("质量追溯", ("质量", "检验", "抽检", "不合格", "召回"), "质量验收和追溯机制不足会影响采购方索赔与整改。", "明确质量标准、抽检规则、不合格处理、召回义务和整改期限。"),
+            ("供应商合规", ("资质", "合规", "许可证", "环保", "安全生产"), "供应商资质和合规承诺缺失会引入运营和监管风险。", "要求供应商持续具备资质许可，并承担违法违规导致的全部损失。"),
+        ],
+    },
+    "service": {
+        "label": "技术服务合同",
+        "checks": [
+            ("服务等级", ("SLA", "服务等级", "响应时间", "可用性", "故障"), "技术服务合同若缺少服务等级，会导致故障响应和赔偿标准不可执行。", "补充 SLA 指标、响应/恢复时限、服务窗口、故障等级和服务抵扣。"),
+            ("需求变更", ("变更", "需求调整", "范围变更", "变更单"), "服务范围和需求变更机制不清，容易造成范围蔓延和成本争议。", "约定任何需求变更必须以书面变更单确认，并同步调整费用、排期和验收标准。"),
+            ("项目验收", ("里程碑", "验收", "上线", "交付物", "验收报告"), "项目型服务需要里程碑、验收材料和默认通过机制。", "补充里程碑计划、验收材料、异议期限、整改次数和逾期默认验收规则。"),
+        ],
+    },
+    "labor": {
+        "label": "劳动合同",
+        "checks": [
+            ("岗位薪酬", ("岗位", "工资", "薪酬", "奖金", "绩效"), "岗位职责、薪酬结构和绩效规则不清，容易引发劳动争议。", "明确岗位职责、工资组成、发放周期、绩效考核口径和调整程序。"),
+            ("工时休假", ("工时", "加班", "休假", "年休假", "调休"), "工时、加班和休假规则缺失会影响用工合规。", "补充工时制度、加班审批、调休/加班费、休假申请和考勤规则。"),
+            ("保密竞业", ("保密", "竞业", "竞业限制", "商业秘密"), "核心岗位应关注保密、竞业限制和补偿机制。", "明确保密范围、竞业期限/地域/补偿、违约责任和资料返还义务。"),
+        ],
+    },
+    "nda": {
+        "label": "保密协议",
+        "checks": [
+            ("保密信息范围", ("保密信息", "秘密信息", "商业秘密", "披露方"), "保密信息范围过窄或过宽都会影响执行和举证。", "明确保密信息形式、例外情形、披露载体、接收方人员范围和标识规则。"),
+            ("使用限制", ("仅限", "目的", "不得使用", "不得披露"), "缺少使用目的限制会增加信息被挪用风险。", "约定接收方仅可为合作评估/履约目的使用保密信息，不得复制、反向工程或对外披露。"),
+            ("返还销毁", ("返还", "销毁", "删除", "备份"), "合作结束后的返还销毁义务缺失会留下数据残留风险。", "约定终止后限期返还或销毁全部保密信息，并出具书面证明。"),
+        ],
+    },
+    "lease": {
+        "label": "房屋租赁合同",
+        "checks": [
+            ("租金押金", ("租金", "押金", "支付", "滞纳金"), "房屋租赁合同应确保租金、押金、支付周期和逾期责任金额一致、可执行。", "核对租金、押金、支付节点、退还期限和逾期责任，并明确金额大小写一致。"),
+            ("房屋交还", ("交还", "退租", "恢复原状", "附属设施", "钥匙"), "租赁期满或提前解除时，如交还标准不清，容易引发押金扣除和修复费用争议。", "补充交还清单、设施状态、合理损耗、维修责任、验收异议期限和押金扣除证明。"),
+            ("维修维护", ("维修", "维护", "设施", "损坏", "水电"), "维修责任过度笼统会导致承租人与出租人责任边界不清。", "区分自然损耗、质量问题、承租人使用不当和第三方原因，并明确通知、维修和费用承担流程。"),
+        ],
+    },
+}
+
+_CONTRACT_TYPE_ALIASES = {
+    "租赁合同": "lease",
+    "房屋租赁": "lease",
+    "租房合同": "lease",
+    "rental": "lease",
+    "lease": "lease",
+    "housing_lease": "lease",
+    "技术服务合同": "service",
+    "服务合同": "service",
+    "采购合同": "purchase",
+    "销售合同": "sales",
+    "劳动合同": "labor",
+    "保密协议": "nda",
+}
+
+_CONTRACT_CATEGORY_KEYWORD_EXTRAS: dict[str, tuple[str, ...]] = {
+    "付款结算": ("支付", "收款", "租金", "押金", "保证金", "滞纳金", "付款节点"),
+    "标的范围": ("房屋坐落", "建筑面积", "房屋用途", "租赁房屋", "服务范围", "项目范围"),
+    "交付验收": ("交还", "交房", "钥匙", "附属设施", "验收报告", "里程碑"),
+    "解除终止": ("退租", "提前退租", "提前收回", "单方解除", "合同终止"),
+    "争议解决": ("协商解决", "人民法院", "法院", "管辖", "仲裁委员会"),
+}
+
+_CONTRACT_OPTIONAL_MISSING_CATEGORIES_BY_TYPE: dict[str, set[str]] = {
+    "lease": {"保密义务", "知识产权"},
+    "labor": {"知识产权"},
+    "nda": {"交付验收", "知识产权"},
+}
+
+_CN_DIGITS = {
+    "零": 0, "〇": 0, "○": 0,
+    "一": 1, "壹": 1,
+    "二": 2, "贰": 2, "两": 2,
+    "三": 3, "叁": 3,
+    "四": 4, "肆": 4,
+    "五": 5, "伍": 5,
+    "六": 6, "陆": 6,
+    "七": 7, "柒": 7,
+    "八": 8, "捌": 8,
+    "九": 9, "玖": 9,
+}
+_CN_SMALL_UNITS = {"十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000}
+_CN_SECTION_UNITS = {"万": 10_000, "亿": 100_000_000}
+
+
+def _contract_storage_root(p: Principal, contract_id: str) -> Path:
+    return (Path(OPENATLAS_HOME) / "contracts" / p.tenant.id / p.user.id / contract_id).resolve()
+
+
+def _contract_storage_root_for(*, tenant_id: str, user_id: str, contract_id: str) -> Path:
+    return (Path(OPENATLAS_HOME) / "contracts" / tenant_id / user_id / contract_id).resolve()
+
+
+def _contract_accessible(row: ContractDocument | None, p: Principal) -> bool:
+    if not row or row.tenant_id != p.tenant.id:
+        return False
+    return _is_admin_user(p.user) or row.user_id == p.user.id
+
+
+def _ensure_contract(db: Session, contract_id: str, p: Principal) -> ContractDocument:
+    row = db.get(ContractDocument, contract_id)
+    if not _contract_accessible(row, p):
+        raise HTTPException(404, "contract not found")
+    return row
+
+
+def _validate_contract_upload(filename: str, content: bytes, suffix: str) -> None:
+    if len(content) > _CONTRACT_MAX_FILE_BYTES:
+        raise HTTPException(413, f"contract file too large (max {_CONTRACT_MAX_FILE_BYTES} bytes)")
+    if suffix == ".docx":
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                infos = zf.infolist()
+                if len(infos) > _CONTRACT_MAX_ZIP_MEMBERS:
+                    raise HTTPException(413, "DOCX has too many internal files")
+                total_size = 0
+                for info in infos:
+                    name = info.filename.replace("\\", "/")
+                    if name.startswith("/") or "../" in name or name.startswith("../"):
+                        raise HTTPException(400, "unsafe DOCX archive path")
+                    total_size += int(info.file_size or 0)
+                    if total_size > _CONTRACT_MAX_UNZIPPED_BYTES:
+                        raise HTTPException(413, "DOCX expanded content is too large")
+                if "word/document.xml" not in {info.filename for info in infos}:
+                    raise HTTPException(400, "invalid DOCX: missing word/document.xml")
+        except HTTPException:
+            raise
+        except zipfile.BadZipFile:
+            raise HTTPException(400, "invalid DOCX file")
+        except Exception as exc:
+            raise HTTPException(400, f"failed to inspect DOCX: {exc}")
+    if suffix == ".pdf" and not content.startswith(b"%PDF"):
+        raise HTTPException(400, "invalid PDF file")
+
+
+def _contract_review_skill(db: Session, tenant_id: str) -> SkillPackage | None:
+    tenant_skill = db.query(SkillPackage).filter(
+        SkillPackage.owner_tenant_id == tenant_id,
+        SkillPackage.slug == _CONTRACT_SKILL_SLUG,
+        SkillPackage.status == "enabled",
+    ).order_by(SkillPackage.updated_at.desc()).first()
+    if tenant_skill:
+        return tenant_skill
+    return db.query(SkillPackage).filter(
+        SkillPackage.scope == Scope.global_,
+        SkillPackage.slug == _CONTRACT_SKILL_SLUG,
+        SkillPackage.status == "enabled",
+    ).order_by(SkillPackage.updated_at.desc()).first()
+
+
+def _contract_paragraphs(text: str) -> list[str]:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").splitlines()]
+    return [line for line in lines if line]
+
+
+def _effective_contract_type(contract_type: str, text: str) -> str:
+    raw = (contract_type or "general").strip().lower()
+    explicit = _CONTRACT_TYPE_ALIASES.get(raw) or raw
+    if explicit and explicit not in {"general", "通用合同", "general_contract"}:
+        return explicit
+    lease_markers = ("租赁", "出租", "承租", "租金", "押金", "房屋坐落", "房屋用途", "退租")
+    if sum(1 for marker in lease_markers if marker in (text or "")) >= 2:
+        return "lease"
+    return "general"
+
+
+def _contract_category_keywords(category: str, keywords: tuple[str, ...], contract_type: str) -> tuple[str, ...]:
+    extras = list(_CONTRACT_CATEGORY_KEYWORD_EXTRAS.get(category, ()))
+    if contract_type == "lease":
+        if category == "主体信息":
+            extras.extend(("出租方", "承租方", "身份证号", "联系方式"))
+        elif category == "标的范围":
+            extras.extend(("房屋地址", "房屋坐落", "建筑面积", "房屋用途", "附属设施"))
+        elif category == "付款结算":
+            extras.extend(("月租金", "租金", "押金", "每月", "滞纳金"))
+    return tuple(dict.fromkeys([*keywords, *extras]))
+
+
+def _docx_anchor_paragraphs(doc: Any) -> list[Any]:
+    anchors: list[Any] = []
+    for paragraph in getattr(doc, "paragraphs", []):
+        if (paragraph.text or "").strip():
+            anchors.append(paragraph)
+    for table in getattr(doc, "tables", []):
+        for row in table.rows:
+            row_text = " | ".join((cell.text or "").strip() for cell in row.cells).strip()
+            if not row_text:
+                continue
+            anchor = None
+            for cell in row.cells:
+                anchor = next((p for p in cell.paragraphs if (p.text or "").strip()), None)
+                if anchor is not None:
+                    break
+            if anchor is not None:
+                anchors.append(anchor)
+    return anchors
+
+
+def _contract_excerpt(paragraphs: list[str], keywords: tuple[str, ...]) -> tuple[int | None, str]:
+    best: tuple[int, int, int, str] | None = None
+    for idx, line in enumerate(paragraphs, 1):
+        matches = [k for k in keywords if k and k in line]
+        if not matches:
+            continue
+        first_pos = min(line.find(k) for k in matches if line.find(k) >= 0)
+        # Prefer paragraphs with more clause-specific hits, then earlier keyword position.
+        candidate = (len(matches), -first_pos, -idx, line[:420])
+        if best is None or candidate > best:
+            best = candidate
+    if best:
+        return -best[2], best[3]
+    return None, ""
+
+
+def _parse_arabic_yuan_to_cents(value: str) -> int | None:
+    raw = re.sub(r"[,\s，]", "", value or "")
+    if not re.fullmatch(r"\d+(?:\.\d{1,2})?", raw):
+        return None
+    yuan, _, cents = raw.partition(".")
+    return int(yuan) * 100 + int((cents + "00")[:2])
+
+
+def _parse_chinese_integer(value: str) -> int | None:
+    text = re.sub(r"[人民币大写：:元圆整正块\s，,。；;（）()]", "", value or "")
+    if not text:
+        return None
+    total = 0
+    section = 0
+    number = 0
+    seen = False
+    for ch in text:
+        if ch in _CN_DIGITS:
+            number = _CN_DIGITS[ch]
+            seen = True
+        elif ch in _CN_SMALL_UNITS:
+            unit = _CN_SMALL_UNITS[ch]
+            if number == 0:
+                number = 1
+            section += number * unit
+            number = 0
+            seen = True
+        elif ch in _CN_SECTION_UNITS:
+            section += number
+            total += section * _CN_SECTION_UNITS[ch]
+            section = 0
+            number = 0
+            seen = True
+        else:
+            return None
+    return total + section + number if seen else None
+
+
+def _parse_chinese_money_to_cents(value: str) -> int | None:
+    text = re.sub(r"\s+", "", value or "")
+    yuan_part = re.split(r"[元圆]", text, maxsplit=1)[0]
+    yuan = _parse_chinese_integer(yuan_part)
+    if yuan is None:
+        return None
+    cents = 0
+    jiao = re.search(r"([零〇一壹二贰两三叁四肆五伍六陆七柒八捌九玖])角", text)
+    fen = re.search(r"([零〇一壹二贰两三叁四肆五伍六陆七柒八捌九玖])分", text)
+    if jiao:
+        cents += _CN_DIGITS.get(jiao.group(1), 0) * 10
+    if fen:
+        cents += _CN_DIGITS.get(fen.group(1), 0)
+    return yuan * 100 + cents
+
+
+def _format_yuan(cents: int) -> str:
+    yuan = cents // 100
+    cent = cents % 100
+    return f"{yuan:,}" if cent == 0 else f"{yuan:,}.{cent:02d}"
+
+
+def _parse_cn_or_arabic_count(value: str) -> int | None:
+    raw = re.sub(r"\s+", "", value or "")
+    if raw.isdigit():
+        return int(raw)
+    return _parse_chinese_integer(raw)
+
+
+_CONTRACT_AMOUNT_PAIR_RE = re.compile(
+    r"(?:人民币\s*)?(?P<num>\d[\d,，]*(?:\.\d{1,2})?)\s*元?\s*[（(]\s*(?:大写\s*[:：]\s*)?"
+    r"(?P<cn>[零〇一壹二贰两三叁四肆五伍六陆七柒八捌九玖十拾百佰千仟万亿元圆角分整正]+)\s*[）)]"
+)
+
+
+def _contract_deterministic_issues(paragraphs: list[str], *, contract_type: str) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    amount_pairs: list[dict[str, Any]] = []
+    def add_lease_issue(
+        *,
+        paragraph_index: int,
+        line: str,
+        category: str,
+        title: str,
+        risk: str,
+        recommendation: str,
+        proposed_revision: str,
+        severity: str = "high",
+        confidence: float = 0.88,
+    ) -> None:
+        issues.append(_contract_issue_seed(
+            severity=severity,
+            category=category,
+            title=title,
+            paragraph_index=paragraph_index,
+            excerpt=line[:420],
+            risk=risk,
+            recommendation=recommendation,
+            proposed_revision=proposed_revision,
+            confidence=confidence,
+        ))
+
+    for idx, line in enumerate(paragraphs, 1):
+        for match in _CONTRACT_AMOUNT_PAIR_RE.finditer(line):
+            arabic = _parse_arabic_yuan_to_cents(match.group("num"))
+            chinese = _parse_chinese_money_to_cents(match.group("cn"))
+            if arabic is None or chinese is None:
+                continue
+            amount_pairs.append({
+                "paragraph_index": idx,
+                "line": line[:420],
+                "arabic": arabic,
+                "chinese": chinese,
+                "raw_arabic": match.group("num"),
+                "raw_chinese": match.group("cn"),
+            })
+            if arabic != chinese:
+                issues.append(_contract_issue_seed(
+                    severity="high",
+                    category="金额一致性",
+                    title="金额大小写不一致",
+                    paragraph_index=idx,
+                    excerpt=line[:420],
+                    risk=(
+                        f"该条款阿拉伯数字金额为 {_format_yuan(arabic)} 元，"
+                        f"中文大写金额为 {_format_yuan(chinese)} 元，二者不一致，可能导致租金/价款执行争议。"
+                    ),
+                    recommendation="请以双方真实业务约定为准，立即统一阿拉伯数字金额与中文大写金额，并复核相关押金、违约金、付款计划是否同步调整。",
+                    proposed_revision=(
+                        f"建议修订：将“{match.group('num')} 元（大写：{match.group('cn')}）”"
+                        "统一为同一金额；若以阿拉伯数字为准，应同步改正中文大写；若以中文大写为准，应同步改正阿拉伯数字。"
+                    ),
+                    confidence=0.96,
+                ))
+
+    if contract_type == "lease":
+        monthly = next((item for item in amount_pairs if "月租金" in item["line"] or "每月租金" in item["line"]), None)
+        deposit = next((item for item in amount_pairs if "押金" in item["line"]), None)
+        if monthly and deposit:
+            months_match = re.search(r"相当于\s*([一壹二贰两三叁四肆五伍六陆七柒八捌九玖十拾\d]+)\s*个?月租金", deposit["line"])
+            months = _parse_cn_or_arabic_count(months_match.group(1)) if months_match else None
+            if months and deposit["arabic"] != monthly["arabic"] * months:
+                issues.append(_contract_issue_seed(
+                    severity="high",
+                    category="金额一致性",
+                    title="押金与月租金倍数不一致",
+                    paragraph_index=deposit["paragraph_index"],
+                    excerpt=deposit["line"],
+                    risk=(
+                        f"合同写明押金相当于 {months} 个月租金。按月租金 {_format_yuan(monthly['arabic'])} 元计算，"
+                        f"押金应为 {_format_yuan(monthly['arabic'] * months)} 元；当前押金为 {_format_yuan(deposit['arabic'])} 元。"
+                    ),
+                    recommendation="请确认月租金、押金金额和“相当于几个月租金”的文字表述是否同一口径，避免押金退还和违约扣款争议。",
+                    proposed_revision="建议修订：统一月租金、押金金额及押金倍数描述；若押金金额固定，请删除或改正“相当于几个月租金”的表述。",
+                    confidence=0.94,
+                ))
+
+        for idx, line in enumerate(paragraphs, 1):
+            if "押金" in line:
+                broad_deposit_markers = ("包括但不限于", "墙面污渍", "灯具/开关/插座", "任何不符合交付原状", "60 日", "无息退还")
+                if sum(1 for marker in broad_deposit_markers if marker in line) >= 2:
+                    add_lease_issue(
+                        paragraph_index=idx,
+                        line=line,
+                        category="押金退还",
+                        title="押金扣除范围过宽且退还期限过长",
+                        risk="押金扣除情形列举过宽，并约定余额在较长期间后无息退还，可能导致押金几乎不可退还或扣款缺少必要证明。",
+                        recommendation="建议限定押金仅用于租金欠付、明确损坏赔偿和经核验的应付费用，出租方应提供费用清单和票据，并在房屋交还、费用结清后的合理期限内退还余额。",
+                        proposed_revision="建议修订：押金仅用于抵扣乙方未付租金、经双方确认的房屋及附属设施损坏赔偿、实际发生且有票据支持的应由乙方承担费用。租赁关系终止、乙方交还房屋并结清费用后，甲方应于 3-15 日内无息退还押金余额；扣除押金的，应提供费用清单、照片或票据。",
+                        confidence=0.9,
+                    )
+
+            if ("具体金额以甲方通知或票据为准" in line and "不得" in line and "异议" in line):
+                add_lease_issue(
+                    paragraph_index=idx,
+                    line=line,
+                    category="费用结算",
+                    title="其他费用以甲方单方通知为准",
+                    risk="费用金额由甲方通知或票据单方确定，并排除乙方异议权，可能导致费用结算缺乏核验、协商和举证机制。",
+                    recommendation="建议要求费用按实际发生、真实票据和费用清单结算，乙方保留核验、异议和合理期限内补正材料的权利。",
+                    proposed_revision="建议修订：其他费用应以实际发生、合法有效票据及明细清单为准；甲方应向乙方提供费用发生依据，乙方有权在收到清单后合理期限内提出异议，双方应据实核对后结算。",
+                    confidence=0.9,
+                )
+
+            if ("维修" in line and "乙方" in line and "承担" in line and any(marker in line for marker in ("自然损耗", "正常使用老化", "质量问题"))):
+                add_lease_issue(
+                    paragraph_index=idx,
+                    line=line,
+                    category="维修责任",
+                    title="自然损耗和质量问题维修责任被转嫁给乙方",
+                    risk="条款将自然损耗、正常使用老化或房屋质量问题产生的维修责任概括由乙方承担，可能与租赁物维修义务的通常规则冲突，并显著加重承租人责任。",
+                    recommendation="建议区分自然损耗、质量问题、承租人不当使用和第三方原因。非乙方原因导致的维修通常应由甲方承担，乙方仅对自身不当使用造成的损坏承担责任。",
+                    proposed_revision="建议修订：房屋及附属设施因自然损耗、正常使用老化、质量问题或非乙方原因损坏的，由甲方负责维修并承担费用；因乙方不当使用、故意或重大过失造成损坏的，由乙方承担相应维修或赔偿责任。",
+                    confidence=0.92,
+                )
+
+        tenant_exit = next((item for item in enumerate(paragraphs, 1) if "提前退租" in item[1] and "剩余租期租金总额的 100%" in item[1]), None)
+        landlord_exit = next((item for item in enumerate(paragraphs, 1) if "提前收回房屋" in item[1] and "一个月租金" in item[1]), None)
+        if tenant_exit and landlord_exit:
+            idx, line = tenant_exit
+            add_lease_issue(
+                paragraph_index=idx,
+                line=line,
+                category="违约责任",
+                title="提前解除违约责任明显不对等",
+                risk="乙方提前退租需承担剩余租期租金总额 100% 且押金不退，而甲方提前收回仅赔偿一个月租金，双方解除责任明显不对等，可能被认定为过分加重承租人责任。",
+                recommendation="建议将提前解除责任设置为合理、对等、可预期的上限，并保留双方实际损失举证和协商空间。",
+                proposed_revision="建议修订：任一方无正当理由提前解除合同的，应提前通知对方，并按不超过两个月租金的标准承担违约责任；给对方造成实际损失且有证据证明的，可在合理范围内另行主张。双方违约责任标准应保持基本对等。",
+                confidence=0.9,
+            )
+
+        for idx, line in enumerate(paragraphs, 1):
+            if "不可抗力" in line and "均不构成不可抗力" in line and any(marker in line for marker in ("房屋被法院查封", "抵押", "出售", "家庭变故")):
+                add_lease_issue(
+                    paragraph_index=idx,
+                    line=line,
+                    category="不可抗力与履约障碍",
+                    title="不可抗力和履约障碍排除过宽",
+                    risk="条款将多类可能影响租赁履行的情形一概排除，可能导致承租人在房屋权属、查封、处分等重大履约障碍下缺少救济。",
+                    recommendation="建议区分不可抗力、权利瑕疵和出租方履约障碍，保留承租人解除、减免租金或损失赔偿的合理救济。",
+                    proposed_revision="建议修订：不可抗力依法律规定认定；因房屋权属瑕疵、查封、抵押处置、出售交割或甲方原因导致乙方无法正常使用房屋的，乙方有权要求减免租金、解除合同并要求甲方承担相应责任。",
+                    confidence=0.86,
+                )
+            if "甲方住所地人民法院管辖" in line:
+                add_lease_issue(
+                    paragraph_index=idx,
+                    line=line,
+                    category="争议解决",
+                    title="管辖约定单方偏向甲方",
+                    risk="争议管辖固定为甲方住所地，可能增加承租人维权成本，尤其在房屋所在地、合同履行地与甲方住所地不一致时不够公平便利。",
+                    recommendation="建议优先约定房屋所在地或合同履行地法院管辖，或采用双方均可接受的中立管辖安排。",
+                    proposed_revision="建议修订：因本合同发生争议，双方应先协商解决；协商不成的，任一方可向房屋所在地或合同履行地有管辖权的人民法院提起诉讼。",
+                    severity="medium",
+                    confidence=0.82,
+                )
+            if "最终解释权" in line:
+                add_lease_issue(
+                    paragraph_index=idx,
+                    line=line,
+                    category="格式条款",
+                    title="甲方最终解释权条款不合理",
+                    risk="“甲方持合同最终解释权”排除了双方对合同条款平等解释和争议解决的权利，属于明显偏向一方的格式化表述。",
+                    recommendation="建议删除最终解释权表述，改为双方按合同目的、交易习惯和法律规定协商解释；协商不成由争议解决机制处理。",
+                    proposed_revision="建议修订：本合同条款如有理解分歧，双方应本着公平、诚信原则协商解释；协商不成的，按本合同争议解决条款处理。",
+                    confidence=0.9,
+                )
+
+    date_pattern = re.compile(
+        r"自\s*(?P<sy>\d{4})\s*年\s*(?P<sm>\d{1,2})\s*月\s*(?P<sd>\d{1,2})\s*日\s*起.*?"
+        r"至\s*(?P<ey>\d{4})\s*年\s*(?P<em>\d{1,2})\s*月\s*(?P<ed>\d{1,2})\s*日\s*止.*?"
+        r"租期共计\s*(?P<months>\d+|[一壹二贰两三叁四肆五伍六陆七柒八捌九玖十拾]+)\s*个?月"
+    )
+    for idx, line in enumerate(paragraphs, 1):
+        match = date_pattern.search(line)
+        if not match:
+            continue
+        stated_months = _parse_cn_or_arabic_count(match.group("months"))
+        if not stated_months:
+            continue
+        start = datetime(int(match.group("sy")), int(match.group("sm")), int(match.group("sd")))
+        end = datetime(int(match.group("ey")), int(match.group("em")), int(match.group("ed")))
+        actual_months = (end.year - start.year) * 12 + (end.month - start.month)
+        if end.day >= start.day:
+            actual_months += 1
+        if actual_months > 0 and abs(actual_months - stated_months) >= 1:
+            issues.append(_contract_issue_seed(
+                severity="high",
+                category="期限一致性",
+                title="租赁期限与起止日期不一致",
+                paragraph_index=idx,
+                excerpt=line[:420],
+                risk=f"起止日期推算租期约为 {actual_months} 个月，但合同写明 {stated_months} 个月，可能影响租金、押金和解除责任计算。",
+                recommendation="请统一租赁起止日期和租期文字，必要时同步复核租金总额、押金、提前解除和续租条款。",
+                proposed_revision="建议修订：将租赁起止日期与“租期共计”表述调整为一致口径。",
+                confidence=0.9,
+            ))
+    return issues
+
+
+
+def _contract_summary(text: str, filename: str, contract_type: str, perspective: str) -> str:
+    paragraphs = _contract_paragraphs(text)
+    chars = len(text or "")
+    detected = []
+    for label, keywords, _risk in _CONTRACT_REVIEW_CATEGORIES:
+        if any(k in text for k in keywords):
+            detected.append(label)
+    if not text:
+        return f"{filename} 已上传。当前文件暂未抽取到可审查正文，请优先上传 DOCX 合同，PDF 深度解析将在后续版本支持。"
+    return (
+        f"已解析 {len(paragraphs)} 个段落、约 {chars} 个字符。"
+        f"审查类型：{contract_type or '通用合同'}；审查视角：{perspective or '均衡'}。"
+        f"已识别条款主题：{'、'.join(detected[:8]) if detected else '待进一步识别'}。"
+    )
+
+
+def _contract_issue_seed(
+    *,
+    severity: str,
+    category: str,
+    title: str,
+    paragraph_index: int | None,
+    excerpt: str,
+    risk: str,
+    recommendation: str,
+    proposed_revision: str,
+    confidence: float = 0.74,
+) -> dict[str, Any]:
+    return {
+        "severity": severity,
+        "category": category,
+        "title": title,
+        "clause_ref": f"第 {paragraph_index} 段" if paragraph_index else "全文缺失项",
+        "paragraph_index": paragraph_index,
+        "excerpt": excerpt,
+        "risk": risk,
+        "recommendation": recommendation,
+        "proposed_revision": proposed_revision,
+        "confidence": confidence,
+    }
+
+
+def _analyze_contract_issues(text: str, *, contract_type: str, perspective: str, focus: list[str] | None = None) -> list[dict[str, Any]]:
+    paragraphs = _contract_paragraphs(text)
+    normalized_type = _effective_contract_type(contract_type, text)
+    normalized_perspective = (perspective or "balanced").strip().lower()
+    focus_terms = [
+        re.sub(r"\s+", " ", str(item or "")).strip()
+        for item in (focus or [])
+        if re.sub(r"\s+", " ", str(item or "")).strip()
+    ][:12]
+    focus_text = " ".join(focus_terms)
+    issues: list[dict[str, Any]] = _contract_deterministic_issues(paragraphs, contract_type=normalized_type)
+    if not text.strip():
+        return [_contract_issue_seed(
+            severity="high",
+            category="文档解析",
+            title="未抽取到可审查正文",
+            paragraph_index=None,
+            excerpt="",
+            risk="系统无法读取合同正文，AI 审核无法覆盖具体条款。",
+            recommendation="请上传可复制文本的 DOCX 合同；扫描版 PDF/OCR 后续版本支持。",
+            proposed_revision="重新上传 DOCX 后再执行审查。",
+            confidence=0.92,
+        )]
+
+    deterministic_categories = {str(issue.get("category") or "") for issue in issues}
+    deterministic_titles = {str(issue.get("title") or "") for issue in issues}
+
+    def lease_category_already_covered(category: str) -> bool:
+        if normalized_type != "lease":
+            return False
+        coverage = {
+            "付款结算": {"金额一致性", "费用结算", "押金退还"},
+            "违约责任": {"违约责任"},
+            "争议解决": {"争议解决"},
+            "维修责任": {"维修责任"},
+            "租金押金": {"金额一致性", "押金退还"},
+        }
+        return bool(coverage.get(category, set()) & deterministic_categories)
+
+    def focus_term_already_covered(term: str) -> bool:
+        compact = re.sub(r"\s+", "", term or "")
+        if not compact:
+            return False
+        coverage = {
+            "租金押金": {"金额一致性", "押金退还"},
+            "租金": {"金额一致性", "押金退还"},
+            "押金": {"金额一致性", "押金退还"},
+            "维修责任": {"维修责任"},
+            "维修": {"维修责任"},
+            "费用结算": {"费用结算", "付款结算"},
+            "其他费用": {"费用结算"},
+            "违约责任": {"违约责任"},
+            "违约": {"违约责任"},
+            "争议解决": {"争议解决"},
+            "管辖": {"争议解决"},
+        }
+        if bool(coverage.get(compact, set()) & deterministic_categories):
+            return True
+        joined = " ".join([*deterministic_categories, *deterministic_titles])
+        return compact in re.sub(r"\s+", "", joined)
+
+    for category, keywords, risk_text in _CONTRACT_REVIEW_CATEGORIES:
+        effective_keywords = _contract_category_keywords(category, keywords, normalized_type)
+        paragraph_index, excerpt = _contract_excerpt(paragraphs, effective_keywords)
+        focused = bool(focus_text and any(k in focus_text for k in effective_keywords + (category,)))
+        if lease_category_already_covered(category):
+            continue
+        if paragraph_index is None:
+            if not focused and category in _CONTRACT_OPTIONAL_MISSING_CATEGORIES_BY_TYPE.get(normalized_type, set()):
+                continue
+            severity = "high" if category in {"付款结算", "违约责任", "争议解决"} else "medium"
+            issues.append(_contract_issue_seed(
+                severity=severity,
+                category=category,
+                title=f"缺少明确的{category}条款",
+                paragraph_index=None,
+                excerpt="",
+                risk=risk_text,
+                recommendation=f"建议补充独立的“{category}”条款，明确适用范围、触发条件、责任边界和证明材料。",
+                proposed_revision=f"建议新增条款：双方应就{category}作出明确约定，包括具体标准、履行节点、责任承担、通知方式和争议处理机制。",
+                confidence=0.78 if focused else 0.7,
+            ))
+            continue
+        weak_patterns = ("另行协商", "适当", "尽快", "合理", "原则上", "视情况", "等")
+        if any(pattern in excerpt for pattern in weak_patterns) or focused:
+            issues.append(_contract_issue_seed(
+                severity="medium" if not focused else "high",
+                category=category,
+                title=f"{category}表述需要进一步明确",
+                paragraph_index=paragraph_index,
+                excerpt=excerpt,
+                risk=f"{risk_text} 当前条款中存在弹性或概括性表述，执行时可能产生解释空间。",
+                recommendation="建议把抽象表述改成可验证的时间、金额、标准、材料、通知方式和责任比例。",
+                proposed_revision=f"建议将该条款补充为：{category}应以书面确认的标准、期限和验收/证明材料为准；任何变更应经双方授权代表书面确认。",
+                confidence=0.76,
+            ))
+
+    profile = _CONTRACT_TYPE_PROFILES.get(normalized_type)
+    if profile:
+        for category, keywords, risk_text, recommendation in profile.get("checks", []):
+            paragraph_index, excerpt = _contract_excerpt(paragraphs, tuple(keywords))
+            if paragraph_index is None:
+                issues.append(_contract_issue_seed(
+                    severity="high" if normalized_perspective == "strict" else "medium",
+                    category=category,
+                    title=f"{profile.get('label', '该类合同')}缺少{category}约定",
+                    paragraph_index=None,
+                    excerpt="",
+                    risk=risk_text,
+                    recommendation=recommendation,
+                    proposed_revision=f"建议新增“{category}”条款：{recommendation}具体标准、触发条件、通知材料、责任承担和例外情形由双方书面确认。",
+                    confidence=0.78,
+                ))
+                continue
+            if normalized_perspective == "strict" or any(pattern in excerpt for pattern in ("另行协商", "适当", "尽快", "合理", "原则上")):
+                issues.append(_contract_issue_seed(
+                    severity="high" if normalized_perspective == "strict" else "medium",
+                    category=category,
+                    title=f"{category}条款需要增强可执行性",
+                    paragraph_index=paragraph_index,
+                    excerpt=excerpt,
+                    risk=f"{risk_text} 当前条款仍需补充量化标准或操作闭环。",
+                    recommendation=recommendation,
+                    proposed_revision=f"建议将该条款补充为：{recommendation}并明确书面确认、异议期限、整改机制和违约后果。",
+                    confidence=0.76,
+                ))
+
+    for term in focus_terms:
+        if len(term) < 2:
+            continue
+        if focus_term_already_covered(term):
+            continue
+        paragraph_index, excerpt = _contract_excerpt(paragraphs, (term,))
+        if paragraph_index is None:
+            issues.append(_contract_issue_seed(
+                severity="high" if normalized_perspective == "strict" else "medium",
+                category="重点关注",
+                title=f"未找到用户重点关注项：{term}",
+                paragraph_index=None,
+                excerpt="",
+                risk=f"用户明确关注“{term}”，但合同正文未识别到对应条款，可能意味着关键业务风险未被覆盖。",
+                recommendation=f"建议补充与“{term}”相关的独立条款，明确适用场景、责任边界、执行标准和证明材料。",
+                proposed_revision=f"建议新增条款：双方应就“{term}”作出明确约定，包括触发条件、履行标准、通知方式、责任承担和争议处理机制。",
+                confidence=0.82,
+            ))
+        else:
+            issues.append(_contract_issue_seed(
+                severity="high",
+                category="重点关注",
+                title=f"用户重点关注项“{term}”需要专项复核",
+                paragraph_index=paragraph_index,
+                excerpt=excerpt,
+                risk=f"该条款命中用户重点关注项“{term}”，需要结合业务目标专项判断是否足够明确、可执行、可举证。",
+                recommendation="建议由业务负责人和法务共同复核该条款的金额、期限、验收材料、违约后果和审批权限。",
+                proposed_revision=f"建议将与“{term}”相关的约定补充为可量化、可验收、可追责的条款，并明确书面确认和争议处理路径。",
+                confidence=0.84,
+            ))
+
+    if normalized_perspective in {"party_a", "buyer", "甲方"}:
+        issues.append(_contract_issue_seed(
+            severity="medium",
+            category="甲方保护",
+            title="建议增强甲方验收、扣款与解除权",
+            paragraph_index=None,
+            excerpt="",
+            risk="从甲方视角看，若缺少阶段验收、质量整改和付款前置条件，可能降低供应商约束力。",
+            recommendation="补充阶段性验收、整改期限、逾期扣款、重大违约解除和损失赔偿机制。",
+            proposed_revision="建议增加：乙方交付不符合约定的，甲方有权要求限期整改、顺延付款、扣减相应费用；重大违约时甲方有权解除合同并要求赔偿。",
+            confidence=0.72,
+        ))
+    elif normalized_perspective in {"party_b", "seller", "乙方"}:
+        issues.append(_contract_issue_seed(
+            severity="medium",
+            category="乙方保护",
+            title="建议增强乙方收款、配合义务与责任上限",
+            paragraph_index=None,
+            excerpt="",
+            risk="从乙方视角看，若缺少客户配合义务、付款保护和责任上限，可能放大履约风险。",
+            recommendation="补充甲方资料配合、逾期付款违约责任、责任上限和间接损失排除。",
+            proposed_revision="建议增加：甲方应按期提供资料并完成确认；因甲方原因导致延期的，交付期限相应顺延；乙方赔偿责任以已收合同价款为上限，法律另有强制规定除外。",
+            confidence=0.72,
+        ))
+    elif normalized_perspective == "strict":
+        issues.append(_contract_issue_seed(
+            severity="high",
+            category="强风控复核",
+            title="建议补充高风险合同的审批、责任上限和合规兜底",
+            paragraph_index=None,
+            excerpt="",
+            risk="强风控视角下，合同除条款完整外，还应具备内部审批、责任边界、合规承诺和异常退出机制。",
+            recommendation="补充授权审批、合规承诺、责任上限/排除间接损失、重大风险提前解除和资料留痕机制。",
+            proposed_revision="建议新增：本合同项下重大变更、付款、延期、验收争议和责任豁免均应经双方授权代表书面确认；任一方违反法律法规或合规要求的，守约方有权暂停履行、解除合同并要求赔偿。",
+            confidence=0.76,
+        ))
+
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    dedup: dict[tuple[str, str], dict[str, Any]] = {}
+    for issue in issues:
+        key = (issue["category"], issue["title"])
+        if key not in dedup:
+            dedup[key] = issue
+    if any(item.get("category") == "金额一致性" for item in dedup.values()):
+        dedup = {
+            key: item for key, item in dedup.items()
+            if not (
+                item.get("category") == "租金押金"
+                or (item.get("category") == "付款结算" and item.get("severity") != "high" and normalized_type == "lease")
+            )
+        }
+    ordered = sorted(
+        dedup.values(),
+        key=lambda item: (
+            severity_rank.get(item["severity"], 9),
+            0 if item.get("category") in {"金额一致性", "期限一致性"} else 1,
+            item.get("category", ""),
+        ),
+    )
+    if normalized_perspective != "strict":
+        high = [item for item in ordered if item.get("severity") == "high"]
+        medium = [item for item in ordered if item.get("severity") != "high"]
+        return [*high, *medium[:10]][:16]
+    return ordered[:30]
+
+
+def _contract_issue_to_dict(row: ContractReviewIssue) -> dict:
+    return {
+        "id": row.id,
+        "contract_id": row.contract_id,
+        "severity": row.severity,
+        "category": row.category,
+        "title": row.title,
+        "clause_ref": row.clause_ref,
+        "page_no": row.page_no,
+        "paragraph_index": row.paragraph_index,
+        "excerpt": row.excerpt,
+        "risk": row.risk,
+        "recommendation": row.recommendation,
+        "proposed_revision": row.proposed_revision,
+        "status": row.status,
+        "confidence": row.confidence,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _contract_version_to_dict(row: ContractVersion) -> dict:
+    return {
+        "id": row.id,
+        "contract_id": row.contract_id,
+        "version_no": row.version_no,
+        "kind": row.kind,
+        "name": row.name,
+        "mime_type": row.mime_type,
+        "size": row.size,
+        "extracted_chars": len(row.extracted_text or ""),
+        "change_summary": row.change_summary,
+        "preview_url": f"/api/contract-reviews/versions/{quote(row.id)}/preview",
+        "download_url": f"/api/contract-reviews/versions/{quote(row.id)}/download",
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _contract_to_dict(db: Session, row: ContractDocument, *, include_detail: bool = False) -> dict:
+    versions = db.query(ContractVersion).filter(
+        ContractVersion.contract_id == row.id,
+        ContractVersion.tenant_id == row.tenant_id,
+    ).order_by(ContractVersion.version_no.desc(), ContractVersion.created_at.desc()).all()
+    issues_q = db.query(ContractReviewIssue).filter(
+        ContractReviewIssue.contract_id == row.id,
+        ContractReviewIssue.tenant_id == row.tenant_id,
+    )
+    issue_rows = issues_q.order_by(ContractReviewIssue.created_at.asc()).all()
+    counts: dict[str, int] = {"high": 0, "medium": 0, "low": 0}
+    for issue in issue_rows:
+        counts[issue.severity] = counts.get(issue.severity, 0) + 1
+    payload = {
+        "id": row.id,
+        "title": row.title,
+        "contract_type": row.contract_type,
+        "review_perspective": row.review_perspective,
+        "status": row.status,
+        "summary": row.summary,
+        "current_version_id": row.current_version_id,
+        "issue_counts": counts,
+        "issue_count": len(issue_rows),
+        "version_count": len(versions),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+    review_skill = _contract_review_skill(db, row.tenant_id)
+    if review_skill:
+        payload["review_skill"] = {
+            "id": review_skill.id,
+            "name": review_skill.name,
+            "slug": review_skill.slug,
+            "version": review_skill.version,
+            "category": review_skill.category,
+            "status": review_skill.status,
+            "description": review_skill.description,
+            "source_ref": review_skill.source_ref,
+        }
+    if include_detail:
+        payload["versions"] = [_contract_version_to_dict(v) for v in versions]
+        payload["issues"] = [_contract_issue_to_dict(i) for i in issue_rows]
+        source = next((v for v in versions if v.kind == "original"), None)
+        if source:
+            source_content, source_kind, _source_renderable = _read_preview_content(
+                Path(source.storage_path),
+                source.mime_type,
+                source.extracted_text,
+            )
+            payload["source_preview"] = {
+                "version_id": source.id,
+                "name": source.name,
+                "mime_type": source.mime_type,
+                "content": source_content,
+                "preview_kind": source_kind,
+                "download_url": f"/api/contract-reviews/versions/{quote(source.id)}/download",
+            }
+    return payload
+
+
+def _write_contract_review_report(contract: ContractDocument, issues: list[ContractReviewIssue]) -> str:
+    lines = [
+        f"# {contract.title or '合同'} AI 审核报告",
+        "",
+        f"- 合同类型：{contract.contract_type or '通用合同'}",
+        f"- 审查视角：{contract.review_perspective or '均衡'}",
+        f"- 审查时间：{datetime.now(timezone.utc).isoformat()}",
+        "",
+        "## 风险概览",
+    ]
+    counts = {"high": 0, "medium": 0, "low": 0}
+    for issue in issues:
+        counts[issue.severity] = counts.get(issue.severity, 0) + 1
+    lines.append(f"- 高风险：{counts.get('high', 0)}")
+    lines.append(f"- 中风险：{counts.get('medium', 0)}")
+    lines.append(f"- 低风险：{counts.get('low', 0)}")
+    lines.append("")
+    lines.append("## 审核建议")
+    for idx, issue in enumerate(issues, 1):
+        lines.extend([
+            "",
+            f"### {idx}. [{issue.severity.upper()}] {issue.title}",
+            f"- 状态：{issue.status or 'open'}",
+            f"- 分类：{issue.category}",
+            f"- 定位：{issue.clause_ref or '全文'}",
+            f"- 原文摘录：{issue.excerpt or '未定位到具体原文'}",
+            f"- 风险说明：{issue.risk}",
+            f"- 修改建议：{issue.recommendation}",
+            f"- 建议修订：{issue.proposed_revision}",
+        ])
+    return "\n".join(lines)
+
+
+def _create_revised_docx(original_path: Path, target_path: Path, contract: ContractDocument, issues: list[ContractReviewIssue]) -> tuple[str, int]:
+    try:
+        from docx import Document  # type: ignore
+        from docx.enum.text import WD_COLOR_INDEX  # type: ignore
+        from docx.shared import RGBColor  # type: ignore
+    except Exception as exc:
+        raise HTTPException(500, f"python-docx unavailable: {exc}")
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        doc = Document(str(original_path)) if original_path.suffix.lower() == ".docx" else Document()
+    except Exception:
+        doc = Document()
+
+    def add_safe_heading(text: str, level: int = 1) -> None:
+        try:
+            doc.add_heading(text, level=level)
+            return
+        except Exception:
+            pass
+        p = doc.add_paragraph()
+        run = p.add_run(text)
+        run.bold = True
+        try:
+            run.font.size = None
+        except Exception:
+            pass
+
+    def insert_paragraph_after(anchor: Any, text: str = "") -> Any:
+        paragraph = doc.add_paragraph(text)
+        try:
+            anchor._p.addnext(paragraph._p)
+        except Exception:
+            pass
+        return paragraph
+
+    def insert_paragraph_before(anchor: Any, text: str = "") -> Any:
+        paragraph = doc.add_paragraph(text)
+        try:
+            anchor._p.addprevious(paragraph._p)
+        except Exception:
+            pass
+        return paragraph
+
+    def add_comment_to_runs(runs: list[Any], issue: ContractReviewIssue, note: str = "") -> None:
+        if not runs:
+            return
+        doc.add_comment(
+            runs,
+            text=(
+                f"[{issue.severity.upper()}] {issue.title}\n"
+                f"分类：{issue.category}\n"
+                f"处理：用户已采纳，Atlas 已写入修订稿\n"
+                f"风险：{issue.risk}\n"
+                f"建议：{issue.recommendation}\n"
+                f"拟修订：{issue.proposed_revision}"
+                + (f"\n说明：{note}" if note else "")
+            ),
+            author="Atlas Contract Review",
+            initials="AI",
+        )
+
+    def find_insertion_anchor(issue: ContractReviewIssue, anchors: list[Any]) -> Any | None:
+        keywords = _contract_category_keywords(issue.category or "", (), _effective_contract_type(contract.contract_type or "", original_text))
+        for paragraph in anchors:
+            text = paragraph.text or ""
+            if keywords and any(k in text for k in keywords):
+                return paragraph
+        signature_markers = ("签字", "签章", "甲方（签字", "乙方（签字")
+        for paragraph in anchors:
+            if any(marker in (paragraph.text or "") for marker in signature_markers):
+                return paragraph
+        return anchors[-1] if anchors else None
+
+    if not _docx_anchor_paragraphs(doc):
+        add_safe_heading(contract.title or "合同修订稿", level=1)
+
+    anchors = _docx_anchor_paragraphs(doc)
+    original_text = "\n".join((paragraph.text or "").strip() for paragraph in anchors if (paragraph.text or "").strip())
+    accepted_issues = [issue for issue in issues if issue.status == "accepted"]
+    comment_count = 0
+    inserted_count = 0
+    for issue in accepted_issues:
+        if not issue.paragraph_index:
+            continue
+        index = int(issue.paragraph_index or 0)
+        if index < 1 or index > len(anchors):
+            continue
+        paragraph = anchors[index - 1]
+        runs = [run for run in paragraph.runs if (run.text or "").strip()]
+        if not runs:
+            runs = [paragraph.add_run(paragraph.text or " ")]
+        try:
+            for run in runs:
+                run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            add_comment_to_runs(runs, issue, note="批注定位于原合同条款；下方绿色文字为用户采纳后的拟修订内容。")
+            comment_count += 1
+            if (issue.proposed_revision or "").strip():
+                inserted = insert_paragraph_after(paragraph, f"Atlas 已采纳修订建议：{issue.proposed_revision}")
+                inserted_count += 1
+                for run in inserted.runs:
+                    run.italic = True
+                    try:
+                        run.font.color.rgb = RGBColor(31, 122, 84)
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+
+    accepted_missing = [
+        issue for issue in accepted_issues
+        if not issue.paragraph_index and (issue.proposed_revision or "").strip()
+    ]
+    anchors = _docx_anchor_paragraphs(doc)
+    for issue in accepted_missing:
+        anchor = find_insertion_anchor(issue, anchors)
+        if anchor is None:
+            paragraph = doc.add_paragraph()
+        else:
+            paragraph = insert_paragraph_before(anchor)
+        title_run = paragraph.add_run(f"Atlas 已采纳补充条款：{issue.title}。")
+        title_run.bold = True
+        paragraph.add_run(issue.proposed_revision)
+        inserted_count += 1
+        for run in paragraph.runs:
+            try:
+                run.font.color.rgb = RGBColor(31, 122, 84)
+            except Exception:
+                pass
+        try:
+            add_comment_to_runs(paragraph.runs, issue, note="全文缺失项已按用户采纳结果插入到修订稿中。")
+            comment_count += 1
+        except Exception:
+            pass
+    doc.save(str(target_path))
+    extracted = _extract_text_from_file(str(target_path), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    return extracted, target_path.stat().st_size
+
+
+def _create_contract_deliverable_versions(
+    db: Session,
+    p: Principal,
+    contract: ContractDocument,
+    original: ContractVersion,
+    issues: list[ContractReviewIssue],
+) -> tuple[ContractVersion, ContractVersion | None]:
+    active_issues = [issue for issue in issues if issue.status != "ignored"]
+    root = _contract_storage_root(p, contract.id)
+    root.mkdir(parents=True, exist_ok=True)
+    latest_no = db.query(ContractVersion).filter(ContractVersion.contract_id == contract.id).count()
+    base_stem = Path(contract.title or original.name or "合同").stem
+
+    report_version_no = latest_no + 1
+    report_text = _write_contract_review_report(contract, active_issues)
+    report_name = f"{base_stem}_AI审核报告_v{report_version_no}.md"
+    report_path = root / _safe_filename(report_name)
+    report_path.write_text(report_text, encoding="utf-8")
+    report_version = ContractVersion(
+        contract_id=contract.id,
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        version_no=report_version_no,
+        kind="report",
+        name=report_name,
+        mime_type="text/markdown;charset=utf-8",
+        storage_path=str(report_path),
+        size=report_path.stat().st_size,
+        extracted_text=report_text,
+        change_summary=f"AI 审核报告，包含 {len(active_issues)} 条有效建议",
+    )
+    db.add(report_version)
+    db.flush()
+
+    revised_version: ContractVersion | None = None
+    original_path = Path(original.storage_path)
+    if original_path.exists() and original_path.suffix.lower() == ".docx":
+        revised_version_no = report_version_no + 1
+        revised_name = f"{base_stem}_AI批注修订建议版_v{revised_version_no}.docx"
+        revised_path = root / _safe_filename(revised_name)
+        revised_text, revised_size = _create_revised_docx(original_path, revised_path, contract, active_issues)
+        revised_version = ContractVersion(
+            contract_id=contract.id,
+            tenant_id=p.tenant.id,
+            user_id=p.user.id,
+            version_no=revised_version_no,
+            kind="revised",
+            name=revised_name,
+            mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            storage_path=str(revised_path),
+            size=revised_size,
+            extracted_text=revised_text,
+            change_summary="保留原合同正文，仅将用户已采纳建议写入正文并插入 Word 批注；已忽略建议不写入修订稿",
+        )
+        db.add(revised_version)
+        db.flush()
+
+    return report_version, revised_version
+
+
+CONTRACT_REVIEW_SAMPLE_TITLE = "示例｜租房合同智能审核"
+CONTRACT_REVIEW_SAMPLE_FILENAME = "租房合同.docx"
+CONTRACT_REVIEW_SAMPLE_ASSET = Path(__file__).resolve().parent / "seed_assets" / "contracts" / CONTRACT_REVIEW_SAMPLE_FILENAME
+CONTRACT_REVIEW_SAMPLE_FOCUS = ["租金押金", "维修责任", "费用结算", "违约责任", "争议解决"]
+
+
+def _ensure_contract_review_examples_for_user(db: Session, *, tenant_id: str, user_id: str) -> int:
+    existing = db.query(ContractDocument.id).filter(
+        ContractDocument.tenant_id == tenant_id,
+        ContractDocument.user_id == user_id,
+        ContractDocument.title == CONTRACT_REVIEW_SAMPLE_TITLE,
+    ).first()
+    if existing or not CONTRACT_REVIEW_SAMPLE_ASSET.exists():
+        return 0
+
+    tenant = db.get(Tenant, tenant_id)
+    user = db.get(User, user_id)
+    if not tenant or not user:
+        return 0
+    p = Principal(user, tenant)
+
+    content = CONTRACT_REVIEW_SAMPLE_ASSET.read_bytes()
+    safe_name = _safe_filename(CONTRACT_REVIEW_SAMPLE_FILENAME)
+    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    contract = ContractDocument(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        title=CONTRACT_REVIEW_SAMPLE_TITLE,
+        contract_type="lease",
+        review_perspective="balanced",
+        status="uploaded",
+        summary="系统预置的租房合同审核示例，可用于体验合同解析、审查建议、采纳修订和报告预览。",
+    )
+    db.add(contract)
+    db.flush()
+
+    root = _contract_storage_root_for(tenant_id=tenant_id, user_id=user_id, contract_id=contract.id)
+    root.mkdir(parents=True, exist_ok=True)
+    original_path = root / safe_name
+    original_path.write_bytes(content)
+    extracted_text = _extract_text_from_file(str(original_path), mime)
+
+    file_asset = FileAsset(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=None,
+        employee_id=None,
+        original_name=CONTRACT_REVIEW_SAMPLE_FILENAME,
+        mime_type=mime,
+        size=len(content),
+        storage_path=str(original_path),
+        status="extracted" if extracted_text else "uploaded",
+        extracted_text=extracted_text,
+    )
+    db.add(file_asset)
+    db.flush()
+
+    original_version = ContractVersion(
+        contract_id=contract.id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        version_no=1,
+        kind="original",
+        name=CONTRACT_REVIEW_SAMPLE_FILENAME,
+        mime_type=mime,
+        storage_path=str(original_path),
+        size=len(content),
+        extracted_text=extracted_text,
+        change_summary="系统预置原始合同示例",
+    )
+    db.add(original_version)
+    db.flush()
+
+    contract.file_asset_id = file_asset.id
+    contract.current_version_id = original_version.id
+    issue_rows: list[ContractReviewIssue] = []
+    for item in _analyze_contract_issues(
+        extracted_text,
+        contract_type=contract.contract_type,
+        perspective=contract.review_perspective,
+        focus=CONTRACT_REVIEW_SAMPLE_FOCUS,
+    ):
+        row = ContractReviewIssue(
+            contract_id=contract.id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            severity=item["severity"],
+            category=item["category"],
+            title=item["title"],
+            clause_ref=item["clause_ref"],
+            paragraph_index=item["paragraph_index"],
+            excerpt=item["excerpt"],
+            risk=item["risk"],
+            recommendation=item["recommendation"],
+            proposed_revision=item["proposed_revision"],
+            confidence=float(item.get("confidence") or 0.72),
+        )
+        db.add(row)
+        issue_rows.append(row)
+    db.flush()
+
+    report_version, revised_version = _create_contract_deliverable_versions(
+        db,
+        p,
+        contract,
+        original_version,
+        issue_rows,
+    )
+    contract.status = "reviewed"
+    contract.summary = (
+        f"系统预置租房合同示例，已完成审核，共发现 {len(issue_rows)} 条建议。"
+        f"高风险 {sum(1 for i in issue_rows if i.severity == 'high')} 条，"
+        f"中风险 {sum(1 for i in issue_rows if i.severity == 'medium')} 条。"
+    )
+    contract.current_version_id = revised_version.id if revised_version else report_version.id
+    contract.updated_at = datetime.now(timezone.utc)
+    db.flush()
+    return 1
+
+
+_PREVIEW_TEXT_BYTES = int(os.environ.get("OPENATLAS_PREVIEW_TEXT_BYTES", str(1024 * 1024)) or str(1024 * 1024))
+_WORKSPACE_MAX_LIST = int(os.environ.get("OPENATLAS_WORKSPACE_MAX_LIST", "500") or "500")
+_ARTIFACT_MAX_BYTES = int(os.environ.get("OPENATLAS_ARTIFACT_MAX_BYTES", str(50 * 1024 * 1024)) or str(50 * 1024 * 1024))
+_BINARY_ARTIFACT_EXTS = {".doc", ".docx", ".pdf", ".ppt", ".pptx", ".xls", ".xlsx", ".zip"}
+_TEXT_ARTIFACT_EXTS = {".html", ".htm", ".md", ".markdown", ".csv", ".json", ".txt"}
+_HELPER_ARTIFACT_EXTS = {".py", ".pyc", ".js", ".ts", ".tsx", ".jsx", ".sh", ".bat", ".cmd", ".ps1"}
+_ARTIFACT_FILENAME_RE = re.compile(
+    r"(?P<name>[\w\u4e00-\u9fff][^\s'\"`<>|，。；;:：]*\.(?:docx?|pdf|xlsx?|pptx?|html?|md|markdown|csv|json|txt))",
+    flags=re.I,
+)
+_ARTIFACT_EXT_KIND = {
+    ".doc": "document",
+    ".docx": "document",
+    ".pdf": "pdf",
+    ".ppt": "presentation",
+    ".pptx": "presentation",
+    ".xls": "spreadsheet",
+    ".xlsx": "spreadsheet",
+    ".zip": "archive",
+}
+
+
+def _path_within(path: Path, roots: list[Path]) -> bool:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return False
+    for root in roots:
+        try:
+            resolved.relative_to(root.resolve())
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _session_for_user(db: Session, sid: str | None, p: Principal) -> SessionRecord | None:
+    if not sid:
+        return None
+    rec = db.get(SessionRecord, sid)
+    if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
+        raise HTTPException(404, "session not found")
+    return rec
+
+
+def _user_workspace_root(p: Principal, session_id: str | None = None) -> Path:
+    scope = session_id or "_shared"
+    return (Path(OPENATLAS_HOME) / "workspaces" / p.tenant.id / p.user.id / scope).resolve()
+
+
+def _user_upload_root(p: Principal, session_id: str | None = None) -> Path:
+    root = Path(OPENATLAS_HOME) / "uploads" / p.tenant.id / p.user.id
+    if session_id:
+        root = root / session_id
+    return root.resolve()
+
+
+def _allowed_user_file_roots(db: Session, p: Principal, session_id: str | None = None) -> list[Path]:
+    roots = [
+        _user_workspace_root(p, session_id),
+        _user_workspace_root(p, None),
+        _user_upload_root(p, session_id),
+        _user_upload_root(p, None),
+    ]
+    try:
+        roots.append(_tenant_hermes_home(db, p.tenant.id).resolve())
+    except Exception:
+        pass
+    return roots
+
+
+def _resolve_workspace_path(
+    db: Session,
+    p: Principal,
+    *,
+    scope: str,
+    session_id: str | None,
+    rel_path: str | None,
+    create_root: bool = True,
+) -> tuple[Path, Path]:
+    _session_for_user(db, session_id, p)
+    normalized_scope = (scope or "workspace").strip().lower()
+    if normalized_scope == "uploads":
+        root = _user_upload_root(p, session_id)
+    elif normalized_scope == "shared":
+        root = _user_workspace_root(p, None)
+    else:
+        root = _user_workspace_root(p, session_id)
+    if create_root:
+        root.mkdir(parents=True, exist_ok=True)
+    raw = (rel_path or "").replace("\\", "/").strip("/")
+    candidate = (root / raw).resolve()
+    if not _path_within(candidate, [root]):
+        raise HTTPException(403, "path outside workspace")
+    return root, candidate
+
+
+def _preview_kind_for_path(path: Path, mime: str) -> str:
+    lower = path.name.lower()
+    mt = (mime or "").lower()
+    if mt.startswith("image/") or lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")):
+        return "image"
+    if mt.startswith("text/html") or lower.endswith((".html", ".htm")):
+        return "html"
+    if "markdown" in mt or lower.endswith((".md", ".markdown")):
+        return "markdown"
+    if "json" in mt or lower.endswith(".json"):
+        return "json"
+    if "csv" in mt or lower.endswith(".csv"):
+        return "csv"
+    if mt == "application/pdf" or lower.endswith(".pdf"):
+        return "pdf_text"
+    if lower.endswith((".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx")):
+        return "document_text"
+    return "text"
+
+
+def _is_binary_artifact_name(name: str | Path, mime: str | None = None) -> bool:
+    ext = Path(str(name)).suffix.lower()
+    mt = (mime or "").lower()
+    return (
+        ext in _BINARY_ARTIFACT_EXTS
+        or mt in {
+            "application/pdf",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-powerpoint",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/zip",
+        }
+    )
+
+
+def _artifact_kind_for_file(path: Path, mime: str | None = None) -> str:
+    ext = path.suffix.lower()
+    if ext in {".html", ".htm"}:
+        return "html"
+    if ext in {".md", ".markdown"}:
+        return "markdown"
+    if ext == ".csv":
+        return "table"
+    if ext == ".json":
+        return "json"
+    if ext in _ARTIFACT_EXT_KIND:
+        return _ARTIFACT_EXT_KIND[ext]
+    if (mime or "").lower() == "application/pdf":
+        return "pdf"
+    return "report"
+
+
+def _content_looks_binary_stub(content: str | None) -> bool:
+    if not content:
+        return False
+    sample = content[:32]
+    return "\x00" in sample or sample.startswith("PK\x03\x04") or sample.startswith("%PDF")
+
+
+def _artifact_inline_content_for_row(art: dict[str, Any]) -> str:
+    """Persist inline content only for textual artifacts.
+
+    Binary deliverables must be copied into managed storage through source_path.
+    Keeping ZIP/PDF bytes in a SQL text column corrupts downloads and makes the
+    frontend render opaque file bytes as plain text.
+    """
+    name = str(art.get("name") or "")
+    mime = str(art.get("mime_type") or "")
+    content = str(art.get("content") or "")
+    if _is_binary_artifact_name(name, mime) or _content_looks_binary_stub(content):
+        return ""
+    return content
+
+
+def _artifact_can_copy_source_path(path: Path, roots: list[Path], *, trusted_generated: bool = False) -> bool:
+    """Decide whether a generated file may be copied into OpenAtlas storage.
+
+    Workspace/upload/Hermes roots are always valid. For trusted Hermes/assistant
+    generated deliverables, allow user-visible document outputs too, but reject
+    hidden config/secrets and oversized files.
+    """
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return False
+    if _path_within(resolved, roots):
+        return True
+    if not trusted_generated:
+        return False
+    try:
+        if not resolved.exists() or not resolved.is_file():
+            return False
+        if resolved.stat().st_size <= 0 or resolved.stat().st_size > _ARTIFACT_MAX_BYTES:
+            return False
+    except Exception:
+        return False
+    ext = resolved.suffix.lower()
+    if ext not in _BINARY_ARTIFACT_EXTS and ext not in _TEXT_ARTIFACT_EXTS:
+        return False
+    blocked_parts = {".ssh", ".aws", ".config", ".kube", ".gnupg", ".docker", ".npmrc", ".env"}
+    if any(part in blocked_parts or part.startswith(".") and part not in {".openatlas", ".hermes"} for part in resolved.parts):
+        return False
+    return True
+
+
+def _is_trusted_generated_artifact_source(source: str | None) -> bool:
+    value = (source or "").lower()
+    return any(key in value for key in ("hermes", "assistant", "tool", "reconcile", "runtime"))
+
+
+def _is_tmp_artifact_path(path: Path | None) -> bool:
+    if path is None:
+        return False
+    try:
+        resolved = path.resolve()
+        tmp_roots = {Path("/tmp").resolve(), Path("/private/tmp").resolve()}
+        return any(resolved == root or root in resolved.parents for root in tmp_roots)
+    except Exception:
+        return False
+
+
+def _candidate_existing_artifact_paths_from_name(name: str) -> list[str]:
+    safe_name = Path(str(name).strip().strip("'\"`，,;。")).name
+    if not safe_name or safe_name.startswith("."):
+        return []
+    ext = Path(safe_name).suffix.lower()
+    if ext not in _BINARY_ARTIFACT_EXTS and ext not in _TEXT_ARTIFACT_EXTS:
+        return []
+    roots = [
+        Path(str(OPENATLAS_HOME)),
+        Path(str(OPENATLAS_HOME)) / "output",
+        Path(str(HERMES_HOME)),
+        Path.home(),
+        Path.home() / "Desktop",
+    ]
+    found: list[str] = []
+    for root in roots:
+        try:
+            path = (root / safe_name).resolve()
+            if path.exists() and path.is_file():
+                found.append(str(path))
+        except Exception:
+            continue
+    return list(dict.fromkeys(found))
+
+
+def _docx_preview_html(path: Path) -> str:
+    try:
+        from docx import Document  # type: ignore
+    except Exception:
+        return _docx_raw_preview_html(path)
+    try:
+        doc = Document(str(path))
+    except Exception:
+        return _docx_raw_preview_html(path)
+
+    blocks: list[str] = ['<article class="docx-preview-document">']
+    index = 0
+
+    def run_html(paragraph: Any) -> str:
+        parts: list[str] = []
+        runs = list(getattr(paragraph, "runs", []) or [])
+        if not runs:
+            return _html.escape(getattr(paragraph, "text", "") or "")
+        for run in runs:
+            text = _html.escape(run.text or "")
+            if not text:
+                continue
+            styles: list[str] = []
+            try:
+                if run.bold:
+                    styles.append("font-weight:700")
+                if run.italic:
+                    styles.append("font-style:italic")
+                if run.underline:
+                    styles.append("text-decoration:underline")
+                if run.font.highlight_color:
+                    styles.append("background:rgba(250,204,21,.38)")
+            except Exception:
+                pass
+            if styles:
+                parts.append(f'<span style="{";".join(styles)}">{text}</span>')
+            else:
+                parts.append(text)
+        return "".join(parts)
+
+    for paragraph in getattr(doc, "paragraphs", []):
+        text = (paragraph.text or "").strip()
+        if not text:
+            continue
+        index += 1
+        style_name = ""
+        try:
+            style_name = (paragraph.style.name or "").lower()
+        except Exception:
+            style_name = ""
+        tag = "h2" if "heading" in style_name or "标题" in style_name else "p"
+        blocks.append(
+            f'<section class="docx-preview-block" data-index="{index}">'
+            f'<span class="docx-preview-index">{index}</span>'
+            f'<{tag}>{run_html(paragraph)}</{tag}>'
+            '</section>'
+        )
+
+    for table in getattr(doc, "tables", []):
+        rows_html: list[str] = []
+        for row in table.rows:
+            cells = []
+            row_text_parts = []
+            for cell in row.cells:
+                cell_text = "\n".join((p.text or "").strip() for p in cell.paragraphs if (p.text or "").strip())
+                row_text_parts.append(cell_text)
+                cells.append(f"<td>{_html.escape(cell_text)}</td>")
+            row_text = " ".join(row_text_parts).strip()
+            if not row_text:
+                continue
+            index += 1
+            rows_html.append(f'<tr class="docx-preview-block" data-index="{index}">{"".join(cells)}</tr>')
+        if rows_html:
+            blocks.append('<div class="docx-preview-table-wrap"><table>' + "".join(rows_html) + "</table></div>")
+
+    blocks.append("</article>")
+    return "\n".join(blocks)
+
+
+def _docx_raw_preview_html(path: Path) -> str:
+    rows = _docx_raw_paragraphs(path)
+    if not rows:
+        return ""
+    blocks: list[str] = ['<article class="docx-preview-document">']
+    for index, row in enumerate(rows, start=1):
+        text = _html.escape(row.get("text") or "")
+        if not text:
+            continue
+        style = row.get("style") or ""
+        tag = "h2" if any(key in style for key in ("heading", "title", "标题")) else "p"
+        blocks.append(
+            f'<section class="docx-preview-block" data-index="{index}">'
+            f'<span class="docx-preview-index">{index}</span>'
+            f'<{tag}>{text}</{tag}>'
+            '</section>'
+        )
+    blocks.append("</article>")
+    return "\n".join(blocks)
+
+
+def _read_preview_content(path: Path, mime: str, extracted_text: str = "") -> tuple[str, str, bool]:
+    kind = _preview_kind_for_path(path, mime)
+    if kind == "document_text" and path.suffix.lower() == ".docx" and path.exists():
+        html_preview = _docx_preview_html(path)
+        if html_preview:
+            return html_preview, "docx_html", True
+    if extracted_text:
+        return extracted_text, kind, True
+    if not path.exists() or not path.is_file():
+        return "", kind, False
+    if kind in {"html", "markdown", "json", "csv", "text"} or str(mime).startswith("text/"):
+        try:
+            data = path.read_bytes()[:_PREVIEW_TEXT_BYTES + 1]
+            truncated = len(data) > _PREVIEW_TEXT_BYTES
+            text = data[:_PREVIEW_TEXT_BYTES].decode("utf-8", errors="replace")
+            if truncated:
+                text += "\n\n[预览已截断，下载原文件查看完整内容]"
+            return text, kind, True
+        except Exception:
+            return "", kind, False
+    extracted = _extract_text_from_file(str(path), mime)
+    if extracted:
+        return extracted, kind, True
+    return "", kind, kind == "image"
+
+
+def _file_preview_payload(
+    *,
+    id: str,
+    name: str,
+    path: Path,
+    mime: str,
+    source: str,
+    extracted_text: str = "",
+    download_url: str,
+) -> dict:
+    content, kind, renderable = _read_preview_content(path, mime, extracted_text)
+    return {
+        "id": id,
+        "name": name,
+        "mime_type": mime,
+        "size": path.stat().st_size if path.exists() and path.is_file() else len(content.encode("utf-8")),
+        "preview_kind": kind,
+        "renderable": renderable,
+        "content": content,
+        "download_url": download_url,
+        "source": source,
+    }
+
+
+def _artifact_storage_root(row: TaskArtifact) -> Path:
+    return (
+        Path(OPENATLAS_HOME)
+        / "artifacts"
+        / row.tenant_id
+        / row.user_id
+        / row.session_id
+        / row.id
+    ).resolve()
+
+
+def _artifact_managed_path(row: TaskArtifact) -> Path:
+    return _artifact_storage_root(row) / _safe_filename(row.name or f"artifact-{row.id}.txt")
+
+
+def _materialize_artifact_file(db: Session, row: TaskArtifact) -> Path | None:
+    """Copy/write an artifact into OpenAtlas-controlled storage.
+
+    The source may be inline content or a Hermes-created file. The managed copy
+    becomes the stable client download/preview target.
+    """
+    existing = Path(row.storage_path) if getattr(row, "storage_path", "") else None
+    if existing and existing.exists() and existing.is_file():
+        row.storage_size = existing.stat().st_size
+        row.managed_status = "managed"
+        return existing
+
+    target = _artifact_managed_path(row)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = row.content or ""
+        is_binary = _is_binary_artifact_name(row.name or "", row.mime_type) or _content_looks_binary_stub(content)
+        source = _safe_candidate_path(row.source_path) if row.source_path else None
+        pseudo_principal = SimpleNamespace(
+            tenant=SimpleNamespace(id=row.tenant_id),
+            user=SimpleNamespace(id=row.user_id),
+        )
+        allowed_roots = _allowed_user_file_roots(db, pseudo_principal, row.session_id)
+
+        # Binary deliverables must be copied as files. A DOCX/PDF/XLSX/PPTX
+        # payload may contain bytes that look like text after JSON coercion
+        # (for example "PK\x03\x04..."); writing that through Text corrupts
+        # the artifact and makes the UI card/download lie.
+        if source is not None and _artifact_can_copy_source_path(
+            source,
+            allowed_roots,
+            trusted_generated=_is_trusted_generated_artifact_source(row.source),
+        ):
+            if not source.exists() or not source.is_file():
+                row.managed_status = "missing"
+                return None
+            if source.stat().st_size <= 0 or source.stat().st_size > _ARTIFACT_MAX_BYTES:
+                row.managed_status = "failed"
+                return None
+            target.write_bytes(source.read_bytes())
+        elif content and not is_binary:
+            target.write_text(content, encoding="utf-8")
+        else:
+            row.managed_status = "missing"
+            return None
+        row.storage_path = str(target)
+        row.storage_size = target.stat().st_size
+        row.managed_status = "managed"
+        return target
+    except Exception:
+        row.managed_status = "failed"
+        return None
+
+
+def _workspace_item(path: Path, root: Path) -> dict:
+    stat = path.stat()
+    mime = _guess_mime(str(path), None) if path.is_file() else "inode/directory"
+    rel = path.relative_to(root).as_posix()
+    return {
+        "name": path.name,
+        "path": rel,
+        "kind": "directory" if path.is_dir() else "file",
+        "mime_type": mime,
+        "size": stat.st_size if path.is_file() else 0,
+        "preview_kind": _preview_kind_for_path(path, mime) if path.is_file() else "directory",
+        "previewable": path.is_file(),
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+    }
+
+
 def _rough_token_count(text: str) -> int:
     if not text:
         return 0
@@ -1614,6 +11440,116 @@ def _session_summary(db: Session, rec: SessionRecord) -> dict:
     }
 
 
+def _assistant_has_substantive_answer(text: str, artifact_count: int = 0) -> bool:
+    if artifact_count > 0:
+        return True
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    if len(compact) < 700:
+        return False
+    strong_report_markers = [
+        "审计报告",
+        "风险清单",
+        "整改建议",
+        "复核材料",
+        "风险等级",
+        "风险矩阵",
+        "控制缺口",
+        "行动清单",
+    ]
+    if len(compact) >= 1200 and sum(1 for marker in strong_report_markers if marker in compact) >= 3:
+        return True
+    blocker_patterns = [
+        r"(无法继续|无法完成|无法生成|无法分析|无法处理|不能继续|不能完成|不能生成|不能分析|不能处理)",
+        r"(必须|需要|请).{0,18}(上传|提供).{0,36}(文件|数据|资料|原文|截图)",
+        r"(缺少|没有).{0,24}(必要|关键).{0,16}(信息|数据|材料|上下文)",
+    ]
+    if any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in blocker_patterns):
+        return False
+    markers = [
+        "核心结论",
+        "关键结论",
+        "分析",
+        "建议",
+        "风险",
+        "下一步",
+        "行动",
+        "验收标准",
+        "用户故事",
+        "里程碑",
+        "数据来源",
+        "免责声明",
+        "交付物",
+        "PRD",
+        "报告",
+        "清单",
+        "纪要",
+    ]
+    marker_count = sum(1 for marker in markers if marker in compact)
+    return marker_count >= 2 or (len(compact) >= 1200 and marker_count >= 1)
+
+
+def _assistant_looks_like_progress_update(text: str) -> bool:
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    if not compact:
+        return False
+    progress_patterns = [
+        r"^(我先|先|让我|我来|现在开始|接下来|好的，我先|好的，我来).{0,100}(搜索|搜集|获取|调研|收集|整理|查询|拉取|读取|生成|制作|绘制|转换|写入)",
+        r"(^|[。！？\n])(正在|开始|准备).{0,100}(搜索|搜集|获取|调研|收集|整理|查询|拉取|读取|生成|制作|绘制|转换|写入)",
+        r"(let me|i will|i'll|now i).{0,100}(search|collect|fetch|query|retrieve|load|generate|create|build|draw|convert|write)",
+    ]
+    return any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in progress_patterns)
+
+
+def _assistant_claims_artifact_delivery(text: str) -> bool:
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    if not compact:
+        return False
+    artifact_patterns = [
+        r"\.(html|htm|md|pdf|docx|xlsx|pptx)\b",
+        r"(文件路径|保存路径|输出路径|下载链接|交付物|saved to|written to)",
+        r"(已|已经).{0,18}(生成|完成|保存|写入|输出|转换).{0,40}(文档|文件|报告|页面|HTML|Word|PPT|表格|交付物)",
+        r"(文档|文件|报告|页面|HTML|Word|PPT|表格|交付物).{0,24}(已|已经).{0,18}(生成|完成|保存|写入|输出|转换)",
+    ]
+    return any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in artifact_patterns)
+
+
+def _validate_task_status_against_artifacts(
+    status: str,
+    reason: str,
+    text: str,
+    artifact_count: int,
+) -> tuple[str, str]:
+    """Prevent false completion when Hermes mentions a file before Atlas stores it.
+
+    A visible answer can be complete without an artifact. A claimed file
+    delivery is not complete until the file has been copied into OpenAtlas
+    managed storage, otherwise the chat card/right panel can disagree with the
+    runtime state.
+    """
+    if artifact_count > 0:
+        if status in {"running", "needs_input"}:
+            return "completed", "assistant produced downloadable artifacts"
+        return status, reason
+    if status != "completed":
+        return status, reason
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    hard_file_claim = any(
+        re.search(pattern, compact, flags=re.IGNORECASE)
+        for pattern in (
+            r"\.(html|htm|md|pdf|docx|xlsx|pptx)\b",
+            r"(文件路径|保存路径|输出路径|下载链接|saved to|written to)",
+            r"(已|已经).{0,18}(生成|保存|写入|转换).{0,40}(docx|xlsx|pptx|pdf|html|md|Word|PPT|表格|文件)",
+        )
+    )
+    if hard_file_claim:
+        return "running", "assistant referenced a deliverable; waiting for artifact reconciliation"
+    if _assistant_claims_artifact_delivery(text) and not _assistant_has_substantive_answer(text):
+        return "running", "assistant mentioned a deliverable but has not produced enough final content"
+    if _assistant_looks_like_progress_update(text):
+        return "running", "assistant produced a progress update"
+    return status, reason
+
+
 def _infer_task_status_from_assistant(text: str) -> tuple[str, str]:
     """Best-effort task closure signal from visible assistant output.
 
@@ -1623,13 +11559,51 @@ def _infer_task_status_from_assistant(text: str) -> tuple[str, str]:
     """
     compact = re.sub(r"\s+", " ", (text or "").strip())
     if not compact:
-        return "needs_input", "assistant returned no visible content"
+        return "running", "assistant returned no visible content; waiting for runtime/tool/artifact reconciliation"
+    if len(compact) >= 250 and any(
+        marker in compact
+        for marker in (
+            "推荐以下",
+            "协作顺序",
+            "你可以直接 @",
+            "推荐按以下顺序",
+            "建议按以下顺序",
+            "使用数智员工",
+        )
+    ):
+        return "completed", "assistant produced guidance and routing recommendations"
+    if _assistant_has_substantive_answer(compact):
+        return "completed", "assistant produced a substantive deliverable"
+    final_patterns = [
+        r"(已|已经).{0,12}(生成|完成|保存|写入|输出)",
+        r"(文件路径|保存路径|下载|交付物|报告如下|研究报告|免责声明|数据来源说明|final report|saved to)",
+        r"\.(html|htm|md|pdf|docx|xlsx|pptx)\b",
+    ]
+    has_final_signal = any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in final_patterns)
+    if not has_final_signal and len(compact) < 500:
+        if _assistant_looks_like_progress_update(compact):
+            return "running", "assistant produced a progress update"
+    if has_final_signal and len(compact) >= 800 and any(
+        marker in compact
+        for marker in ("免责声明", "数据来源", "核心结论", "风险矩阵", "研究报告", "交付物")
+    ):
+        return "completed", "assistant produced a final report/deliverable"
     ask_patterns = [
         r"请(提供|补充|确认|说明|上传|告知)",
         r"(需要|还需|缺少|无法继续|看不到).{0,24}(信息|资料|文件|上下文|参数|内容)",
         r"(which|please provide|need more|missing).{0,40}(information|context|file|details)",
     ]
     if compact.endswith(("?", "？")):
+        if len(compact) >= 120 and any(
+            marker in compact
+            for marker in ("推荐", "建议", "你可以直接 @", "可以选择", "下一步")
+        ):
+            return "completed", "assistant produced guidance and optional next-step prompt"
+        if any(
+            marker in compact
+            for marker in ("如果需要", "如需", "需要我协助", "是否需要我", "您希望哪种方式", "你希望哪种方式")
+        ):
+            return "completed", "assistant produced an answer with an optional follow-up question"
         return "needs_input", "assistant ended with a question"
     for pattern in ask_patterns:
         if re.search(pattern, compact, flags=re.IGNORECASE):
@@ -1691,6 +11665,226 @@ def _extract_tool_command(data: dict[str, Any]) -> str:
     return ""
 
 
+def _tool_error_text(data: dict[str, Any]) -> str:
+    err = data.get("error")
+    if err is False or (isinstance(err, str) and err.strip().lower() in {"", "false", "null", "undefined"}):
+        return ""
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    if isinstance(err, dict):
+        for key in ("message", "detail", "stderr", "output", "reason"):
+            val = err.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return json.dumps(err, ensure_ascii=False)[:1000]
+    for key in ("message", "detail", "stderr", "output", "result"):
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict):
+            nested = _tool_error_text(val)
+            if nested:
+                return nested
+    return "工具调用失败，但 Hermes 未返回具体错误。"
+
+
+def _tool_error_is_false_marker(value: Any) -> bool:
+    return value is False or (isinstance(value, str) and value.strip().lower() == "false")
+
+
+RUNTIME_OPEN_RUN_STATUSES = {"queued", "running", "waiting_approval", "waiting_input", "stalled"}
+RUNTIME_QUOTA_RUN_STATUSES = {"queued", "running"}
+RUNTIME_TERMINAL_SESSION_STATUSES = {"completed", "failed", "stopped", "cancelled", "archived"}
+RUNTIME_QUOTA_ACTIVE_WINDOW_SECONDS = 30 * 60
+
+
+def _is_quota_or_rate_limit_error(text: str) -> bool:
+    compact = str(text or "").lower()
+    if not compact:
+        return False
+    needles = (
+        "429",
+        "too many requests",
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "quota",
+        "insufficient_quota",
+        "capacity",
+        "overloaded",
+        "billing",
+        "余额不足",
+        "额度",
+        "限流",
+        "频率",
+        "请求过多",
+    )
+    return any(needle in compact for needle in needles)
+
+
+def _quota_waiting_reason(message: str = "") -> str:
+    detail = "模型服务当前触发额度或频率限制，Atlas 已保留本轮任务，可稍后继续或切换备选模型。"
+    if message and not re.search(r"(api[_ -]?key|sk-[a-z0-9]|bearer\s+)", message, flags=re.IGNORECASE):
+        return f"{detail} 原始提示: {message[:220]}"
+    return detail
+
+
+def _is_runtime_transient_error(text: str) -> bool:
+    compact = str(text or "").lower()
+    if not compact:
+        return False
+    needles = (
+        "server disconnected",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "remote protocol",
+        "incomplete read",
+        "read timeout",
+        "timed out",
+        "timeout",
+        "gateway",
+        "bad gateway",
+        "service unavailable",
+        "http 502",
+        "http 503",
+        "http 504",
+        "transport",
+        "peer closed",
+    )
+    return any(needle in compact for needle in needles)
+
+
+def _reconcile_open_session_runs(
+    db: Session,
+    *,
+    tenant_id: str,
+    user_id: str | None = None,
+    stale_after_seconds: int = RUNTIME_QUOTA_ACTIVE_WINDOW_SECONDS,
+) -> int:
+    """Close or stall stale logical runs before quota accounting.
+
+    This is intentionally conservative: it does not kill Hermes processes. It
+    only fixes OpenAtlas bookkeeping when a session already reached a terminal
+    status, or when a queued/running row has not emitted progress for a long
+    time. Without this guard, interrupted SSE clients, browser refreshes, and
+    deploy restarts can leave durable `session_runs` in `running` forever and
+    falsely exhaust tenant quota.
+    """
+    query = db.query(SessionRun, SessionRecord).join(SessionRecord, SessionRun.session_id == SessionRecord.id).filter(
+        SessionRun.tenant_id == tenant_id,
+        SessionRun.status.in_(RUNTIME_OPEN_RUN_STATUSES),
+    )
+    if user_id:
+        query = query.filter(SessionRun.user_id == user_id)
+    now = datetime.now(timezone.utc)
+    changed = 0
+    for run, rec in query.all():
+        session_status = (rec.task_status or "").strip()
+        run_status = (run.status or "").strip()
+        updated_at = run.updated_at or run.created_at
+        if updated_at and updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        age = (now - updated_at).total_seconds() if updated_at else stale_after_seconds + 1
+
+        if session_status in RUNTIME_TERMINAL_SESSION_STATUSES:
+            if session_status == "completed":
+                run.status = "completed"
+            elif session_status in {"stopped", "cancelled"}:
+                run.status = "cancelled"
+            else:
+                run.status = "failed"
+            run.stage = run.stage or "reconciled"
+            run.reason = run.reason or f"会话状态已是 {session_status}，自动收敛运行记录"
+            run.last_event_type = "openatlas.run_reconciled"
+            run.completed_at = run.completed_at or now
+            run.updated_at = now
+            changed += 1
+            continue
+
+        if run_status in RUNTIME_QUOTA_RUN_STATUSES and age > stale_after_seconds:
+            run.status = "stalled"
+            run.stage = "stale"
+            run.reason = "运行记录超过 30 分钟没有新事件，已从并发额度中移出，可在会话中继续/恢复。"
+            run.last_event_type = "openatlas.run_stalled"
+            run.updated_at = now
+            if session_status == "running":
+                rec.task_status = "stalled"
+                rec.task_summary = run.reason
+                rec.updated_at = now
+            changed += 1
+    if changed:
+        db.flush()
+    return changed
+
+
+def _runtime_quota_snapshot(db: Session, tenant_id: str, user_id: str) -> dict[str, Any]:
+    reconciled = _reconcile_open_session_runs(db, tenant_id=tenant_id)
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=RUNTIME_QUOTA_ACTIVE_WINDOW_SECONDS)
+    active_filter = (
+        SessionRun.tenant_id == tenant_id,
+        SessionRun.status.in_(RUNTIME_QUOTA_RUN_STATUSES),
+        SessionRun.updated_at >= cutoff,
+        SessionRecord.task_status.in_(["running", "quota_waiting"]),
+    )
+    tenant_active = db.query(SessionRun).join(SessionRecord, SessionRun.session_id == SessionRecord.id).filter(
+        *active_filter,
+    ).count()
+    user_active = db.query(SessionRun).join(SessionRecord, SessionRun.session_id == SessionRecord.id).filter(
+        *active_filter,
+        SessionRun.user_id == user_id,
+    ).count()
+    tenant_limited = OPENATLAS_MAX_ACTIVE_RUNS_PER_TENANT > 0 and tenant_active >= OPENATLAS_MAX_ACTIVE_RUNS_PER_TENANT
+    user_limited = OPENATLAS_MAX_ACTIVE_RUNS_PER_USER > 0 and user_active >= OPENATLAS_MAX_ACTIVE_RUNS_PER_USER
+    limited = tenant_limited or user_limited
+    reason = ""
+    if limited:
+        scope = "租户" if tenant_limited else "当前用户"
+        limit = OPENATLAS_MAX_ACTIVE_RUNS_PER_TENANT if tenant_limited else OPENATLAS_MAX_ACTIVE_RUNS_PER_USER
+        active = tenant_active if tenant_limited else user_active
+        reason = f"{scope}活跃任务已达上限 {active}/{limit}，本轮进入限流等待。"
+    return {
+        "limited": limited,
+        "tenant_active": tenant_active,
+        "user_active": user_active,
+        "tenant_limit": OPENATLAS_MAX_ACTIVE_RUNS_PER_TENANT,
+        "user_limit": OPENATLAS_MAX_ACTIVE_RUNS_PER_USER,
+        "retry_after_seconds": OPENATLAS_QUOTA_RETRY_AFTER_SECONDS,
+        "reconciled_stale_runs": reconciled,
+        "reason": reason,
+    }
+
+
+def _is_bound_openatlas_skill_lookup_failure(
+    tool_name: str,
+    payload: dict[str, Any],
+    skill_evidence: list[dict[str, Any]] | None,
+) -> bool:
+    """Treat failed skill_view for injected OpenAtlas skills as non-blocking.
+
+    OpenAtlas-managed skills are already injected into the system prompt from
+    tenant governance storage. Hermes' native ``skill_view`` tool may not know
+    those slugs, so a lookup failure should not poison the whole run when the
+    employee can continue with the injected instructions.
+    """
+    if _event_key(tool_name) != "skill_view":
+        return False
+    if not skill_evidence:
+        return False
+    haystack = " ".join(
+        str(payload.get(key) or "")
+        for key in ("command", "preview", "label", "tool", "tool_name", "name")
+    ).lower()
+    if not haystack:
+        return False
+    for skill in skill_evidence:
+        slug = str(skill.get("slug") or "").strip().lower()
+        name = str(skill.get("name") or "").strip().lower()
+        if (slug and slug in haystack) or (name and name in haystack):
+            return True
+    return False
+
+
 def _approval_choices(data: dict[str, Any]) -> list[str]:
     choices = data.get("choices")
     if isinstance(choices, list):
@@ -1718,7 +11912,15 @@ def _normalize_approval_payload(
         or ("Hermes 工具调用需要人工确认" if source == "hermes" else "执行型工具可能正在等待人工确认")
     )
     return {
-        "approval_id": data.get("approval_id") or data.get("approvalId") or data.get("id"),
+        "approval_id": (
+            data.get("approval_id")
+            or data.get("approvalId")
+            or data.get("approval_request_id")
+            or data.get("approvalRequestId")
+            or data.get("request_id")
+            or data.get("requestId")
+            or data.get("id")
+        ),
         "command": _extract_tool_command(data),
         "description": str(description),
         "pattern_key": data.get("pattern_key") or data.get("risk") or ev_name,
@@ -1745,6 +11947,397 @@ def _is_approval_event(ev_name: str, data: dict[str, Any]) -> bool:
 def _is_approval_sensitive_tool(tool_name: str) -> bool:
     n = _event_key(tool_name)
     return n in APPROVAL_SENSITIVE_TOOLS or any(part in n for part in ("terminal", "shell", "execute_code", "code_execution"))
+
+
+def _employee_allowed_toolsets(emp: DigitalEmployee | None) -> set[str]:
+    if not emp or not emp.toolsets:
+        return set()
+    try:
+        raw = json.loads(emp.toolsets or "[]")
+    except Exception:
+        raw = []
+    return {str(item).strip().lower() for item in raw if str(item).strip()}
+
+
+def _tool_required_toolsets(tool_name: str, command: str = "") -> set[str]:
+    n = _event_key(tool_name)
+    c = (command or "").lower()
+    if any(part in n for part in ("terminal", "shell")) or any(part in c for part in ("curl ", "wget ", " | python", "|python", "python3 -m")):
+        return {"terminal"}
+    if any(part in n for part in ("execute_code", "code_execution", "python")) or any(
+        part in c for part in ("execute_code", "code_execution")
+    ):
+        return {"execute_code", "code_execution", "python"}
+    if "browser" in n:
+        return {"browser"}
+    if "web" in n or "search" in n:
+        return {"web", "search"}
+    if "file" in n or "read" in n or "write" in n:
+        return {"file"}
+    return set()
+
+
+def _tool_allowed_by_employee_toolsets(emp: DigitalEmployee | None, tool_name: str, command: str = "") -> tuple[bool, str]:
+    allowed = _employee_allowed_toolsets(emp)
+    if not allowed:
+        return True, "employee_toolsets_unconfigured"
+    required = _tool_required_toolsets(tool_name, command)
+    if not required:
+        return True, "toolset_not_mapped"
+    normalized_allowed = set(allowed)
+    if "code_execution" in normalized_allowed:
+        normalized_allowed.add("execute_code")
+    if "execute_code" in normalized_allowed:
+        normalized_allowed.add("code_execution")
+    if required & normalized_allowed:
+        return True, "allowed"
+    return False, f"blocked_by_employee_toolsets:requires={','.join(sorted(required))};allowed={','.join(sorted(allowed))}"
+
+
+CAPABILITY_RULES: list[dict[str, Any]] = [
+    {
+        "key": "web_search",
+        "label": "联网检索",
+        "type": "tool",
+        "toolsets": {"web", "search", "browser"},
+        "patterns": ("联网", "搜索", "检索", "爬取", "今日", "最新", "新闻", "官网", "网页", "行情", "实时"),
+        "aliases": ("web", "search", "browser", "浏览器", "联网", "检索"),
+    },
+    {
+        "key": "browser",
+        "label": "浏览器操作",
+        "type": "tool",
+        "toolsets": {"browser"},
+        "patterns": ("打开网页", "网页", "浏览器", "截图", "页面", "网站", "登录", "点击"),
+        "aliases": ("browser", "浏览器", "网页"),
+    },
+    {
+        "key": "stock_data",
+        "label": "股票/行情数据",
+        "type": "skill",
+        "toolsets": {"web", "search", "browser"},
+        "patterns": ("股票", "股价", "A股", "港股", "美股", "行情", "投资", "估值", "财报", "年报", "研报", "云鼎科技"),
+        "aliases": ("股票", "股价", "a股", "投资", "stock", "finance", "akshare", "行情"),
+    },
+    {
+        "key": "file_context",
+        "label": "文件上下文",
+        "type": "context",
+        "toolsets": {"file"},
+        "patterns": ("上传", "附件", "文件", "文档", "DOCX", "PDF", "Excel", "CSV", "PPT", "图片"),
+        "aliases": ("file", "文件", "文档", "docx", "pdf", "excel", "xlsx", "csv", "ppt"),
+    },
+    {
+        "key": "spreadsheet",
+        "label": "表格处理",
+        "type": "skill",
+        "toolsets": {"file", "python", "execute_code", "code_execution"},
+        "patterns": ("Excel", "表格", "CSV", "透视", "数据表", "清洗", "统计", "图表"),
+        "aliases": ("excel", "xlsx", "csv", "表格", "spreadsheet", "pandas", "数据分析"),
+    },
+    {
+        "key": "code_execution",
+        "label": "代码执行",
+        "type": "tool",
+        "toolsets": {"execute_code", "code_execution", "python"},
+        "patterns": ("代码", "脚本", "Python", "计算", "建模", "画图", "可视化", "运行"),
+        "aliases": ("python", "execute_code", "code_execution", "脚本", "代码"),
+    },
+    {
+        "key": "terminal",
+        "label": "终端命令",
+        "type": "tool",
+        "toolsets": {"terminal", "shell"},
+        "patterns": ("终端", "命令", "shell", "安装", "执行命令", "本地文件", "写文件"),
+        "aliases": ("terminal", "shell", "bash", "命令"),
+    },
+    {
+        "key": "document_processing",
+        "label": "文档解析/修订",
+        "type": "skill",
+        "toolsets": {"file"},
+        "patterns": ("合同", "审合同", "审核", "修订", "批注", "Word", "DOCX", "论文", "文档解析", "PageTurner", "翻书"),
+        "aliases": ("合同", "法务", "docx", "word", "pageturner", "翻书", "文档"),
+    },
+    {
+        "key": "report_generation",
+        "label": "报告/交付物生成",
+        "type": "output",
+        "toolsets": {"file", "terminal", "python", "execute_code", "code_execution"},
+        "patterns": ("报告", "方案", "PPT", "HTML", "Markdown", "交付物", "下载", "生成", "导出"),
+        "aliases": ("报告", "方案", "ppt", "html", "markdown", "交付物", "写作"),
+    },
+    {
+        "key": "multi_agent",
+        "label": "多员工协作",
+        "type": "workflow",
+        "toolsets": set(),
+        "patterns": ("合作", "协作", "一起", "群聊", "作战室", "接力", "分工", "合稿", "审校"),
+        "aliases": ("协作", "项目", "合稿", "接力", "多员工"),
+    },
+]
+
+
+def _compact_match_text(*parts: Any) -> str:
+    return re.sub(r"\s+", "", " ".join(str(p or "") for p in parts)).lower()
+
+
+def _infer_task_capabilities(message: str, file_assets: list[FileAsset] | None = None, *, participant_count: int = 1) -> list[dict[str, Any]]:
+    compact = _compact_match_text(message)
+    required: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for rule in CAPABILITY_RULES:
+        patterns = [str(p).lower() for p in rule.get("patterns", [])]
+        if any(_compact_match_text(p) in compact for p in patterns):
+            item = {
+                "key": rule["key"],
+                "label": rule["label"],
+                "type": rule.get("type", "skill"),
+                "reason": "任务描述命中能力需求",
+                "required": True,
+            }
+            required.append(item)
+            seen.add(rule["key"])
+    if file_assets and "file_context" not in seen:
+        required.append({
+            "key": "file_context",
+            "label": "文件上下文",
+            "type": "context",
+            "reason": f"本轮上传/选择了 {len(file_assets)} 个附件",
+            "required": True,
+        })
+        seen.add("file_context")
+    if participant_count > 1 and "multi_agent" not in seen:
+        required.append({
+            "key": "multi_agent",
+            "label": "多员工协作",
+            "type": "workflow",
+            "reason": f"本轮包含 {participant_count} 位员工",
+            "required": True,
+        })
+    return required
+
+
+def _employee_skill_packages(db: Session, employee_id: str | None) -> list[SkillPackage]:
+    if not employee_id:
+        return []
+    rows = db.execute(
+        select(SkillPackage)
+        .join(SkillBinding, SkillPackage.id == SkillBinding.skill_id)
+        .where(
+            SkillBinding.target_type == "employee",
+            SkillBinding.target_id == employee_id,
+            SkillBinding.enabled == True,  # noqa: E712
+            SkillPackage.status == "enabled",
+        )
+    ).scalars().all()
+    return list(rows)
+
+
+def _employee_capability_profile(db: Session, emp: DigitalEmployee | None) -> dict[str, Any]:
+    if not emp:
+        return {"keys": [], "labels": [], "toolsets": [], "skills": [], "unrestricted_tools": False}
+    toolsets = _employee_allowed_toolsets(emp)
+    skills = _employee_skill_packages(db, emp.id)
+    skill_text = " ".join(f"{s.name} {s.slug} {s.description} {s.category} {s.source_ref or ''}" for s in skills)
+    profile_text = _compact_match_text(emp.display_name, emp.description, emp.system_prompt, emp.toolsets, skill_text)
+    keys: set[str] = set()
+    for rule in CAPABILITY_RULES:
+        aliases = [str(a).lower() for a in rule.get("aliases", [])]
+        if rule.get("toolsets") and (set(rule["toolsets"]) & toolsets):
+            keys.add(rule["key"])
+        elif any(_compact_match_text(alias) in profile_text for alias in aliases):
+            keys.add(rule["key"])
+    if "stock_data" in keys:
+        keys.update({"web_search", "report_generation"})
+    if "document_processing" in keys:
+        keys.update({"file_context", "report_generation"})
+    if "spreadsheet" in keys:
+        keys.update({"file_context", "code_execution", "report_generation"})
+    if "terminal" in toolsets:
+        keys.add("code_execution")
+    labels = [str(rule["label"]) for rule in CAPABILITY_RULES if rule["key"] in keys]
+    return {
+        "employee_id": emp.id,
+        "employee_name": emp.display_name,
+        "keys": sorted(keys),
+        "labels": labels,
+        "toolsets": sorted(toolsets),
+        "skills": [
+            {
+                "id": s.id,
+                "name": s.name,
+                "slug": s.slug,
+                "category": s.category,
+                "source_ref": s.source_ref,
+            }
+            for s in skills[:12]
+        ],
+        "unrestricted_tools": not bool(toolsets),
+    }
+
+
+def _capability_available(profile: dict[str, Any], capability_key: str) -> bool:
+    if capability_key in set(profile.get("keys") or []):
+        return True
+    # Empty toolsets means OpenAtlas is not blocking runtime tools for this
+    # employee. Treat tool-level capabilities as available but mark them as
+    # implicitly governed in the visible plan.
+    if profile.get("unrestricted_tools"):
+        rule = next((r for r in CAPABILITY_RULES if r["key"] == capability_key), None)
+        return bool(rule and rule.get("type") in {"tool", "context", "output"})
+    return False
+
+
+def _employee_capability_score(profile: dict[str, Any], required: list[dict[str, Any]]) -> int:
+    return sum(1 for cap in required if _capability_available(profile, str(cap.get("key") or "")))
+
+
+def _build_capability_plan(
+    db: Session,
+    p: Principal,
+    *,
+    message: str,
+    file_assets: list[FileAsset],
+    employees: list[DigitalEmployee],
+) -> dict[str, Any]:
+    required = _infer_task_capabilities(message, file_assets, participant_count=max(1, len(employees)))
+    profiles = [_employee_capability_profile(db, emp) for emp in employees]
+    current_profile = profiles[0] if profiles else {}
+    gaps = [
+        {
+            **cap,
+            "status": "missing",
+            "reason": f"当前员工缺少 {cap.get('label')}",
+        }
+        for cap in required
+        if not _capability_available(current_profile, str(cap.get("key") or ""))
+    ]
+    visible_candidates = [
+        emp for emp in db.query(DigitalEmployee).filter(
+            DigitalEmployee.tenant_id == p.tenant.id,
+            DigitalEmployee.status == EmployeeStatus.active,
+        ).all()
+        if _employee_visible_to_principal(db, emp, p)
+    ]
+    suggestions = []
+    for emp in visible_candidates:
+        profile = _employee_capability_profile(db, emp)
+        score = _employee_capability_score(profile, required)
+        if score <= 0:
+            continue
+        suggestions.append({
+            "employee_id": emp.id,
+            "employee_name": emp.display_name,
+            "score": score,
+            "matched": [
+                cap for cap in required
+                if _capability_available(profile, str(cap.get("key") or ""))
+            ],
+            "profile": {
+                "keys": profile.get("keys") or [],
+                "labels": profile.get("labels") or [],
+                "toolsets": profile.get("toolsets") or [],
+                "skills": profile.get("skills") or [],
+            },
+        })
+    suggestions.sort(key=lambda item: (-int(item["score"]), item["employee_name"]))
+    current_score = _employee_capability_score(current_profile, required)
+    best = suggestions[0] if suggestions else None
+    auto_route = None
+    if employees and len(employees) == 1 and best and best["employee_id"] != employees[0].id:
+        best_score = int(best["score"])
+        if gaps and best_score > current_score and best_score >= max(1, len(required) - 1):
+            auto_route = best
+    return {
+        "required_capabilities": required,
+        "current_employee": current_profile,
+        "employee_profiles": profiles,
+        "gaps": gaps,
+        "suggested_employees": suggestions[:5],
+        "auto_route": auto_route,
+        "summary": _capability_plan_summary(required, gaps, auto_route),
+    }
+
+
+def _capability_plan_summary(required: list[dict[str, Any]], gaps: list[dict[str, Any]], auto_route: dict[str, Any] | None) -> str:
+    if not required:
+        return "未识别到额外能力需求，按当前员工默认能力执行。"
+    labels = "、".join(str(item.get("label") or item.get("key")) for item in required)
+    if auto_route:
+        return f"本任务需要 {labels}；已路由给更匹配的「{auto_route.get('employee_name')}」。"
+    if gaps:
+        missing = "、".join(str(item.get("label") or item.get("key")) for item in gaps)
+        return f"本任务需要 {labels}；当前员工缺少 {missing}，将使用可用上下文并提示授权/转交。"
+    return f"本任务需要 {labels}；当前员工能力满足。"
+
+
+def _build_collaboration_policy(message: str, employees: list[DigitalEmployee], capability_plan: dict[str, Any]) -> dict[str, Any]:
+    if len(employees) <= 1:
+        return {
+            "mode": "single",
+            "requires_synthesis": False,
+            "owner_employee_id": employees[0].id if employees else None,
+            "owner_name": employees[0].display_name if employees else "",
+            "steps": ["任务理解", "执行", "最终交付"],
+        }
+    compact = _compact_match_text(message)
+    serial_markers = ("接力", "先", "然后", "再由", "最后由", "审校", "复核", "修改", "润色")
+    parallel_markers = ("合作", "一起", "协作", "分工", "合稿", "整合", "推广计划", "方案", "报告")
+    serial = any(marker in compact for marker in serial_markers)
+    parallel = any(marker in compact for marker in parallel_markers)
+    requires_synthesis = parallel or not serial
+    owner = employees[0]
+    return {
+        "mode": "parallel_synthesis" if requires_synthesis else "serial_handoff",
+        "requires_synthesis": requires_synthesis,
+        "owner_employee_id": owner.id,
+        "owner_name": owner.display_name,
+        "steps": (
+            ["任务理解", "分工规划", "员工执行", "合稿整合", "审校补全", "最终交付"]
+            if requires_synthesis else
+            ["任务理解", "接力执行", "末棒整合", "最终交付"]
+        ),
+        "participant_count": len(employees),
+        "capability_summary": capability_plan.get("summary") or "",
+    }
+
+
+def _select_synthesizer_employee(
+    db: Session,
+    p: Principal,
+    employees: list[DigitalEmployee],
+) -> DigitalEmployee | None:
+    preferred_terms = ("项目交付经理", "高管简报秘书", "产品需求经理", "行政小六")
+    visible = [
+        emp for emp in db.query(DigitalEmployee).filter(
+            DigitalEmployee.tenant_id == p.tenant.id,
+            DigitalEmployee.status == EmployeeStatus.active,
+        ).all()
+        if _employee_visible_to_principal(db, emp, p)
+    ]
+    for term in preferred_terms:
+        match = next((emp for emp in visible if term in emp.display_name), None)
+        if match:
+            return match
+    return employees[0] if employees else None
+
+
+def _capability_prompt_block(plan: dict[str, Any], policy: dict[str, Any]) -> str:
+    required = plan.get("required_capabilities") or []
+    gaps = plan.get("gaps") or []
+    suggestions = plan.get("suggested_employees") or []
+    return (
+        "<openatlas_capability_dispatch>\n"
+        "Atlas has already analyzed this task before execution. Do not tell the user you simply cannot perform the task if a routed employee, bound Skill, file context, or fallback delivery path is available.\n"
+        f"Capability summary: {plan.get('summary') or ''}\n"
+        f"Required capabilities: {', '.join(str(x.get('label') or x.get('key')) for x in required) or 'none'}\n"
+        f"Current gaps: {', '.join(str(x.get('label') or x.get('key')) for x in gaps) or 'none'}\n"
+        f"Suggested employees: {', '.join(str(x.get('employee_name')) for x in suggestions[:3]) or 'none'}\n"
+        f"Collaboration policy: {policy.get('mode')} / steps: {' -> '.join(policy.get('steps') or [])}\n"
+        "If a required capability is missing, clearly state the missing authorization or suggest transfer, but still provide the best reviewable result from available context.\n"
+        "</openatlas_capability_dispatch>"
+    )
 
 
 def _is_stale_running_session(row: SessionRecord) -> bool:
@@ -1795,13 +12388,17 @@ def _session_health_snapshot(db: Session, rec: SessionRecord) -> dict:
     if status == "needs_input":
         issues.append({"code": "needs_input", "severity": "warning", "message": rec.task_summary or "任务需要用户补充信息。"})
         actions.append({"key": "resume", "label": "继续补充", "kind": "resume"})
+    if status == "quota_waiting":
+        issues.append({"code": "quota_waiting", "severity": "warning", "message": rec.task_summary or "模型服务处于限流等待，可稍后继续。"})
+        actions.append({"key": "retry", "label": "稍后重试本轮", "kind": "task_status", "value": "running", "primary": True})
+        actions.append({"key": "resume", "label": "换员工接力", "kind": "resume"})
     if _is_stale_running_session(rec):
         issues.append({"code": "stale_running", "severity": "critical", "message": "任务运行中但超过 30 分钟没有更新。"})
-        actions.append({"key": "recover", "label": "补同步结果", "kind": "recover"})
+        actions.append({"key": "recover", "label": "同步最新结果", "kind": "recover"})
         actions.append({"key": "inspect_runtime", "label": "检查 Runtime", "kind": "runtime"})
     if latest_user and not latest_assistant_after_user:
         issues.append({"code": "awaiting_assistant", "severity": "warning", "message": "最近一轮用户输入后还没有可见模型回复。"})
-        actions.append({"key": "recover", "label": "补同步 Hermes 会话", "kind": "recover"})
+        actions.append({"key": "recover", "label": "同步 Hermes 会话", "kind": "recover"})
     if latest_user and not contexts:
         issues.append({"code": "missing_context_trace", "severity": "warning", "message": "本会话缺少上下文注入记录，难以追溯文件、Skill、记忆来源。"})
         actions.append({"key": "retry_with_context", "label": "重新带上下文执行", "kind": "resume"})
@@ -1856,6 +12453,7 @@ def _session_health_snapshot(db: Session, rec: SessionRecord) -> dict:
         "latest_runtime_event": _canvas_event_to_dict(latest_event) if latest_event else None,
         "latest_run": _session_run_to_dict(latest_run) if latest_run else None,
         "latest_workflow": _workflow_run_to_dict(latest_workflow) if latest_workflow else None,
+        "progress": _session_progress_snapshot(db, rec, latest_run=latest_run, latest_workflow=latest_workflow),
     }
 
 
@@ -1904,9 +12502,12 @@ def _artifact_provenance(db: Session, row: TaskArtifact) -> dict:
     if row.created_at:
         user_q = user_q.filter(MessageRecord.created_at <= row.created_at)
     user_msg = user_q.order_by(MessageRecord.created_at.desc()).first()
+    raw_source_path = getattr(row, "source_path", "") or ""
+    source_name = Path(raw_source_path).name if raw_source_path else ""
     return {
         "source": row.source,
-        "source_path": getattr(row, "source_path", "") or "",
+        "source_path": "",
+        "source_name": source_name,
         "run_id": getattr(row, "run_id", None),
         "hermes_run_id": run.hermes_run_id if run else "",
         "employee_id": getattr(row, "employee_id", None) or (msg.speaker_employee_id if msg else None),
@@ -1921,16 +12522,28 @@ def _artifact_provenance(db: Session, row: TaskArtifact) -> dict:
 
 
 def _artifact_to_dict(row: TaskArtifact, db: Session | None = None) -> dict:
+    managed_path = _materialize_artifact_file(db, row) if db is not None else (
+        Path(row.storage_path) if getattr(row, "storage_path", "") else None
+    )
+    raw_source_path = getattr(row, "source_path", "") or ""
+    is_binary = _is_binary_artifact_name(row.name or "", row.mime_type) or _content_looks_binary_stub(row.content or "")
+    display_kind = row.kind
+    if is_binary and display_kind in {"report", "artifact", "file", ""}:
+        display_kind = _artifact_kind_for_file(Path(row.name or ""), row.mime_type)
     out = {
         "id": row.id,
         "session_id": row.session_id,
         "message_id": row.message_id,
-        "kind": row.kind,
+        "kind": display_kind,
         "name": row.name,
         "mime_type": row.mime_type,
-        "content": row.content,
+        "content": "" if is_binary else row.content,
         "source": row.source,
-        "source_path": getattr(row, "source_path", "") or "",
+        "source_path": "",
+        "source_name": Path(raw_source_path).name if raw_source_path else "",
+        "storage_ref": f"artifact:{row.id}" if getattr(row, "storage_path", "") else "",
+        "storage_size": int(getattr(row, "storage_size", 0) or 0),
+        "managed_status": getattr(row, "managed_status", "") or ("managed" if managed_path else "pending"),
         "run_id": getattr(row, "run_id", None),
         "employee_id": getattr(row, "employee_id", None),
         "version": int(getattr(row, "version", 1) or 1),
@@ -1941,6 +12554,35 @@ def _artifact_to_dict(row: TaskArtifact, db: Session | None = None) -> dict:
     if db is not None:
         out["provenance"] = _artifact_provenance(db, row)
     return out
+
+
+def _dedupe_artifact_rows_for_display(rows: list[TaskArtifact]) -> list[TaskArtifact]:
+    """Hide duplicate discoveries of the same generated file/content."""
+    seen_paths: set[str] = set()
+    seen_content: set[tuple[str, str]] = set()
+    result: list[TaskArtifact] = []
+    for row in rows:
+        path = getattr(row, "source_path", "") or ""
+        content_key = _artifact_content_key(row.name, row.content or "")
+        display_content_key = (row.name, content_key[2]) if content_key else None
+        if path and path in seen_paths:
+            continue
+        if display_content_key and display_content_key in seen_content:
+            continue
+        result.append(row)
+        if path:
+            seen_paths.add(path)
+        if display_content_key:
+            seen_content.add(display_content_key)
+    return result
+
+
+def _can_access_artifact(row: TaskArtifact | None, p: Principal) -> bool:
+    if not row or row.tenant_id != p.tenant.id:
+        return False
+    if p.user.role in (UserRole.tenant_admin, UserRole.system_admin):
+        return True
+    return row.user_id == p.user.id
 
 
 def _record_context_injections(
@@ -2256,6 +12898,56 @@ def _session_run_to_dict(row: SessionRun) -> dict:
     }
 
 
+def _session_run_event_to_dict(row: SessionRunEvent) -> dict:
+    return {
+        "id": row.id,
+        "session_id": row.session_id,
+        "run_id": row.run_id,
+        "hermes_run_id": row.hermes_run_id,
+        "event_type": row.event_type,
+        "sequence": row.sequence,
+        "source": row.source,
+        "payload": _json_loads_obj(row.payload_json, {}),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _record_session_run_event(
+    db: Session,
+    *,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    event_type: str,
+    run_id: str | None = None,
+    hermes_run_id: str | None = None,
+    payload: dict[str, Any] | None = None,
+    source: str = "openatlas",
+) -> SessionRunEvent | None:
+    if not event_type:
+        return None
+    last = db.query(SessionRunEvent.sequence).filter(
+        SessionRunEvent.tenant_id == tenant_id,
+        SessionRunEvent.session_id == session_id,
+        SessionRunEvent.run_id == run_id,
+    ).order_by(SessionRunEvent.sequence.desc()).first()
+    seq = int(last[0] if last else 0) + 1
+    row = SessionRunEvent(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=session_id,
+        run_id=run_id,
+        hermes_run_id=(hermes_run_id or "")[:128],
+        event_type=event_type[:96],
+        sequence=seq,
+        source=source[:32],
+        payload_json=json.dumps(payload or {}, ensure_ascii=False),
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
 def _workflow_node_to_dict(row: WorkflowNodeRun) -> dict:
     return {
         "id": row.id,
@@ -2355,14 +13047,203 @@ def _workflow_fork_to_dict(row: WorkflowRunFork) -> dict:
     }
 
 
+def _session_progress_snapshot(
+    db: Session,
+    rec: SessionRecord,
+    *,
+    latest_run: SessionRun | None = None,
+    latest_workflow: WorkflowRun | None = None,
+) -> dict:
+    """User-facing task cockpit payload for long-running sessions.
+
+    This is intentionally a read-only projection: the execution engine keeps
+    writing SessionRun / Workflow* rows, while UI surfaces one consistent
+    mental model: where the task is, what happened, and how to recover.
+    """
+    latest_run = latest_run or db.query(SessionRun).filter(
+        SessionRun.session_id == rec.id,
+        SessionRun.tenant_id == rec.tenant_id,
+    ).order_by(SessionRun.created_at.desc()).first()
+    latest_workflow = latest_workflow or db.query(WorkflowRun).filter(
+        WorkflowRun.session_id == rec.id,
+        WorkflowRun.tenant_id == rec.tenant_id,
+    ).order_by(WorkflowRun.created_at.desc()).first()
+    nodes: list[WorkflowNodeRun] = []
+    steps: list[WorkflowStepEvent] = []
+    checkpoints: list[WorkflowCheckpoint] = []
+    forks: list[WorkflowRunFork] = []
+    if latest_workflow:
+        nodes = db.query(WorkflowNodeRun).filter(
+            WorkflowNodeRun.workflow_run_id == latest_workflow.id,
+            WorkflowNodeRun.tenant_id == rec.tenant_id,
+        ).order_by(WorkflowNodeRun.created_at.asc()).all()
+        steps = db.query(WorkflowStepEvent).filter(
+            WorkflowStepEvent.workflow_run_id == latest_workflow.id,
+            WorkflowStepEvent.tenant_id == rec.tenant_id,
+        ).order_by(WorkflowStepEvent.created_at.asc()).limit(500).all()
+        checkpoints = db.query(WorkflowCheckpoint).filter(
+            WorkflowCheckpoint.workflow_run_id == latest_workflow.id,
+            WorkflowCheckpoint.tenant_id == rec.tenant_id,
+        ).order_by(WorkflowCheckpoint.created_at.asc()).limit(200).all()
+        forks = db.query(WorkflowRunFork).filter(
+            WorkflowRunFork.session_id == rec.id,
+            WorkflowRunFork.tenant_id == rec.tenant_id,
+        ).order_by(WorkflowRunFork.created_at.asc()).limit(80).all()
+
+    status = rec.task_status or (latest_run.status if latest_run else "draft") or "draft"
+    if latest_workflow and latest_workflow.status in {"stalled", "failed", "waiting_approval", "quota_waiting", "running"}:
+        status = latest_workflow.status
+    if latest_run and latest_run.status in {"stalled", "failed", "waiting_approval", "quota_waiting", "running"}:
+        status = latest_run.status
+    is_stale = _is_stale_running_session(rec)
+    if is_stale:
+        status = "stalled"
+
+    status_order = {
+        "waiting_approval": 0,
+        "quota_waiting": 1,
+        "stalled": 1,
+        "failed": 2,
+        "running": 3,
+        "queued": 4,
+        "needs_input": 5,
+        "waiting_input": 5,
+        "completed": 6,
+        "done": 6,
+        "draft": 7,
+    }
+    active_node = None
+    if nodes:
+        active_node = sorted(nodes, key=lambda n: (status_order.get(n.status, 9), n.updated_at or n.created_at), reverse=False)[0]
+    latest_step = steps[-1] if steps else None
+    blocking_step = next(
+        (s for s in reversed(steps) if s.status in {"stalled", "failed", "waiting_approval", "quota_waiting"}),
+        None,
+    )
+    current_step = blocking_step or latest_step
+    if status in {"completed", "done", "failed", "cancelled", "stopped"}:
+        # A previous approval/failure checkpoint can remain in the replay
+        # timeline after a late Hermes transcript is reconciled. Once the
+        # run/workflow has closed, do not let that old blocking step override
+        # the user-visible phase/headline back to "waiting".
+        current_step = None
+
+    node_counts = {
+        "total": len(nodes),
+        "completed": sum(1 for n in nodes if n.status in {"done", "completed"}),
+        "running": sum(1 for n in nodes if n.status in {"running", "queued"}),
+        "waiting": sum(1 for n in nodes if n.status in {"waiting_approval", "waiting_input", "quota_waiting"}),
+        "stalled": sum(1 for n in nodes if n.status == "stalled"),
+        "failed": sum(1 for n in nodes if n.status == "failed"),
+    }
+    step_counts: dict[str, int] = {}
+    for step in steps:
+        step_counts[step.status] = step_counts.get(step.status, 0) + 1
+
+    phase_label = {
+        "draft": "等待任务",
+        "queued": "排队中",
+        "running": "执行中",
+        "waiting_approval": "等待人工确认",
+        "quota_waiting": "限流等待",
+        "needs_input": "需要补充信息",
+        "waiting_input": "需要补充信息",
+        "stalled": "后台处理中，自动同步中",
+        "failed": "失败，可重试",
+        "completed": "已完成",
+        "done": "已完成",
+    }.get(status, status)
+    if current_step and current_step.status == "waiting_approval":
+        phase_label = "等待人工确认"
+    elif current_step and current_step.status == "quota_waiting":
+        phase_label = "限流等待"
+    elif current_step and current_step.status == "stalled":
+        phase_label = "后台处理中，自动同步中"
+    elif current_step and current_step.status == "failed":
+        phase_label = "失败，可重试"
+
+    actions: list[dict[str, Any]] = []
+    if status in {"running", "stalled"} or is_stale:
+        actions.append({"key": "recover", "label": "同步最新结果", "kind": "recover", "primary": status == "stalled" or is_stale})
+    if checkpoints:
+        actions.append({
+            "key": "open_replay",
+            "label": f"打开回放并从 {len(checkpoints)} 个检查点继续",
+            "kind": "replay",
+            "primary": status in {"stalled", "failed", "waiting_approval", "quota_waiting"},
+        })
+    if status in {"needs_input", "waiting_input"}:
+        actions.append({"key": "resume_input", "label": "继续补充信息", "kind": "resume", "primary": True})
+    if status == "quota_waiting":
+        actions.append({"key": "retry_quota", "label": "稍后重试本轮", "kind": "task_status", "value": "running", "primary": True})
+        actions.append({"key": "relay_after_quota", "label": "换员工接力", "kind": "resume"})
+    if status == "failed":
+        actions.append({"key": "retry", "label": "重新进行", "kind": "task_status", "value": "running", "primary": True})
+    if latest_run and latest_run.hermes_run_id and status in {"running", "waiting_approval", "stalled"}:
+        actions.append({"key": "inspect_run", "label": "查看 Hermes Run", "kind": "runtime", "run_id": latest_run.hermes_run_id})
+
+    timeline = []
+    for step in list(reversed(steps))[:10]:
+        timeline.append({
+            "id": step.id,
+            "event_type": step.event_type,
+            "status": step.status,
+            "title": step.title or _step_title_for_event(step.event_type, _json_loads_obj(step.payload_json, {})),
+            "summary": step.summary or step.output_summary or step.input_summary,
+            "tool_name": step.tool_name,
+            "risk_level": step.risk_level,
+            "is_checkpoint": bool(step.is_checkpoint),
+            "recoverable": bool(step.is_checkpoint or step.status in {"failed", "stalled", "waiting_approval", "quota_waiting"} or step.event_type.startswith("tool.")),
+            "artifact_count": len(_json_loads_obj(step.artifact_ids, [])),
+            "created_at": step.created_at.isoformat() if step.created_at else None,
+        })
+
+    return {
+        "status": status,
+        "phase_label": phase_label,
+        "headline": (
+            (current_step.summary or current_step.title) if current_step
+            else rec.task_summary or rec.last_message or "当前会话还没有任务输入。"
+        ),
+        "current_node": _workflow_node_to_dict(active_node) if active_node else None,
+        "current_step": _workflow_step_to_dict(current_step) if current_step else None,
+        "latest_run": _session_run_to_dict(latest_run) if latest_run else None,
+        "workflow_run": _workflow_run_to_dict(latest_workflow, nodes) if latest_workflow else None,
+        "counts": {
+            "nodes": node_counts,
+            "steps": len(steps),
+            "step_statuses": step_counts,
+            "checkpoints": len(checkpoints),
+            "forks": len(forks),
+        },
+        "timeline": timeline,
+        "actions": actions,
+        "can_recover": any(a.get("kind") in {"recover", "replay", "resume"} for a in actions),
+        "recovery_hint": (
+            "Atlas 会继续监听 Hermes 结果并自动同步；必要时可打开回放，从检查点继续。"
+            if status in {"stalled", "failed", "waiting_approval", "quota_waiting"} or checkpoints
+            else "当前任务暂不需要恢复操作。"
+        ),
+        "updated_at": (
+            (latest_workflow.updated_at if latest_workflow else None)
+            or (latest_run.updated_at if latest_run else None)
+            or rec.updated_at
+        ).isoformat() if ((latest_workflow and latest_workflow.updated_at) or (latest_run and latest_run.updated_at) or rec.updated_at) else None,
+    }
+
+
 def _step_status_for_event(event_type: str) -> str:
     if event_type.endswith(".failed") or event_type in {"node.failed", "run.failed", "error"}:
         return "failed"
+    if event_type in {"run.stop_requested", "node.cancelled"}:
+        return "cancelled"
     if event_type in {"tool.started", "run.started", "node.started"}:
         return "running"
     if event_type in {"approval.required", "openatlas.approval_required"}:
         return "waiting_approval"
-    if event_type in {"openatlas.run_idle", "openatlas.run_detached", "node.stalled"}:
+    if event_type in {"runtime.quota_waiting", "openatlas.quota_waiting"}:
+        return "quota_waiting"
+    if event_type in {"openatlas.run_idle", "openatlas.run_detached", "openatlas.tool_waiting_diagnostic", "node.stalled"}:
         return "stalled"
     return "completed"
 
@@ -2378,8 +13259,8 @@ def _step_title_for_event(event_type: str, payload: dict[str, Any]) -> str:
         return "等待人工确认"
     if event_type.startswith("artifact."):
         return "交付物"
-    if event_type in {"openatlas.run_idle", "openatlas.run_detached", "node.stalled"}:
-        return "长任务停滞"
+    if event_type in {"openatlas.run_idle", "openatlas.run_detached", "openatlas.tool_waiting_diagnostic", "node.stalled"}:
+        return "长任务后台处理中"
     if event_type == "assistant.delta":
         return "模型回复"
     return event_type
@@ -2396,9 +13277,11 @@ def _should_checkpoint_event(event_type: str, status: str) -> bool:
             "node.failed",
             "openatlas.run_idle",
             "openatlas.run_detached",
+            "openatlas.tool_waiting_diagnostic",
             "approval.resolved",
+            "run.stop_requested",
         }
-        or status in {"failed", "stalled", "waiting_approval"}
+        or status in {"failed", "stalled", "waiting_approval", "cancelled"}
     )
 
 
@@ -2576,6 +13459,7 @@ async def _execute_checkpoint_resume(
                     user_id=wf.user_id,
                     employee_id=emp.id,
                     hermes_home=hermes_home,
+                    session_id=wf.session_id,
                     file_ctx_block="",
                     recent_context_block="",
                 )
@@ -2657,8 +13541,8 @@ async def _execute_checkpoint_resume(
                         _update_session_run(db, session_run_id, status="stalled", stage="runtime", reason="Hermes 长时间未推送新事件", event_type="openatlas.run_idle", hermes_run_id=hermes_run_id)
                         node.status = "stalled"
                         wf.status = "stalled"
-                        rec.task_status = "running"
-                        rec.task_summary = "恢复执行暂时无新事件，后台补同步仍在继续。"
+                        rec.task_status = "stalled"
+                        rec.task_summary = "后台同步中：Hermes 暂时没有新事件，Atlas 正在继续监听并自动同步结果。"
                         _record_workflow_step(
                             db,
                             tenant_id=wf.tenant_id,
@@ -2806,7 +13690,7 @@ async def _execute_checkpoint_resume(
                         kind=art["kind"],
                         name=art["name"],
                         mime_type=art["mime_type"],
-                        content=art["content"],
+                        content=_artifact_inline_content_for_row(art),
                         source="assistant",
                         run_id=session_run_id,
                         employee_id=node.employee_id,
@@ -3155,10 +14039,39 @@ def _hermes_message_role_content(item: dict[str, Any]) -> tuple[str, str]:
     return role, _sanitize_hermes_text(content)
 
 
+def _safe_candidate_path(path: str | Path) -> Path | None:
+    """Best-effort path parsing for Hermes tool outputs.
+
+    Hermes tools may emit paths like ``~/Desktop/foo.html`` or even
+    ``~some-user/foo``. ``Path.expanduser()`` raises RuntimeError when the
+    current process cannot resolve that home, and that must not break session
+    restore/history loading.
+    """
+    raw = str(path).strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser()
+    except RuntimeError:
+        if raw == "~" or raw.startswith("~/"):
+            home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+            if not home:
+                openatlas_home = Path(str(OPENATLAS_HOME))
+                if openatlas_home.is_absolute() and openatlas_home.name == ".openatlas":
+                    home = str(openatlas_home.parent)
+            if home:
+                return Path(home) / raw[2:]
+        return None
+    except Exception:
+        return None
+
+
 def _artifact_from_path(path: str | Path, *, source: str = "hermes_tool") -> dict | None:
     if isinstance(path, str) and (not path.strip() or len(path) > 4096 or "\n" in path or "\r" in path):
         return None
-    p = Path(path).expanduser()
+    p = _safe_candidate_path(path)
+    if p is None:
+        return None
     try:
         if not p.exists() or not p.is_file():
             return None
@@ -3167,17 +14080,48 @@ def _artifact_from_path(path: str | Path, *, source: str = "hermes_tool") -> dic
     try:
         resolved = p.resolve()
         home = Path.home().resolve()
+        openatlas_home = Path(str(OPENATLAS_HOME)).resolve()
+        hermes_home = Path(str(HERMES_HOME)).resolve()
         tmp_roots = {Path("/tmp").resolve(), Path("/private/tmp").resolve()}
         is_tmp_helper = any(resolved == root or root in resolved.parents for root in tmp_roots)
         is_user_visible = resolved == home or home in resolved.parents
+        is_openatlas_owned = resolved == openatlas_home or openatlas_home in resolved.parents
+        is_hermes_owned = resolved == hermes_home or hermes_home in resolved.parents
     except Exception:
         is_tmp_helper = False
         is_user_visible = False
+        is_openatlas_owned = False
+        is_hermes_owned = False
+        resolved = p
+    ext = p.suffix.lower()
+    resolved_text = str(resolved)
+    if "/.hermes/cache/screenshots/" in resolved_text or "/.openatlas/" in resolved_text and "/cache/screenshots/" in resolved_text:
+        return None
+    if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".tiff", ".svg"}:
+        return None
+    if ext in _BINARY_ARTIFACT_EXTS:
+        if is_tmp_helper:
+            return None
+        if not (is_user_visible or is_openatlas_owned or is_hermes_owned):
+            return None
+        try:
+            size = p.stat().st_size
+        except Exception:
+            return None
+        if size <= 0 or size > _ARTIFACT_MAX_BYTES:
+            return None
+        return {
+            "kind": _artifact_kind_for_file(p),
+            "name": p.name,
+            "mime_type": mimetypes.guess_type(str(p))[0] or "application/octet-stream",
+            "content": "",
+            "source": source,
+            "source_path": str(resolved),
+        }
     try:
         file_text = p.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return None
-    ext = p.suffix.lower()
     if ext in {".html", ".htm"}:
         if is_tmp_helper:
             return None
@@ -3218,7 +14162,7 @@ def _artifact_from_path(path: str | Path, *, source: str = "hermes_tool") -> dic
         }
     if is_tmp_helper or ext in {".py", ".js", ".ts", ".tsx", ".jsx", ".sh", ".pyc"}:
         return None
-    if not is_user_visible:
+    if not (is_user_visible or is_openatlas_owned or is_hermes_owned):
         return None
     return {
         "kind": "report",
@@ -3228,6 +14172,99 @@ def _artifact_from_path(path: str | Path, *, source: str = "hermes_tool") -> dic
         "source": source,
         "source_path": str(resolved),
     }
+
+
+def _coerce_json_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return value
+        try:
+            return json.loads(stripped)
+        except Exception:
+            return value
+    return value
+
+
+def _inline_artifact_from_payload(payload: Any, *, source: str = "hermes_tool") -> dict | None:
+    payload = _coerce_json_payload(payload)
+    if not isinstance(payload, dict):
+        return None
+    path = (
+        payload.get("path")
+        or payload.get("file_path")
+        or payload.get("filepath")
+        or payload.get("filename")
+        or payload.get("output_path")
+        or payload.get("resolved_path")
+    )
+    content = payload.get("content") or payload.get("text") or payload.get("data")
+    if not isinstance(content, str) or not content.strip():
+        return None
+    name = Path(str(path)).name if path else str(payload.get("name") or "Hermes 产物.md")
+    ext = Path(name).suffix.lower()
+    source_path = str(_safe_candidate_path(str(path)) or "") if path else ""
+    source_candidate = _safe_candidate_path(source_path) if source_path else None
+    if ext in _HELPER_ARTIFACT_EXTS or _is_tmp_artifact_path(source_candidate):
+        return None
+    if path and ext in _BINARY_ARTIFACT_EXTS:
+        from_path = _artifact_from_path(path, source=source)
+        if from_path:
+            return from_path
+        return {
+            "kind": _ARTIFACT_EXT_KIND.get(ext, "document"),
+            "name": name,
+            "mime_type": mimetypes.guess_type(name)[0] or "application/octet-stream",
+            "content": "",
+            "source": source,
+            "source_path": source_path,
+        }
+    if ext in {".html", ".htm"} or re.match(r"^\s*(<!doctype html|<html[\s>])", content, flags=re.I):
+        return {
+            "kind": "html",
+            "name": name if ext in {".html", ".htm"} else f"{Path(name).stem or 'Hermes 产物'}.html",
+            "mime_type": "text/html;charset=utf-8",
+            "content": _wrap_html_artifact(content),
+            "source": source,
+            "source_path": source_path,
+        }
+    if ext in {".md", ".markdown"}:
+        return {
+            "kind": "markdown",
+            "name": name,
+            "mime_type": "text/markdown;charset=utf-8",
+            "content": content,
+            "source": source,
+            "source_path": source_path,
+        }
+    if ext == ".csv":
+        return {
+            "kind": "table",
+            "name": name,
+            "mime_type": "text/csv;charset=utf-8",
+            "content": content[:200000],
+            "source": source,
+            "source_path": source_path,
+        }
+    if ext == ".json":
+        return {
+            "kind": "json",
+            "name": name,
+            "mime_type": "application/json;charset=utf-8",
+            "content": content[:200000],
+            "source": source,
+            "source_path": source_path,
+        }
+    if path:
+        return {
+            "kind": "report",
+            "name": name,
+            "mime_type": mimetypes.guess_type(name)[0] or "text/plain;charset=utf-8",
+            "content": content[:200000],
+            "source": source,
+            "source_path": source_path,
+        }
+    return None
 
 
 def _candidate_paths_from_payload(payload: Any) -> list[str]:
@@ -3245,6 +14282,8 @@ def _candidate_paths_from_payload(payload: Any) -> list[str]:
             paths.append(value.strip().strip("'\"`，,;"))
         for m in re.finditer(r"(?P<path>(?:~|/Users/|/tmp/|/private/tmp/)[^\s'\"`<>|]+)", value):
             paths.append(m.group("path").strip().strip("'\"`，,;"))
+        for m in _ARTIFACT_FILENAME_RE.finditer(value):
+            paths.extend(_candidate_existing_artifact_paths_from_name(m.group("name")))
 
     def walk(value: Any) -> None:
         if isinstance(value, dict):
@@ -3279,7 +14318,119 @@ def _tool_artifacts_from_payload(payload: Any, *, source: str = "hermes_tool") -
         art = _artifact_from_path(path, source=source)
         if art:
             artifacts.append(art)
+    if not artifacts:
+        inline = _inline_artifact_from_payload(payload, source=source)
+        if inline:
+            artifacts.append(inline)
     return artifacts[:12]
+
+
+def _iter_tool_call_payloads(tool_calls: Any) -> list[dict[str, Any]]:
+    raw = _coerce_json_payload(tool_calls)
+    if not raw:
+        return []
+    if isinstance(raw, dict):
+        raw_items: list[Any] = [raw]
+    elif isinstance(raw, list):
+        raw_items = raw
+    else:
+        return []
+    payloads: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        fn = item.get("function") if isinstance(item.get("function"), dict) else {}
+        tool_name = str(
+            item.get("tool_name")
+            or item.get("name")
+            or item.get("tool")
+            or fn.get("name")
+            or ""
+        ).strip()
+        args = (
+            item.get("args")
+            or item.get("arguments")
+            or item.get("parameters")
+            or item.get("input")
+            or fn.get("arguments")
+            or {}
+        )
+        args = _coerce_json_payload(args)
+        payload: dict[str, Any] = {}
+        if isinstance(args, dict):
+            payload.update(args)
+        else:
+            payload["input"] = args
+        payload.update({
+            "tool_name": tool_name,
+            "name": tool_name,
+            "result": item.get("result") or item.get("output"),
+            "error": item.get("error"),
+        })
+        for key in ("path", "file_path", "filepath", "filename", "output_path", "content"):
+            if key in item and key not in payload:
+                payload[key] = item.get(key)
+        payloads.append(payload)
+    return payloads
+
+
+def _tool_artifacts_from_tool_calls(tool_calls: Any, *, source: str = "hermes_tool_call") -> list[dict]:
+    artifacts: list[dict] = []
+    for payload in _iter_tool_call_payloads(tool_calls):
+        tool_name = _event_key(payload.get("tool_name") or payload.get("name"))
+        if tool_name and not any(part in tool_name for part in ("write", "file", "terminal", "execute_code", "artifact")):
+            continue
+        for art in _tool_artifacts_from_payload(payload, source=source):
+            key = (art.get("source_path") or "", art.get("name") or "", art.get("content") or "")
+            if not any((a.get("source_path") or "", a.get("name") or "", a.get("content") or "") == key for a in artifacts):
+                artifacts.append(art)
+    return artifacts[:12]
+
+
+def _artifact_content_key(name: str, content: str | None) -> tuple[str, str, str] | None:
+    if not content:
+        return None
+    digest = hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
+    return (name, "__content__", digest)
+
+
+def _remember_artifact_key(
+    artifact_keys: set[tuple[str, str, str]],
+    artifact_paths: set[str],
+    art: dict,
+    source: str,
+) -> None:
+    path = art.get("source_path") or ""
+    artifact_keys.add((art["name"], source, path))
+    content_key = _artifact_content_key(art["name"], art.get("content") or "")
+    if content_key:
+        artifact_keys.add(content_key)
+    if path:
+        artifact_paths.add(path)
+
+
+def _artifact_keys(db: Session, session_id: str, *, active_only: bool = True) -> tuple[set[tuple[str, str, str]], set[str]]:
+    q = db.query(TaskArtifact).filter_by(session_id=session_id)
+    if active_only:
+        q = q.filter(TaskArtifact.archived == False)  # noqa: E712
+    rows = q.all()
+    keys = {(a.name, a.source, getattr(a, "source_path", "") or "") for a in rows}
+    for row in rows:
+        content_key = _artifact_content_key(row.name, row.content or "")
+        if content_key:
+            keys.add(content_key)
+    paths = {getattr(a, "source_path", "") or "" for a in rows if getattr(a, "source_path", "")}
+    return keys, paths
+
+
+def _artifact_seen(artifact_keys: set[tuple[str, str, str]], artifact_paths: set[str], art: dict, source: str) -> bool:
+    path = art.get("source_path") or ""
+    content_key = _artifact_content_key(art["name"], art.get("content") or "")
+    return (
+        bool(path and path in artifact_paths)
+        or (art["name"], source, path) in artifact_keys
+        or bool(content_key and content_key in artifact_keys)
+    )
 
 
 def _next_artifact_version(db: Session, *, session_id: str, name: str, exclude_id: str | None = None) -> int:
@@ -3297,15 +14448,22 @@ def _next_artifact_version(db: Session, *, session_id: str, name: str, exclude_i
 
 
 def _tool_artifacts_from_hermes_item(item: dict[str, Any], *, prefix: str = "Hermes 产物") -> list[dict]:
+    artifacts: list[dict] = []
     role, content = _hermes_message_role_content(item)
     tool_name = str(item.get("tool_name") or item.get("name") or "").strip()
-    if role != "tool" or tool_name not in {"write_file", "write", "terminal", "execute_code"} or not content:
-        return []
-    try:
-        payload = json.loads(content)
-    except Exception:
-        payload = content
-    return _tool_artifacts_from_payload(payload, source="hermes_tool")
+    if role == "tool" and tool_name in {"write_file", "write", "terminal", "execute_code"} and content:
+        payload = _coerce_json_payload(content)
+        artifacts.extend(_tool_artifacts_from_payload(payload, source="hermes_tool"))
+    artifacts.extend(_tool_artifacts_from_tool_calls(item.get("tool_calls"), source="hermes_tool_call"))
+    deduped: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for art in artifacts:
+        key = (art.get("source_path") or "", art.get("name") or "", art.get("content") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(art)
+    return deduped[:12]
 
 
 def _persist_tool_event_artifacts(
@@ -3324,10 +14482,10 @@ def _persist_tool_event_artifacts(
     db = SessionLocal()
     persisted: list[dict] = []
     try:
-        seen = {(a.name, a.source, a.source_path) for a in db.query(TaskArtifact).filter_by(session_id=session_id).all()}
+        artifact_seen, artifact_paths = _artifact_keys(db, session_id)
         for art in artifacts:
-            key = (art["name"], art.get("source") or "hermes_tool_live", art.get("source_path") or "")
-            if key in seen:
+            source = art.get("source") or "hermes_tool_live"
+            if _artifact_seen(artifact_seen, artifact_paths, art, source):
                 continue
             row = TaskArtifact(
                 tenant_id=tenant_id,
@@ -3337,8 +14495,8 @@ def _persist_tool_event_artifacts(
                 kind=art["kind"],
                 name=art["name"],
                 mime_type=art["mime_type"],
-                content=art["content"],
-                source=art.get("source") or "hermes_tool_live",
+                content=_artifact_inline_content_for_row(art),
+                source=source,
                 source_path=art.get("source_path") or "",
                 run_id=run_id,
                 employee_id=employee_id,
@@ -3351,11 +14509,194 @@ def _persist_tool_event_artifacts(
             db.add(row)
             db.flush()
             persisted.append(_artifact_to_dict(row, db))
-            seen.add(key)
+            _remember_artifact_key(artifact_seen, artifact_paths, art, source)
         db.commit()
         return persisted
     finally:
         db.close()
+
+
+def _assistant_has_final_delivery(text: str, artifact_count: int = 0) -> bool:
+    if artifact_count > 0:
+        return True
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    if not compact:
+        return False
+    final_patterns = [
+        r"(报告|文件|页面|PPT|HTML|分析).{0,20}(已|已经).{0,12}(生成|完成|保存|写入|输出)",
+        r"(已|已经).{0,12}(生成|完成|保存|写入|输出).{0,30}(报告|文件|页面|PPT|HTML|交付物)",
+        r"(文件路径|保存路径|输出路径|saved to|written to).{0,160}\.(html|htm|md|pdf|docx|xlsx|pptx)\b",
+    ]
+    return any(re.search(pattern, compact, flags=re.IGNORECASE) for pattern in final_patterns)
+
+
+def _sync_runtime_completion_from_reconcile(
+    db: Session,
+    *,
+    rec: SessionRecord,
+    employee_id: str | None = None,
+) -> None:
+    artifacts = db.query(TaskArtifact).filter(
+        TaskArtifact.session_id == rec.id,
+        TaskArtifact.tenant_id == rec.tenant_id,
+        TaskArtifact.archived == False,  # noqa: E712
+    ).all()
+    latest_assistant = db.query(MessageRecord).filter(
+        MessageRecord.session_id == rec.id,
+        MessageRecord.role == "assistant",
+    ).order_by(MessageRecord.created_at.desc()).first()
+    latest_user = db.query(MessageRecord).filter(
+        MessageRecord.session_id == rec.id,
+        MessageRecord.role == "user",
+    ).order_by(MessageRecord.created_at.desc()).first()
+    assistant_text = latest_assistant.content if latest_assistant else ""
+    inferred_status, inferred_reason = _infer_task_status_from_assistant(assistant_text or "")
+    latest_assistant_after_user = bool(
+        latest_assistant
+        and (
+            not latest_user
+            or not latest_assistant.created_at
+            or not latest_user.created_at
+            or latest_assistant.created_at >= latest_user.created_at
+        )
+    )
+    latest_artifact_after_user = any(
+        not latest_user
+        or not getattr(a, "created_at", None)
+        or not latest_user.created_at
+        or a.created_at >= latest_user.created_at
+        for a in artifacts
+    )
+    delivered = latest_assistant_after_user and _assistant_has_final_delivery(assistant_text or "", len(artifacts))
+    completed_from_reconcile = bool(latest_assistant_after_user and inferred_status == "completed")
+    delivered = bool(delivered or (latest_artifact_after_user and latest_assistant_after_user))
+    latest_run = db.query(SessionRun).filter(
+        SessionRun.session_id == rec.id,
+        SessionRun.tenant_id == rec.tenant_id,
+    ).order_by(SessionRun.created_at.desc()).first()
+    has_any_runtime_evidence = bool(latest_user or latest_assistant or artifacts or latest_run)
+
+    if delivered or completed_from_reconcile:
+        rec.task_status = "completed"
+        names = " / ".join(a.name for a in artifacts[:6])
+        if delivered:
+            rec.task_summary = f"任务已完成，交付物已入库。{('交付物: ' + names) if names else ''}"
+        else:
+            rec.task_summary = inferred_reason or "后台自动同步发现最终回复，已修正为完成。"
+        if latest_run and latest_run.status in {"running", "stalled", "waiting_approval", "waiting_input", "failed"}:
+            latest_run.status = "completed"
+            latest_run.stage = "artifact" if delivered else "assistant"
+            latest_run.reason = (
+                "后台自动同步发现最终回复/交付物，已修正为完成"
+                if delivered else
+                "后台自动同步发现最终回复，已修正为完成"
+            )
+            latest_run.last_event_type = "runtime.reconciled"
+            latest_run.completed_at = datetime.now(timezone.utc)
+            latest_run.updated_at = datetime.now(timezone.utc)
+        cutoff_candidates = [
+            latest_assistant.created_at if latest_assistant else None,
+            *(a.created_at for a in artifacts if getattr(a, "created_at", None)),
+        ]
+        cutoff = max((v for v in cutoff_candidates if v), default=datetime.now(timezone.utc))
+        open_runs = db.query(SessionRun).filter(
+            SessionRun.session_id == rec.id,
+            SessionRun.tenant_id == rec.tenant_id,
+            SessionRun.status.in_(["running", "stalled", "waiting_approval", "waiting_input"]),
+            SessionRun.created_at <= cutoff,
+        ).all()
+        for run in open_runs:
+            run.status = "completed"
+            run.stage = "artifact" if delivered else "assistant"
+            run.reason = "已有可见回复/交付物，自动收敛运行态为完成"
+            run.last_event_type = "runtime.reconciled"
+            run.completed_at = run.completed_at or datetime.now(timezone.utc)
+            run.updated_at = datetime.now(timezone.utc)
+        open_workflows = db.query(WorkflowRun).filter(
+            WorkflowRun.session_id == rec.id,
+            WorkflowRun.tenant_id == rec.tenant_id,
+            WorkflowRun.status.in_(["running", "stalled", "waiting_approval", "waiting_input", "needs_input"]),
+            WorkflowRun.created_at <= cutoff,
+        ).all()
+        for wf_row in open_workflows:
+            wf_row.status = "completed"
+            wf_row.summary = "已有可见回复/交付物，自动收敛工作流为完成。"
+            wf_row.completed_at = wf_row.completed_at or datetime.now(timezone.utc)
+            wf_row.updated_at = datetime.now(timezone.utc)
+            node_rows = db.query(WorkflowNodeRun).filter(
+                WorkflowNodeRun.workflow_run_id == wf_row.id,
+                WorkflowNodeRun.tenant_id == rec.tenant_id,
+                WorkflowNodeRun.status.in_(["running", "queued", "waiting_approval", "waiting_input", "needs_input", "stalled"]),
+            ).all()
+            for node in node_rows:
+                node.status = "done"
+                node.completed_at = node.completed_at or datetime.now(timezone.utc)
+                node.updated_at = datetime.now(timezone.utc)
+    elif latest_run and latest_run.status in {"stalled", "waiting_approval"}:
+        rec.task_status = "waiting_approval" if latest_run.status == "waiting_approval" else "running"
+        rec.task_summary = latest_run.reason or (
+            "等待用户确认工具授权。"
+            if latest_run.status == "waiting_approval"
+            else
+            "Hermes 长任务正在后台处理中，Atlas 会继续监听并自动同步结果。"
+        )
+    elif not latest_user and not latest_assistant and not artifacts:
+        # A newly created or externally marked running session has no user turn yet.
+        # Do not collapse it to needs_input just because there is no assistant text.
+        if latest_run and latest_run.status in RUNTIME_OPEN_RUN_STATUSES:
+            rec.task_status = "waiting_approval" if latest_run.status == "waiting_approval" else latest_run.status
+            rec.task_summary = latest_run.reason or rec.task_summary or "任务运行态已记录，等待后续事件。"
+        elif (rec.task_status or "") in {"queued", "running", "waiting_approval", "waiting_input", "quota_waiting", "stalled"}:
+            rec.task_status = rec.task_status or "running"
+            rec.task_summary = rec.task_summary or "任务运行态已记录，等待后续事件。"
+        elif not has_any_runtime_evidence:
+            rec.task_status = rec.task_status or "draft"
+    elif inferred_status == "needs_input":
+        rec.task_status = "needs_input"
+        rec.task_summary = inferred_reason
+    else:
+        rec.task_status = inferred_status
+        rec.task_summary = inferred_reason if inferred_status != "completed" else rec.task_summary
+
+    rec.message_count = _session_message_count(db, rec.id, rec.message_count)
+    rec.updated_at = datetime.now(timezone.utc)
+
+    wf = db.query(WorkflowRun).filter(
+        WorkflowRun.session_id == rec.id,
+        WorkflowRun.tenant_id == rec.tenant_id,
+    ).order_by(WorkflowRun.created_at.desc()).first()
+    if wf:
+        nodes = db.query(WorkflowNodeRun).filter(WorkflowNodeRun.workflow_run_id == wf.id).all()
+        artifact_ids = [a.id for a in artifacts]
+        for node in nodes:
+            if employee_id and node.employee_id != employee_id:
+                continue
+            if delivered or completed_from_reconcile:
+                node.status = "done"
+                node.completed_at = node.completed_at or datetime.now(timezone.utc)
+                node.output_summary = (assistant_text or node.output_summary or "")[:4000]
+                if artifact_ids:
+                    node.artifact_ids = json.dumps(list(dict.fromkeys([
+                        *_json_loads_obj(node.artifact_ids, []),
+                        *artifact_ids,
+                    ])), ensure_ascii=False)
+            elif latest_run and latest_run.status in {"stalled", "waiting_approval"}:
+                node.status = latest_run.status
+                node.error = latest_run.reason or node.error
+            node.updated_at = datetime.now(timezone.utc)
+        if delivered or completed_from_reconcile:
+            wf.status = "completed"
+            wf.completed_at = wf.completed_at or datetime.now(timezone.utc)
+            wf.summary = f"后台自动同步完成: {len(nodes)} 个节点，交付物 {len(artifacts)} 个"
+        elif any(n.status == "waiting_approval" for n in nodes):
+            wf.status = "waiting_approval"
+            wf.completed_at = None
+            wf.summary = "协作运行等待人工确认"
+        elif any(n.status == "stalled" for n in nodes) or (latest_run and latest_run.status == "stalled"):
+            wf.status = "stalled"
+            wf.completed_at = None
+            wf.summary = "协作运行暂时没有新事件，Atlas 正在后台监听并自动同步"
+        wf.updated_at = datetime.now(timezone.utc)
 
 
 async def _reconcile_hermes_session_transcript(
@@ -3388,15 +14729,16 @@ async def _reconcile_hermes_session_transcript(
         if role == "assistant" and content
     ]
     imported = 0
-    artifact_seen = {
-        (a.name, a.source, getattr(a, "source_path", "") or "")
-        for a in db.query(TaskArtifact).filter_by(session_id=rec.id).all()
-    }
+    artifact_seen, artifact_paths = _artifact_keys(db, rec.id)
     for item in items:
         role, content = _hermes_message_role_content(item)
-        for art in _tool_artifacts_from_hermes_item(item, prefix="Hermes 产物"):
-            key = (art["name"], art.get("source") or "hermes_tool", art.get("source_path") or "")
-            if key in artifact_seen:
+        try:
+            hermes_artifacts = _tool_artifacts_from_hermes_item(item, prefix="Hermes 产物")
+        except Exception:
+            hermes_artifacts = []
+        for art in hermes_artifacts:
+            source = art.get("source") or "hermes_tool"
+            if _artifact_seen(artifact_seen, artifact_paths, art, source):
                 continue
             db.add(TaskArtifact(
                 tenant_id=tenant_id,
@@ -3406,16 +14748,39 @@ async def _reconcile_hermes_session_transcript(
                 kind=art["kind"],
                 name=art["name"],
                 mime_type=art["mime_type"],
-                content=art["content"],
+                content=_artifact_inline_content_for_row(art),
                 source=art.get("source") or "hermes_tool",
                 source_path=art.get("source_path") or "",
                 employee_id=employee_id or rec.employee_id,
                 version=_next_artifact_version(db, session_id=rec.id, name=art["name"]),
                 provenance_payload=json.dumps({"origin": "reconcile_tool"}, ensure_ascii=False),
             ))
-            artifact_seen.add(key)
+            _remember_artifact_key(artifact_seen, artifact_paths, art, source)
             imported += 1
-        if role != "assistant" or not content or ("assistant", content) in existing:
+        if role == "assistant" and content and ("assistant", content) in existing:
+            for art in _tool_artifacts_from_payload(content, source="assistant_path"):
+                source = art.get("source") or "assistant_path"
+                if _artifact_seen(artifact_seen, artifact_paths, art, source):
+                    continue
+                db.add(TaskArtifact(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    session_id=rec.id,
+                    message_id=None,
+                    kind=art["kind"],
+                    name=art["name"],
+                    mime_type=art["mime_type"],
+                    content=_artifact_inline_content_for_row(art),
+                    source=source,
+                    source_path=art.get("source_path") or "",
+                    employee_id=employee_id or rec.employee_id,
+                    version=_next_artifact_version(db, session_id=rec.id, name=art["name"]),
+                    provenance_payload=json.dumps({"origin": "reconcile_existing_assistant_path"}, ensure_ascii=False),
+                ))
+                _remember_artifact_key(artifact_seen, artifact_paths, art, source)
+                imported += 1
+            continue
+        if role != "assistant" or not content:
             continue
         if any(content in old or old in content for old in existing_assistant_texts):
             continue
@@ -3440,9 +14805,9 @@ async def _reconcile_hermes_session_transcript(
         )
         db.add(msg_row)
         db.flush()
-        for art in _extract_task_artifacts(content, prefix=f"{speaker_name or 'Hermes'}-补同步"):
-            key = (art["name"], "assistant_reconcile", "")
-            if key in artifact_seen:
+        for art in _tool_artifacts_from_tool_calls(item.get("tool_calls"), source="assistant_tool_call"):
+            source = art.get("source") or "assistant_tool_call"
+            if _artifact_seen(artifact_seen, artifact_paths, art, source):
                 continue
             db.add(TaskArtifact(
                 tenant_id=tenant_id,
@@ -3452,22 +14817,71 @@ async def _reconcile_hermes_session_transcript(
                 kind=art["kind"],
                 name=art["name"],
                 mime_type=art["mime_type"],
-                content=art["content"],
+                content=_artifact_inline_content_for_row(art),
+                source=source,
+                source_path=art.get("source_path") or "",
+                employee_id=employee_id or rec.employee_id,
+                version=_next_artifact_version(db, session_id=rec.id, name=art["name"]),
+                provenance_payload=json.dumps({"origin": "reconcile_assistant_tool_call"}, ensure_ascii=False),
+            ))
+            _remember_artifact_key(artifact_seen, artifact_paths, art, source)
+            imported += 1
+        for art in _tool_artifacts_from_payload(content, source="assistant_path"):
+            source = art.get("source") or "assistant_path"
+            if _artifact_seen(artifact_seen, artifact_paths, art, source):
+                continue
+            db.add(TaskArtifact(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=rec.id,
+                message_id=msg_row.id,
+                kind=art["kind"],
+                name=art["name"],
+                mime_type=art["mime_type"],
+                content=_artifact_inline_content_for_row(art),
+                source=source,
+                source_path=art.get("source_path") or "",
+                employee_id=employee_id or rec.employee_id,
+                version=_next_artifact_version(db, session_id=rec.id, name=art["name"]),
+                provenance_payload=json.dumps({"origin": "reconcile_assistant_path"}, ensure_ascii=False),
+            ))
+            _remember_artifact_key(artifact_seen, artifact_paths, art, source)
+            imported += 1
+        for art in _extract_task_artifacts(content, prefix=f"{speaker_name or 'Hermes'}-自动同步"):
+            source = "assistant_reconcile"
+            if _artifact_seen(artifact_seen, artifact_paths, art, source):
+                continue
+            db.add(TaskArtifact(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=rec.id,
+                message_id=msg_row.id,
+                kind=art["kind"],
+                name=art["name"],
+                mime_type=art["mime_type"],
+                content=_artifact_inline_content_for_row(art),
                 source="assistant_reconcile",
                 employee_id=employee_id or rec.employee_id,
                 version=_next_artifact_version(db, session_id=rec.id, name=art["name"]),
                 provenance_payload=json.dumps({"origin": "reconcile_message"}, ensure_ascii=False),
             ))
-            artifact_seen.add(key)
+            _remember_artifact_key(artifact_seen, artifact_paths, art, source)
         existing.add(("assistant", content))
         existing_assistant_texts.append(content)
         imported += 1
     if imported:
-        rec.message_count = _session_message_count(db, rec.id, rec.message_count)
-        rec.updated_at = datetime.now(timezone.utc)
-        if rec.task_status == "running":
-            rec.task_status = "completed"
+        _sync_runtime_completion_from_reconcile(db, rec=rec, employee_id=employee_id or rec.employee_id)
         db.commit()
+        _publish_session_event(
+            rec.id,
+            "session.updated",
+            _session_update_event_payload(
+                db,
+                rec,
+                source="transcript_reconcile",
+                imported=imported,
+            ),
+        )
     return imported
 
 
@@ -3484,31 +14898,76 @@ def health() -> dict:
 # ── Auth ────────────────────────────────────────────────────────────────────
 @app.post("/api/auth/login", response_model=LoginOut)
 def login(body: LoginIn, request: Request, db: Session = Depends(get_db)) -> LoginOut:
-    user = db.execute(select(User).where(User.email == body.email)).scalar_one_or_none()
+    identifier = body.email.strip()
+    identifier_lower = identifier.lower()
+    user = db.execute(
+        select(User).where(or_(
+            User.email == identifier_lower,
+            User.email == identifier,
+            User.username == identifier,
+            User.username == identifier_lower,
+        ))
+    ).scalars().first()
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(401, "invalid credentials")
     if not user.is_active:
         raise HTTPException(403, "user disabled")
     tenant = db.get(Tenant, user.tenant_id)
-    user.last_login_at = datetime.utcnow()
+    user.last_login_at = datetime.now(timezone.utc)
     token = issue_token(user_id=user.id, tenant_id=user.tenant_id, role=user.role.value)
     db.commit()
     audit(db, principal=Principal(user, tenant), action="auth.login", resource_type="user",
           resource_id=user.id, request=request)
     db.commit()
-    return LoginOut(
-        access_token=token,
-        user={"id": user.id, "email": user.email, "username": user.username, "role": user.role.value},
-        tenant={"id": tenant.id, "slug": tenant.slug, "name": tenant.name},
+    return LoginOut(access_token=token, user=_auth_user_payload(db, Principal(user, tenant)), tenant=_auth_tenant_payload(tenant))
+
+
+@app.post("/api/auth/register", response_model=LoginOut)
+def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)) -> LoginOut:
+    identifier = body.email.strip()
+    if not identifier:
+        raise HTTPException(400, "email or username is required")
+    if "@" in identifier:
+        email = identifier.lower()
+        username = (body.username or identifier.split("@", 1)[0]).strip() or identifier
+    else:
+        username = (body.username or identifier).strip()
+        email = f"{re.sub(r'[^a-zA-Z0-9_.+-]+', '_', username).strip('_').lower() or 'user'}@{DEFAULT_TENANT_SLUG}.openatlas"
+    tenant = db.execute(select(Tenant).where(Tenant.slug == DEFAULT_TENANT_SLUG)).scalar_one_or_none()
+    if not tenant:
+        tenant = Tenant(slug=DEFAULT_TENANT_SLUG, name=DEFAULT_TENANT_NAME, status=TenantStatus.active, plan="team")
+        db.add(tenant)
+        db.flush()
+    existing = db.execute(
+        select(User).where(User.tenant_id == tenant.id, or_(User.email == email, User.username == username))
+    ).scalar_one_or_none()
+    if existing:
+        raise HTTPException(409, "user already exists")
+    user = User(
+        tenant_id=tenant.id,
+        email=email,
+        username=username[:64],
+        password_hash=hash_password(body.password),
+        role=UserRole.user,
+        is_active=True,
     )
+    db.add(user)
+    db.flush()
+    _ensure_whiteboard_examples_for_user(db, tenant_id=tenant.id, user_id=user.id)
+    _ensure_contract_review_examples_for_user(db, tenant_id=tenant.id, user_id=user.id)
+    audit(db, principal=Principal(user, tenant), action="auth.register", resource_type="user",
+          resource_id=user.id, request=request, extra={"default_role": "user"})
+    token = issue_token(user_id=user.id, tenant_id=user.tenant_id, role=user.role.value)
+    user.last_login_at = datetime.now(timezone.utc)
+    db.commit()
+    return LoginOut(access_token=token, user=_auth_user_payload(db, Principal(user, tenant)), tenant=_auth_tenant_payload(tenant))
 
 
 @app.get("/api/auth/me")
-def me(p: Principal = Depends(get_principal)) -> dict:
+def me(p: Principal = Depends(get_principal), db: Session = Depends(get_db)) -> dict:
     return {
-        "user": {"id": p.user.id, "email": p.user.email, "username": p.user.username,
-                 "role": p.user.role.value, "tenant_id": p.tenant.id},
-        "tenant": {"id": p.tenant.id, "slug": p.tenant.slug, "name": p.tenant.name},
+        "user": _auth_user_payload(db, p),
+        "tenant": _auth_tenant_payload(p.tenant),
     }
 
 
@@ -3595,6 +15054,62 @@ def get_file_meta(
     return _file_to_dict(fa)
 
 
+@app.get("/api/files/{fid}/preview")
+def preview_file(
+    fid: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    fa = db.get(FileAsset, fid)
+    if not fa:
+        raise HTTPException(404, "file not found")
+    if fa.tenant_id != p.tenant.id or fa.user_id != p.user.id:
+        raise HTTPException(403, "forbidden")
+    path = Path(fa.storage_path)
+    if not _path_within(path, _allowed_user_file_roots(db, p, fa.session_id)):
+        raise HTTPException(403, "file outside authorized workspace")
+    audit(db, principal=p, action="file.preview", resource_type="file",
+          resource_id=fa.id, request=request, extra={"session_id": fa.session_id, "name": fa.original_name})
+    db.commit()
+    return _file_preview_payload(
+        id=fa.id,
+        name=fa.original_name,
+        path=path,
+        mime=fa.mime_type,
+        source="upload",
+        extracted_text=fa.extracted_text or "",
+        download_url=f"/api/files/{quote(fa.id)}/download",
+    )
+
+
+@app.get("/api/files/{fid}/download")
+def download_file(
+    fid: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+):
+    fa = db.get(FileAsset, fid)
+    if not fa:
+        raise HTTPException(404, "file not found")
+    if fa.tenant_id != p.tenant.id or fa.user_id != p.user.id:
+        raise HTTPException(403, "forbidden")
+    path = Path(fa.storage_path)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "file content not found")
+    if not _path_within(path, _allowed_user_file_roots(db, p, fa.session_id)):
+        raise HTTPException(403, "file outside authorized workspace")
+    audit(db, principal=p, action="file.download", resource_type="file",
+          resource_id=fa.id, request=request, extra={"session_id": fa.session_id, "name": fa.original_name})
+    db.commit()
+    return FileResponse(
+        path=str(path),
+        media_type=fa.mime_type or "application/octet-stream",
+        filename=_safe_filename(fa.original_name),
+    )
+
+
 @app.get("/api/files")
 def list_files(
     session_id: str | None = Query(default=None),
@@ -3622,6 +15137,125 @@ def list_files(
     if not include_expired:
         rows = [f for f in rows if not _file_to_dict(f)["is_expired"]]
     return {"items": [_file_to_dict(f) for f in rows]}
+
+
+@app.get("/api/workspace/files")
+def list_workspace_files(
+    session_id: str | None = Query(default=None),
+    path: str = Query(default=""),
+    scope: str = Query(default="workspace"),
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        root, target = _resolve_workspace_path(db, p, scope=scope, session_id=session_id, rel_path=path)
+    except HTTPException as exc:
+        if exc.status_code == 404 and session_id:
+            return {
+                "scope": scope,
+                "session_id": session_id,
+                "path": "",
+                "items": [],
+                "stale_session": True,
+                "message": "session workspace is not available yet",
+            }
+        raise
+    if scope == "uploads" and not path.strip("/"):
+        q = db.query(FileAsset).filter(
+            FileAsset.tenant_id == p.tenant.id,
+            FileAsset.user_id == p.user.id,
+        )
+        if session_id:
+            q = q.filter(FileAsset.session_id == session_id)
+        rows = q.order_by(FileAsset.created_at.desc()).limit(_WORKSPACE_MAX_LIST).all()
+        items: list[dict[str, Any]] = []
+        for fa in rows:
+            storage = Path(fa.storage_path)
+            if not _path_within(storage, [root]):
+                continue
+            try:
+                rel = storage.resolve().relative_to(root).as_posix()
+            except Exception:
+                continue
+            items.append({
+                "name": fa.original_name,
+                "path": rel,
+                "kind": "file",
+                "mime_type": fa.mime_type,
+                "size": int(fa.size or 0),
+                "preview_kind": _preview_kind_for_path(storage, fa.mime_type),
+                "previewable": True,
+                "modified_at": fa.created_at.isoformat() if fa.created_at else None,
+                "file_id": fa.id,
+                "status": fa.status,
+                "extracted_chars": len(fa.extracted_text or ""),
+            })
+        return {"scope": scope, "session_id": session_id, "path": "", "items": items}
+    if not target.exists():
+        return {"scope": scope, "session_id": session_id, "path": path.strip("/"), "items": []}
+    if not target.is_dir():
+        raise HTTPException(400, "path is not a directory")
+    rows = sorted(
+        [x for x in target.iterdir() if x.name not in {".DS_Store"}],
+        key=lambda pth: (not pth.is_dir(), pth.name.lower()),
+    )[:_WORKSPACE_MAX_LIST]
+    return {
+        "scope": scope,
+        "session_id": session_id,
+        "path": target.relative_to(root).as_posix() if target != root else "",
+        "items": [_workspace_item(x, root) for x in rows],
+    }
+
+
+@app.get("/api/workspace/files/preview")
+def preview_workspace_file(
+    request: Request,
+    session_id: str | None = Query(default=None),
+    path: str = Query(default=""),
+    scope: str = Query(default="workspace"),
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    root, target = _resolve_workspace_path(db, p, scope=scope, session_id=session_id, rel_path=path, create_root=False)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "file not found")
+    mime = _guess_mime(str(target), None)
+    rel = target.relative_to(root).as_posix()
+    audit(db, principal=p, action="workspace.file.preview", resource_type="workspace_file",
+          resource_id=rel, request=request, extra={"scope": scope, "session_id": session_id})
+    db.commit()
+    return _file_preview_payload(
+        id=rel,
+        name=target.name,
+        path=target,
+        mime=mime,
+        source=f"workspace:{scope}",
+        download_url=f"/api/workspace/files/download?scope={quote(scope)}&session_id={quote(session_id or '')}&path={quote(rel)}",
+    )
+
+
+@app.get("/api/workspace/files/download")
+def download_workspace_file(
+    request: Request,
+    session_id: str | None = Query(default=None),
+    path: str = Query(default=""),
+    scope: str = Query(default="workspace"),
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+):
+    root, target = _resolve_workspace_path(db, p, scope=scope, session_id=session_id, rel_path=path, create_root=False)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "file not found")
+    rel = target.relative_to(root).as_posix()
+    mime = _guess_mime(str(target), None)
+    audit(db, principal=p, action="workspace.file.download", resource_type="workspace_file",
+          resource_id=rel, request=request, extra={"scope": scope, "session_id": session_id})
+    db.commit()
+    return FileResponse(
+        path=str(target),
+        media_type=mime or "application/octet-stream",
+        filename=_safe_filename(target.name),
+    )
 
 
 @app.post("/api/files/prune-expired")
@@ -3672,17 +15306,3432 @@ def delete_file(
           resource_id=fid, request=request)
 
 
+# ── Contract Review Workspace ──────────────────────────────────────────────
+@app.get("/api/contract-reviews")
+def list_contract_reviews(
+    limit: int = Query(default=50, ge=1, le=200),
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not _is_admin_user(p.user):
+        existing_count = db.query(ContractDocument.id).filter(
+            ContractDocument.tenant_id == p.tenant.id,
+            ContractDocument.user_id == p.user.id,
+        ).count()
+        if existing_count == 0 and _ensure_contract_review_examples_for_user(db, tenant_id=p.tenant.id, user_id=p.user.id):
+            db.commit()
+    query = db.query(ContractDocument).filter(ContractDocument.tenant_id == p.tenant.id)
+    if not _is_admin_user(p.user):
+        query = query.filter(ContractDocument.user_id == p.user.id)
+    rows = query.order_by(ContractDocument.updated_at.desc()).limit(limit).all()
+    return {"items": [_contract_to_dict(db, row) for row in rows]}
+
+
+@app.post("/api/contract-reviews/upload")
+async def upload_contract_review(
+    request: Request,
+    file: UploadFile = File(...),
+    contract_type: str = Query(default="general"),
+    review_perspective: str = Query(default="balanced"),
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not file.filename:
+        raise HTTPException(400, "missing filename")
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in _CONTRACT_SUPPORTED_EXTS:
+        raise HTTPException(400, "only DOCX and PDF contracts are supported in this workspace")
+    content = await file.read()
+    _validate_contract_upload(file.filename, content, suffix)
+
+    contract = ContractDocument(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        title=Path(file.filename).stem[:255],
+        contract_type=(contract_type or "general")[:64],
+        review_perspective=(review_perspective or "balanced")[:32],
+        status="uploaded",
+    )
+    db.add(contract)
+    db.flush()
+
+    safe_name = _safe_filename(file.filename)
+    root = _contract_storage_root(p, contract.id)
+    root.mkdir(parents=True, exist_ok=True)
+    original_path = root / safe_name
+    original_path.write_bytes(content)
+    mime = _guess_mime(str(original_path), file.content_type)
+    extracted_text = "" if suffix == ".pdf" else _extract_text_from_file(str(original_path), mime)
+
+    file_asset = FileAsset(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=None,
+        employee_id=None,
+        original_name=file.filename,
+        mime_type=mime,
+        size=len(content),
+        storage_path=str(original_path),
+        status="extracted" if extracted_text else "uploaded",
+        extracted_text=extracted_text,
+    )
+    db.add(file_asset)
+    db.flush()
+    original_version = ContractVersion(
+        contract_id=contract.id,
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        version_no=1,
+        kind="original",
+        name=file.filename,
+        mime_type=mime,
+        storage_path=str(original_path),
+        size=len(content),
+        extracted_text=extracted_text,
+        change_summary="原始上传版本",
+    )
+    db.add(original_version)
+    db.flush()
+
+    contract.file_asset_id = file_asset.id
+    contract.current_version_id = original_version.id
+    contract.summary = _contract_summary(extracted_text, file.filename, contract.contract_type, contract.review_perspective)
+    contract.status = "parsed" if extracted_text else ("pdf_uploaded" if suffix == ".pdf" else "uploaded")
+    audit(db, principal=p, action="contract.upload", resource_type="contract",
+          resource_id=contract.id, request=request,
+          extra={"name": file.filename, "size": len(content), "mime": mime, "extracted_chars": len(extracted_text)})
+    db.commit()
+    db.refresh(contract)
+    return _contract_to_dict(db, contract, include_detail=True)
+
+
+@app.get("/api/contract-reviews/{contract_id}")
+def get_contract_review(
+    contract_id: str,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    contract = _ensure_contract(db, contract_id, p)
+    return _contract_to_dict(db, contract, include_detail=True)
+
+
+@app.post("/api/contract-reviews/{contract_id}/review")
+def run_contract_review(
+    contract_id: str,
+    body: ContractReviewRunIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    run_started_at = datetime.now(timezone.utc)
+    contract = _ensure_contract(db, contract_id, p)
+    review_skill = _contract_review_skill(db, p.tenant.id)
+    original = db.query(ContractVersion).filter(
+        ContractVersion.contract_id == contract.id,
+        ContractVersion.tenant_id == p.tenant.id,
+        ContractVersion.kind == "original",
+    ).order_by(ContractVersion.version_no.asc()).first()
+    if not original:
+        raise HTTPException(404, "original contract version not found")
+
+    text = original.extracted_text or ""
+    contract.contract_type = body.contract_type or contract.contract_type
+    contract.review_perspective = body.review_perspective or contract.review_perspective
+
+    for existing in db.query(ContractReviewIssue).filter(
+        ContractReviewIssue.contract_id == contract.id,
+        ContractReviewIssue.tenant_id == p.tenant.id,
+    ).all():
+        db.delete(existing)
+    db.flush()
+
+    issue_payloads = _analyze_contract_issues(
+        text,
+        contract_type=contract.contract_type,
+        perspective=contract.review_perspective,
+        focus=body.focus,
+    )
+    issue_rows: list[ContractReviewIssue] = []
+    for item in issue_payloads:
+        row = ContractReviewIssue(
+            contract_id=contract.id,
+            tenant_id=p.tenant.id,
+            user_id=p.user.id,
+            severity=item["severity"],
+            category=item["category"],
+            title=item["title"],
+            clause_ref=item["clause_ref"],
+            paragraph_index=item["paragraph_index"],
+            excerpt=item["excerpt"],
+            risk=item["risk"],
+            recommendation=item["recommendation"],
+            proposed_revision=item["proposed_revision"],
+            confidence=float(item.get("confidence") or 0.72),
+        )
+        db.add(row)
+        issue_rows.append(row)
+    db.flush()
+
+    report_version, revised_version = _create_contract_deliverable_versions(db, p, contract, original, issue_rows)
+
+    contract.status = "reviewed"
+    contract.summary = (
+        f"AI 审核完成，共发现 {len(issue_rows)} 条建议。"
+        f"高风险 {sum(1 for i in issue_rows if i.severity == 'high')} 条，"
+        f"中风险 {sum(1 for i in issue_rows if i.severity == 'medium')} 条。"
+    )
+    if revised_version:
+        contract.current_version_id = revised_version.id
+    contract.updated_at = datetime.now(timezone.utc)
+    if review_skill:
+        db.add(SkillRun(
+            tenant_id=p.tenant.id,
+            user_id=p.user.id,
+            session_id=None,
+            employee_id=None,
+            skill_id=review_skill.id,
+            skill_name=review_skill.name,
+            skill_slug=review_skill.slug,
+            status="succeeded",
+            duration_ms=max(0, int((datetime.now(timezone.utc) - run_started_at).total_seconds() * 1000)),
+            error="",
+        ))
+    audit(db, principal=p, action="contract.review", resource_type="contract",
+          resource_id=contract.id, request=request,
+          extra={
+              "issues": len(issue_rows),
+              "revised_docx": bool(revised_version),
+              "template": body.review_template,
+              "skill_slug": review_skill.slug if review_skill else _CONTRACT_SKILL_SLUG,
+          })
+    db.commit()
+    db.refresh(contract)
+    return _contract_to_dict(db, contract, include_detail=True)
+
+
+@app.patch("/api/contract-reviews/issues/{issue_id}")
+def patch_contract_issue(
+    issue_id: str,
+    body: ContractIssuePatchIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    issue = db.get(ContractReviewIssue, issue_id)
+    if not issue or issue.tenant_id != p.tenant.id:
+        raise HTTPException(404, "issue not found")
+    contract = _ensure_contract(db, issue.contract_id, p)
+    issue.status = body.status
+    issue.updated_at = datetime.now(timezone.utc)
+    audit(db, principal=p, action="contract.issue.update", resource_type="contract_issue",
+          resource_id=issue.id, request=request, extra={"contract_id": contract.id, "status": body.status})
+    db.commit()
+    db.refresh(issue)
+    return _contract_issue_to_dict(issue)
+
+
+@app.post("/api/contract-reviews/{contract_id}/deliverables/regenerate")
+def regenerate_contract_deliverables(
+    contract_id: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    run_started_at = datetime.now(timezone.utc)
+    contract = _ensure_contract(db, contract_id, p)
+    original = db.query(ContractVersion).filter(
+        ContractVersion.contract_id == contract.id,
+        ContractVersion.tenant_id == p.tenant.id,
+        ContractVersion.kind == "original",
+    ).order_by(ContractVersion.version_no.asc()).first()
+    if not original:
+        raise HTTPException(404, "original contract version not found")
+    issue_rows = db.query(ContractReviewIssue).filter(
+        ContractReviewIssue.contract_id == contract.id,
+        ContractReviewIssue.tenant_id == p.tenant.id,
+    ).order_by(ContractReviewIssue.created_at.asc()).all()
+    if not issue_rows:
+        raise HTTPException(400, "no review issues to export")
+
+    review_skill = _contract_review_skill(db, p.tenant.id)
+    _report_version, revised_version = _create_contract_deliverable_versions(db, p, contract, original, issue_rows)
+    active_issues = [issue for issue in issue_rows if issue.status != "ignored"]
+    contract.status = "reviewed"
+    contract.summary = f"交付物已重新生成，当前包含 {len(active_issues)} 条有效建议。"
+    if revised_version:
+        contract.current_version_id = revised_version.id
+    contract.updated_at = datetime.now(timezone.utc)
+    if review_skill:
+        db.add(SkillRun(
+            tenant_id=p.tenant.id,
+            user_id=p.user.id,
+            session_id=None,
+            employee_id=None,
+            skill_id=review_skill.id,
+            skill_name=review_skill.name,
+            skill_slug=review_skill.slug,
+            status="succeeded",
+            duration_ms=max(0, int((datetime.now(timezone.utc) - run_started_at).total_seconds() * 1000)),
+            error="",
+        ))
+    audit(db, principal=p, action="contract.deliverables.regenerate", resource_type="contract",
+          resource_id=contract.id, request=request,
+          extra={"issues": len(active_issues), "skill_slug": review_skill.slug if review_skill else _CONTRACT_SKILL_SLUG})
+    db.commit()
+    db.refresh(contract)
+    return _contract_to_dict(db, contract, include_detail=True)
+
+
+@app.get("/api/contract-reviews/versions/{version_id}/preview")
+def preview_contract_version(
+    version_id: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    version = db.get(ContractVersion, version_id)
+    if not version or version.tenant_id != p.tenant.id:
+        raise HTTPException(404, "contract version not found")
+    contract = _ensure_contract(db, version.contract_id, p)
+    path = Path(version.storage_path)
+    if path.exists() and not _path_within(path, [_contract_storage_root_for(tenant_id=version.tenant_id, user_id=version.user_id, contract_id=contract.id)]):
+        raise HTTPException(403, "contract path outside authorized workspace")
+    audit(db, principal=p, action="contract.version.preview", resource_type="contract_version",
+          resource_id=version.id, request=request, extra={"contract_id": contract.id, "kind": version.kind})
+    db.commit()
+    return _file_preview_payload(
+        id=version.id,
+        name=version.name,
+        path=path,
+        mime=version.mime_type,
+        source=f"contract:{version.kind}",
+        extracted_text=version.extracted_text or "",
+        download_url=f"/api/contract-reviews/versions/{quote(version.id)}/download",
+    )
+
+
+@app.get("/api/contract-reviews/versions/{version_id}/download")
+def download_contract_version(
+    version_id: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+):
+    version = db.get(ContractVersion, version_id)
+    if not version or version.tenant_id != p.tenant.id:
+        raise HTTPException(404, "contract version not found")
+    contract = _ensure_contract(db, version.contract_id, p)
+    path = Path(version.storage_path)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "contract file not found")
+    if not _path_within(path, [_contract_storage_root_for(tenant_id=version.tenant_id, user_id=version.user_id, contract_id=contract.id)]):
+        raise HTTPException(403, "contract path outside authorized workspace")
+    audit(db, principal=p, action="contract.version.download", resource_type="contract_version",
+          resource_id=version.id, request=request, extra={"contract_id": contract.id, "kind": version.kind})
+    db.commit()
+    return FileResponse(
+        path=str(path),
+        media_type=version.mime_type or "application/octet-stream",
+        filename=_safe_filename(version.name),
+    )
+
+
+# ── AIPPT Workspace ────────────────────────────────────────────────────────
+
+def _presentation_empty_plan(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": f"{_field_value(config.get('topic')) or 'AIPPT'}｜待生成",
+        "sections": [],
+        "slides": [],
+        "knowledge": [],
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _presentation_deck_to_dict(row: PresentationDeckDocument, *, include_plan: bool = True) -> dict[str, Any]:
+    config = _json_loads_obj(row.config_json, {})
+    plan = _json_loads_obj(row.plan_json, {}) if include_plan else None
+    try:
+        warnings = json.loads(row.warnings_json or "[]")
+    except Exception:
+        warnings = []
+    payload = {
+        "id": row.id,
+        "title": row.title,
+        "useCase": row.use_case,
+        "aspectRatio": row.aspect_ratio,
+        "styleKey": row.style_key,
+        "status": row.status,
+        "source": row.source,
+        "model": row.model,
+        "query": row.query,
+        "config": config if isinstance(config, dict) else {},
+        "warnings": warnings if isinstance(warnings, list) else [],
+        "slide_count": row.slide_count,
+        "knowledge_count": row.knowledge_count,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+    if include_plan:
+        safe_plan = plan if isinstance(plan, dict) else _presentation_empty_plan(config if isinstance(config, dict) else {})
+        if isinstance(config, dict) and isinstance(safe_plan, dict) and not isinstance(safe_plan.get("specLock"), dict):
+            safe_plan = _presentation_with_spec_lock(safe_plan, config)
+        payload["plan"] = safe_plan
+    return payload
+
+
+def _presentation_deck_version_to_dict(row: PresentationDeckVersion, *, include_payload: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": row.id,
+        "deck_id": row.deck_id,
+        "version_no": row.version_no,
+        "title": row.title,
+        "change_summary": row.change_summary,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+    if include_payload:
+        config = _json_loads_obj(row.config_json, {})
+        plan = _json_loads_obj(row.plan_json, {})
+        payload["config"] = config if isinstance(config, dict) else {}
+        safe_plan = plan if isinstance(plan, dict) else _presentation_empty_plan(config if isinstance(config, dict) else {})
+        if isinstance(config, dict) and isinstance(safe_plan, dict) and not isinstance(safe_plan.get("specLock"), dict):
+            safe_plan = _presentation_with_spec_lock(safe_plan, config)
+        payload["plan"] = safe_plan
+    return payload
+
+
+_AIPPT_STYLE_TOKENS = {
+    "executive_blue": {
+        "name": "高管汇报蓝",
+        "background": "F6F8FC",
+        "surface": "FFFFFF",
+        "surface_alt": "EAF2FF",
+        "primary": "1D4ED8",
+        "accent": "10B981",
+        "accent_soft": "DCFCE7",
+        "text": "111827",
+        "muted": "64748B",
+        "border": "D0D5DD",
+        "palette": ["1D4ED8", "10B981", "F59E0B", "64748B"],
+    },
+    "tech_launch": {
+        "name": "科技路演黑",
+        "background": "070A12",
+        "surface": "111827",
+        "surface_alt": "1E293B",
+        "primary": "818CF8",
+        "accent": "22D3EE",
+        "accent_soft": "082F49",
+        "text": "F8FAFC",
+        "muted": "A7B0C4",
+        "border": "334155",
+        "palette": ["22D3EE", "818CF8", "34D399", "F472B6"],
+    },
+    "teaching_clear": {
+        "name": "清晰教学绿",
+        "background": "F8FAF8",
+        "surface": "FFFFFF",
+        "surface_alt": "ECFDF5",
+        "primary": "047857",
+        "accent": "F97316",
+        "accent_soft": "FFF7ED",
+        "text": "17221D",
+        "muted": "6B7280",
+        "border": "BBF7D0",
+        "palette": ["047857", "F97316", "2563EB", "A855F7"],
+    },
+}
+
+_AIPPT_DESIGN_DEFAULTS = {
+    "eyebrow": {"x": 8, "y": 8, "width": 44, "height": 6, "zIndex": 10, "fontSize": 15, "fontWeight": 850, "align": "left", "visible": True, "locked": False},
+    "title": {"x": 8, "y": 18, "width": 63, "height": 16, "zIndex": 20, "fontSize": 52, "fontWeight": 950, "align": "left", "visible": True, "locked": False},
+    "headline": {"x": 8, "y": 39, "width": 68, "height": 10, "zIndex": 30, "fontSize": 26, "fontWeight": 720, "align": "left", "visible": True, "locked": False},
+    "bullets": {"x": 8, "y": 56, "width": 47, "height": 30, "zIndex": 40, "fontSize": 21, "fontWeight": 680, "align": "left", "visible": True, "locked": False},
+    "visual": {"x": 60, "y": 48, "width": 32, "height": 34, "zIndex": 5, "fontSize": 20, "fontWeight": 780, "align": "left", "visible": True, "locked": False, "radius": 16},
+}
+
+
+def _pptx_rgb(value: str):
+    from pptx.dml.color import RGBColor  # type: ignore
+    clean = re.sub(r"[^0-9a-fA-F]", "", str(value or ""))[:6] or "111827"
+    if len(clean) == 3:
+        clean = "".join(ch * 2 for ch in clean)
+    if len(clean) != 6:
+        clean = "111827"
+    return RGBColor(int(clean[0:2], 16), int(clean[2:4], 16), int(clean[4:6], 16))
+
+
+def _pptx_tokens(config: dict[str, Any]) -> dict[str, Any]:
+    return _AIPPT_STYLE_TOKENS.get(_field_value(config.get("styleKey")) or "", _AIPPT_STYLE_TOKENS["executive_blue"])
+
+
+def _pptx_dimensions(config: dict[str, Any]) -> tuple[float, float]:
+    return (15.0, 5.0) if _field_value(config.get("aspectRatio")) == "3:1" else (13.333, 7.5)
+
+
+def _pptx_style(slide: dict[str, Any], key: str, tokens: dict[str, Any]) -> dict[str, Any]:
+    design = slide.get("design") if isinstance(slide.get("design"), dict) else {}
+    elements = design.get("elements") if isinstance(design.get("elements"), dict) else {}
+    raw = elements.get(key) if isinstance(elements.get(key), dict) else {}
+    base = dict(_AIPPT_DESIGN_DEFAULTS[key])
+    if not raw:
+        layout = _field_value(slide.get("layout"))
+        template = _pptx_chart_template(slide)
+        if layout in {"metrics", "compare", "diagram", "process", "timeline", "checklist"}:
+            if key == "title":
+                base.update({"width": 76, "height": 14, "fontSize": 46})
+            elif key == "headline":
+                base.update({"y": 35, "width": 78, "height": 10, "fontSize": 23})
+            elif key == "bullets":
+                base.update({"x": 8, "y": 53, "width": 38, "height": 34, "fontSize": 18})
+            elif key == "visual":
+                base.update({"x": 51, "y": 45, "width": 41, "height": 40})
+        if template in {"kpi_cards", "line_chart", "bar_chart", "grouped_bar_chart", "horizontal_bar_chart"}:
+            if key == "bullets":
+                base.update({"width": 35, "fontSize": 17})
+            elif key == "visual":
+                base.update({"x": 49, "y": 43, "width": 43, "height": 42})
+        if _field_value(slide.get("layout")) in {"cover", "section", "quote"}:
+            if key == "bullets":
+                base.update({"width": 62})
+            elif key == "visual":
+                base.update({"x": 64, "y": 42, "width": 28, "height": 34})
+        if _field_value(slide.get("layout")) == "quote":
+            if key == "title":
+                base.update({"x": 10, "y": 15, "width": 76, "height": 10, "fontSize": 34, "align": "center"})
+            elif key == "headline":
+                base.update({"x": 10, "y": 30, "width": 78, "height": 24, "fontSize": 27, "fontWeight": 850, "align": "center"})
+            elif key == "bullets":
+                base.update({"x": 16, "y": 61, "width": 68, "height": 16, "fontSize": 18, "align": "center"})
+            elif key == "visual":
+                base.update({"visible": False})
+    base.update(raw)
+    if not base.get("color"):
+        base["color"] = tokens["primary"] if key == "eyebrow" else tokens["muted"] if key == "headline" else tokens["text"]
+    return base
+
+
+def _pptx_box(item: dict[str, Any], slide_w: float, slide_h: float) -> tuple[float, float, float, float]:
+    return (
+        max(-slide_w, float(item.get("x") or 0) / 100 * slide_w),
+        max(-slide_h, float(item.get("y") or 0) / 100 * slide_h),
+        max(0.1, float(item.get("width") or 10) / 100 * slide_w),
+        max(0.1, float(item.get("height") or 10) / 100 * slide_h),
+    )
+
+
+def _pptx_pt(px: Any, minimum: int = 9) -> int:
+    try:
+        return max(minimum, round(float(px or 16) * 0.75))
+    except Exception:
+        return minimum
+
+
+def _pptx_text_units(text: str) -> float:
+    total = 0.0
+    for ch in str(text or ""):
+        code = ord(ch)
+        if ch.isspace():
+            total += 0.35
+        elif code <= 0x007F:
+            total += 0.58
+        elif 0x3000 <= code <= 0x303F or 0xFF00 <= code <= 0xFFEF:
+            total += 0.62
+        else:
+            total += 1.0
+    return total
+
+
+def _pptx_wrap_token(token: str, max_units: float) -> list[str]:
+    rows: list[str] = []
+    current = ""
+    for ch in token:
+        if current and _pptx_text_units(current + ch) > max_units:
+            rows.append(current)
+            current = ch
+        else:
+            current += ch
+    if current:
+        rows.append(current)
+    return rows
+
+
+def _pptx_wrap_line(line: str, max_units: float) -> list[str]:
+    clean = re.sub(r"\s+", " ", str(line or "").strip())
+    if not clean:
+        return [""]
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9+./:%_-]*|\s+|.", clean, flags=re.S)
+    rows: list[str] = []
+    current = ""
+    for token in tokens:
+        if not token:
+            continue
+        if token.isspace():
+            token = " "
+        candidate = f"{current}{token}" if current else token.lstrip()
+        if not candidate:
+            continue
+        if _pptx_text_units(candidate) <= max_units:
+            current = candidate
+            continue
+        if current:
+            rows.append(current.rstrip())
+            current = token.lstrip()
+        if _pptx_text_units(current) > max_units:
+            chunks = _pptx_wrap_token(current, max_units)
+            rows.extend(chunks[:-1])
+            current = chunks[-1] if chunks else ""
+    if current.strip():
+        rows.append(current.strip())
+    return rows or [clean]
+
+
+def _pptx_text_max_units_for_box(w: float, font_pt: int) -> float:
+    usable_points = max(10.0, w * 72.0 - 12.0)
+    return max(4.0, usable_points / max(font_pt * 1.02, 1.0))
+
+
+def _pptx_text_max_lines_for_box(h: float, font_pt: int, *, bullets: bool) -> int:
+    usable_points = max(8.0, h * 72.0 - 10.0)
+    line_height = font_pt * (1.30 if bullets else 1.22)
+    return max(1, int(usable_points / max(line_height, 1.0)))
+
+
+def _pptx_wrap_text_for_box(
+    text: str,
+    *,
+    w: float,
+    h: float,
+    font_pt: int,
+    bullets: bool,
+    max_lines: int | None = None,
+    min_font_pt: int | None = None,
+) -> tuple[list[str], int]:
+    minimum = max(6, int(min_font_pt or (7 if bullets else 8)))
+    font = max(minimum, font_pt)
+    source_lines = str(text or "").splitlines() if bullets else [str(text or "")]
+    while True:
+        max_units = _pptx_text_max_units_for_box(w, font)
+        line_limit = _pptx_text_max_lines_for_box(h, font, bullets=bullets)
+        if max_lines:
+            line_limit = min(line_limit, max(1, max_lines))
+        wrapped: list[str] = []
+        for source in source_lines:
+            wrapped.extend(row for row in _pptx_wrap_line(source, max_units) if row.strip())
+        if len(wrapped) <= line_limit or font <= minimum:
+            break
+        font -= 1
+    if len(wrapped) > line_limit:
+        wrapped = wrapped[:line_limit]
+        max_units = _pptx_text_max_units_for_box(w, font)
+        last = wrapped[-1]
+        while last and _pptx_text_units(f"{last}...") > max_units:
+            last = last[:-1]
+        wrapped[-1] = f"{last.rstrip()}..." if last else "..."
+    return wrapped or [str(text or "")], font
+
+
+def _pptx_add_text(slide_obj: Any, text: str, item: dict[str, Any], slide_w: float, slide_h: float, *, bold: bool = False, bullets: bool = False):
+    if item.get("visible") is False or not str(text or "").strip():
+        return
+    from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE  # type: ignore
+    from pptx.util import Inches, Pt  # type: ignore
+    x, y, w, h = _pptx_box(item, slide_w, slide_h)
+    shape = slide_obj.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+    frame = shape.text_frame
+    frame.clear()
+    frame.margin_left = frame.margin_right = frame.margin_top = frame.margin_bottom = Inches(0.03)
+    frame.word_wrap = True
+    frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    font_pt = _pptx_pt(item.get("fontSize"), 11 if bullets else 9)
+    try:
+        max_lines = int(item.get("maxLines")) if item.get("maxLines") is not None else None
+    except Exception:
+        max_lines = None
+    try:
+        min_font_pt = int(item.get("minFontSize")) if item.get("minFontSize") is not None else None
+    except Exception:
+        min_font_pt = None
+    lines, font_pt = _pptx_wrap_text_for_box(str(text), w=w, h=h, font_pt=font_pt, bullets=bullets, max_lines=max_lines, min_font_pt=min_font_pt)
+    for idx, line in enumerate(lines):
+        p = frame.paragraphs[0] if idx == 0 else frame.add_paragraph()
+        p.text = line
+        p.font.name = "Microsoft YaHei"
+        p.font.size = Pt(font_pt)
+        p.font.bold = bool(bold or float(item.get("fontWeight") or 400) >= 720)
+        p.font.color.rgb = _pptx_rgb(str(item.get("color") or "111827"))
+        p.alignment = {"center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIGHT}.get(_field_value(item.get("align")), PP_ALIGN.LEFT)
+        p.line_spacing = 1.06 if bullets else 1.0
+        if bullets:
+            p.level = 0
+
+
+def _pptx_data_image_bytes(url: str) -> tuple[bytes, str] | None:
+    if not str(url or "").startswith("data:image/"):
+        return None
+    if str(url).startswith("data:image/svg+xml"):
+        return None
+    head, _, payload = str(url).partition(",")
+    mime = head.split(";", 1)[0].replace("data:", "") or "image/png"
+    if ";base64" in head:
+        import base64
+        return base64.b64decode(payload), mime
+    return unquote(payload).encode("utf-8"), mime
+
+
+def _pptx_svg_image_bytes(url: str) -> bytes | None:
+    if not str(url or "").startswith("data:image/svg+xml"):
+        return None
+    head, _, payload = str(url).partition(",")
+    if not payload:
+        return None
+    if ";base64" in head:
+        import base64
+        return base64.b64decode(payload)
+    return unquote(payload).encode("utf-8")
+
+
+def _pptx_add_svg_picture(slide_obj: Any, svg_bytes: bytes, x: float, y: float, w: float, h: float, *, alt: str = "SVG image") -> bool:
+    try:
+        from pptx.opc.constants import RELATIONSHIP_TYPE as RT  # type: ignore
+        from pptx.oxml import parse_xml  # type: ignore
+        from pptx.oxml.ns import nsdecls  # type: ignore
+        from pptx.parts.image import ImagePart  # type: ignore
+        from pptx.util import Inches  # type: ignore
+        package = slide_obj.part.package
+        image_part = ImagePart(package.next_image_partname("svg"), "image/svg+xml", package, svg_bytes, "image.svg")
+        r_id = slide_obj.part.relate_to(image_part, RT.IMAGE)
+        shape_id = slide_obj.shapes._next_shape_id
+        off_x, off_y, ext_x, ext_y = int(Inches(x)), int(Inches(y)), int(Inches(w)), int(Inches(h))
+        safe_name = _html.escape((alt or f"SVG Picture {shape_id}")[:120], quote=True)
+        pic = parse_xml(f"""
+            <p:pic {nsdecls('a', 'p', 'r')}>
+              <p:nvPicPr>
+                <p:cNvPr id="{shape_id}" name="{safe_name}" descr="{safe_name}"/>
+                <p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr>
+                <p:nvPr/>
+              </p:nvPicPr>
+              <p:blipFill>
+                <a:blip r:embed="{r_id}"/>
+                <a:stretch><a:fillRect/></a:stretch>
+              </p:blipFill>
+              <p:spPr>
+                <a:xfrm>
+                  <a:off x="{off_x}" y="{off_y}"/>
+                  <a:ext cx="{ext_x}" cy="{ext_y}"/>
+                </a:xfrm>
+                <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+              </p:spPr>
+            </p:pic>
+        """)
+        slide_obj.shapes._spTree.insert_element_before(pic, "p:extLst")
+        return True
+    except Exception:
+        return False
+
+
+def _pptx_visual_spec(slide: dict[str, Any]) -> dict[str, Any]:
+    spec = slide.get("visualSpec") if isinstance(slide.get("visualSpec"), dict) else {}
+    return spec
+
+
+def _pptx_hint_text(slide: dict[str, Any]) -> str:
+    return "；".join(filter(None, [
+        *(_presentation_list_strings(slide.get("renderHints"), limit=8)),
+        _field_value(slide.get("visual")),
+        _field_value(slide.get("designIntent")),
+        _field_value(slide.get("evidenceRole")),
+    ]))
+
+
+def _pptx_hint_value(slide: dict[str, Any], keys: list[str]) -> str:
+    text = _pptx_hint_text(slide)
+    for key in keys:
+        match = re.search(rf"{re.escape(key)}\s*[=:：]\s*([^；;\n]+)", text, flags=re.I)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+    return ""
+
+
+def _pptx_chart_template(slide: dict[str, Any]) -> str:
+    spec = _pptx_visual_spec(slide)
+    layout = _field_value(slide.get("layout"))
+    explicit_template = _field_value(spec.get("templateId") or spec.get("template_id") or spec.get("chartTemplate") or spec.get("chart_template") or spec.get("visualTemplate") or spec.get("template"))
+    if explicit_template:
+        clean = _presentation_canonical_template_id(explicit_template)
+        template_layout = _field_value(_presentation_template_def(clean).get("layout"))
+        if not template_layout or template_layout == layout:
+            return "" if clean in {"cover", "section", "quote"} else clean
+    hinted = _pptx_hint_value(slide, ["templateId", "chartTemplate", "chart模板", "visualTemplate"])
+    if hinted:
+        clean = _presentation_canonical_template_id(hinted)
+        template_layout = _field_value(_presentation_template_def(clean).get("layout"))
+        if not template_layout or template_layout == layout:
+            return "" if clean in {"cover", "section", "quote"} else clean
+    return _presentation_chart_template(slide, layout) if layout else ""
+
+
+def _pptx_bullet_rows(slide: dict[str, Any], limit: int = 6) -> list[str]:
+    return _presentation_list_strings(slide.get("bullets"), limit=limit)
+
+
+def _pptx_number(value: Any) -> float | None:
+    try:
+        return float(re.sub(r"[^\d.+-]", "", str(value)))
+    except Exception:
+        return None
+
+
+def _pptx_allows_metric_fallback(spec: dict[str, Any], slide: dict[str, Any]) -> bool:
+    layout = _field_value(slide.get("layout"))
+    spec_type = _field_value(spec.get("type"))
+    chart = spec.get("chart") if isinstance(spec.get("chart"), dict) else {}
+    template = _pptx_chart_template(slide)
+    metric_templates = {
+        "kpi_cards",
+        "hero_metric",
+        "metric_dashboard",
+        "bullet_chart",
+        "line_chart",
+        "multi_line_chart",
+        "bar_chart",
+        "grouped_bar_chart",
+        "horizontal_bar_chart",
+    }
+    return bool(
+        layout == "metrics"
+        or spec_type in {"scorecard", "combo_metrics", "metric", "metrics", "bar", "line"}
+        or template in metric_templates
+        or chart.get("series")
+    )
+
+
+def _pptx_metric_from_bullet(value: Any) -> dict[str, Any] | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    # Avoid turning narrative metadata into fake KPI cards, e.g. "20 分钟" or "2026 年 Q2".
+    if re.search(r"(汇报时长|时长|数据截止|截止|日期|更新|Q[1-4]|季度|年月|年\s*Q|分钟|背景|路径|行动计划|→)", text, re.I):
+        return None
+    match = re.search(r"([-+]?\d+(?:\.\d+)?)\s*(%|亿|万|万元|元|人|家|个|次|倍|小时|天|周|月)", text)
+    if not match:
+        return None
+    unit = match.group(2)
+    if unit in {"分钟", "年"}:
+        return None
+    number = _pptx_number(match.group(1))
+    if number is None:
+        return None
+    label_source = re.split(r"[:：,，;；]", text, 1)[0].strip()
+    label = re.sub(r"[-+]?\d+(?:\.\d+)?\s*(%|亿|万|万元|元|人|家|个|次|倍|小时|天|周|月)", "", label_source).strip(" ：:-")
+    if not label or len(label) > 18:
+        label = text[:14]
+    return {
+        "label": label[:14],
+        "value": number,
+        "unit": unit,
+        "detail": text,
+    }
+
+
+def _pptx_metric_values(spec: dict[str, Any], slide: dict[str, Any]) -> list[dict[str, Any]]:
+    metrics = spec.get("metrics") if isinstance(spec.get("metrics"), list) else []
+    if metrics:
+        return [m for m in metrics if isinstance(m, dict)][:6]
+    if not _pptx_allows_metric_fallback(spec, slide):
+        return []
+    out = []
+    for bullet in slide.get("bullets") or []:
+        metric = _pptx_metric_from_bullet(bullet)
+        if metric:
+            out.append(metric)
+    return out[:6]
+
+
+def _pptx_chart_series(chart: dict[str, Any], metrics: list[dict[str, Any]]) -> tuple[list[str], list[dict[str, Any]]]:
+    labels = [str(item) for item in chart.get("labels") or [] if str(item).strip()] if isinstance(chart.get("labels"), list) else []
+    raw_series = chart.get("series") if isinstance(chart.get("series"), list) else []
+    series: list[dict[str, Any]] = []
+    for index, row in enumerate(raw_series):
+        if not isinstance(row, dict):
+            continue
+        values = [_pptx_number(v) for v in (row.get("values") or []) if _pptx_number(v) is not None]
+        if not values:
+            continue
+        series.append({
+            "name": _field_value(row.get("name")) or f"序列 {index + 1}",
+            "values": values[:12],
+            "unit": _field_value(row.get("unit")),
+        })
+    if not series and metrics:
+        labels = [_field_value(item.get("label") or item.get("title")) or f"指标 {idx + 1}" for idx, item in enumerate(metrics)]
+        values = [_pptx_number(item.get("value")) or 0 for item in metrics]
+        series.append({"name": "当前值", "values": values[:12], "unit": _field_value(chart.get("unit"))})
+    if series:
+        max_len = max(len(item["values"]) for item in series)
+        if len(labels) < max_len:
+            labels = labels + [f"P{i + 1}" for i in range(len(labels), max_len)]
+        labels = labels[:max_len]
+        for item in series:
+            item["values"] = (item["values"] + [0] * max(0, max_len - len(item["values"])))[:max_len]
+    return labels[:12], series[:5]
+
+
+def _pptx_add_native_chart(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float, chart_kind: str, metrics: list[dict[str, Any]]) -> bool:
+    try:
+        from pptx.chart.data import CategoryChartData  # type: ignore
+        from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION  # type: ignore
+        from pptx.util import Inches, Pt  # type: ignore
+        chart = spec.get("chart") if isinstance(spec.get("chart"), dict) else {}
+        labels, series = _pptx_chart_series(chart, metrics)
+        if not labels or not series:
+            return False
+        chart_data = CategoryChartData()
+        chart_data.categories = labels
+        for row in series:
+            chart_data.add_series(str(row.get("name") or "序列"), row.get("values") or [])
+        chart_type = (
+            XL_CHART_TYPE.LINE_MARKERS if chart_kind == "line"
+            else XL_CHART_TYPE.BAR_CLUSTERED if chart_kind == "horizontal_bar"
+            else XL_CHART_TYPE.COLUMN_CLUSTERED
+        )
+        graphic_frame = slide_obj.shapes.add_chart(chart_type, Inches(x), Inches(y), Inches(w), Inches(h), chart_data)
+        chart_obj = graphic_frame.chart
+        chart_obj.has_title = True
+        chart_obj.chart_title.text_frame.text = _field_value(spec.get("title")) or _field_value(deck_slide.get("visual")) or ("趋势图" if chart_kind == "line" else "柱状图")
+        chart_obj.has_legend = len(series) > 1
+        if chart_obj.has_legend:
+            chart_obj.legend.position = XL_LEGEND_POSITION.BOTTOM
+            chart_obj.legend.include_in_layout = False
+        try:
+            chart_obj.value_axis.tick_labels.font.size = Pt(9)
+            chart_obj.category_axis.tick_labels.font.size = Pt(9)
+        except Exception:
+            pass
+        try:
+            for idx, ppt_series in enumerate(chart_obj.series):
+                ppt_series.format.line.color.rgb = _pptx_rgb(tokens["palette"][idx % len(tokens["palette"])])
+                if chart_kind in {"bar", "horizontal_bar"}:
+                    ppt_series.format.fill.solid()
+                    ppt_series.format.fill.fore_color.rgb = _pptx_rgb(tokens["palette"][idx % len(tokens["palette"])])
+        except Exception:
+            pass
+        provenance = "；".join(filter(None, [
+            _field_value(chart.get("source")),
+            _field_value(chart.get("methodology")),
+            "估算数据" if chart.get("estimated") else "",
+        ]))
+        if provenance:
+            _pptx_add_text(slide_obj, provenance, {"x": (x + 0.05) / slide_w * 100, "y": (y + h + 0.04) / slide_h * 100, "width": min(95, w / slide_w * 100), "height": 4, "fontSize": 9, "fontWeight": 500, "color": tokens["muted"]}, slide_w, slide_h)
+        return True
+    except Exception:
+        return False
+
+
+def _pptx_shape(slide_obj: Any, shape_type: Any, x: float, y: float, w: float, h: float, *, fill: str, line: str | None = None):
+    from pptx.enum.shapes import MSO_SHAPE  # type: ignore
+    from pptx.util import Inches  # type: ignore
+    shape = slide_obj.shapes.add_shape(shape_type or MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(max(0.05, w)), Inches(max(0.05, h)))
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = _pptx_rgb(fill)
+    if line:
+        shape.line.color.rgb = _pptx_rgb(line)
+    else:
+        shape.line.fill.background()
+    return shape
+
+
+def _pptx_metric_label(metric: dict[str, Any], index: int) -> str:
+    return _field_value(metric.get("label") or metric.get("title")) or f"指标 {index + 1}"
+
+
+def _pptx_metric_display(metric: dict[str, Any]) -> str:
+    value = metric.get("value")
+    unit = _field_value(metric.get("unit"))
+    if value is None or _field_value(value) == "":
+        return "待补"
+    text = _field_value(value)
+    return f"{text}{unit}" if unit and unit not in text else text
+
+
+def _pptx_add_metric_card(slide_obj: Any, metric: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float, index: int, *, hero: bool = False) -> None:
+    from pptx.enum.shapes import MSO_SHAPE  # type: ignore
+    palette = tokens["palette"]
+    color = palette[index % len(palette)]
+    _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, x, y, w, h, fill=tokens["surface_alt"] if not hero else tokens["accent_soft"], line=tokens["border"])
+    _pptx_shape(slide_obj, MSO_SHAPE.RECTANGLE, x, y, 0.07, h, fill=color)
+    value_pt = 38 if hero else 23 if w < 1.35 else 26
+    _pptx_add_text(slide_obj, _pptx_metric_display(metric), {"x": (x + 0.18) / slide_w * 100, "y": (y + 0.16) / slide_h * 100, "width": (w - 0.32) / slide_w * 100, "height": (h * (0.40 if hero else 0.32)) / slide_h * 100, "fontSize": value_pt, "fontWeight": 930, "color": color, "maxLines": 1, "minFontSize": 14 if hero else 10}, slide_w, slide_h, bold=True)
+    _pptx_add_text(slide_obj, _pptx_metric_label(metric, index), {"x": (x + 0.18) / slide_w * 100, "y": (y + h * (0.52 if hero else 0.48)) / slide_h * 100, "width": (w - 0.32) / slide_w * 100, "height": (h * 0.20) / slide_h * 100, "fontSize": 14 if hero else 11, "fontWeight": 850, "color": tokens["text"], "maxLines": 2, "minFontSize": 8}, slide_w, slide_h, bold=True)
+    detail = _field_value(metric.get("detail"))
+    if detail:
+        _pptx_add_text(slide_obj, detail, {"x": (x + 0.18) / slide_w * 100, "y": (y + h * 0.70) / slide_h * 100, "width": (w - 0.32) / slide_w * 100, "height": (h * 0.24) / slide_h * 100, "fontSize": 9, "fontWeight": 600, "color": tokens["muted"], "maxLines": 2, "minFontSize": 7}, slide_w, slide_h)
+
+
+def _pptx_add_metric_cards(slide_obj: Any, metrics: list[dict[str, Any]], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float, template: str) -> bool:
+    if not metrics:
+        return False
+    rows = metrics[:5]
+    gap = 0.14
+    if template == "hero_metric":
+        _pptx_add_metric_card(slide_obj, rows[0], tokens, slide_w, slide_h, x, y, w, h, 0, hero=True)
+        return True
+    if template == "metric_dashboard" and len(rows) >= 3 and w >= 3.2:
+        hero_w = w * 0.48
+        _pptx_add_metric_card(slide_obj, rows[0], tokens, slide_w, slide_h, x, y, hero_w, h, 0, hero=True)
+        right_x = x + hero_w + gap
+        right_w = max(0.8, w - hero_w - gap)
+        small_h = max(0.65, (h - gap * (min(len(rows), 5) - 2)) / max(1, min(len(rows), 5) - 1))
+        for offset, metric in enumerate(rows[1:5], start=1):
+            _pptx_add_metric_card(slide_obj, metric, tokens, slide_w, slide_h, right_x, y + (offset - 1) * (small_h + gap), right_w, small_h, offset)
+        return True
+    cols = 2 if w >= 3.0 and len(rows) > 1 else 1
+    if template == "kpi_cards" and w >= 4.2 and len(rows) >= 3:
+        cols = min(3, len(rows))
+    card_w = max(0.8, (w - gap * (cols - 1)) / cols)
+    card_h = max(0.7, (h - gap * (math.ceil(len(rows) / cols) - 1)) / max(1, math.ceil(len(rows) / cols)))
+    for idx, metric in enumerate(rows):
+        col = idx % cols
+        row = idx // cols
+        _pptx_add_metric_card(slide_obj, metric, tokens, slide_w, slide_h, x + col * (card_w + gap), y + row * (card_h + gap), card_w, card_h, idx)
+    return True
+
+
+def _pptx_spec_columns(spec: dict[str, Any], slide: dict[str, Any]) -> list[dict[str, Any]]:
+    columns = spec.get("columns") if isinstance(spec.get("columns"), list) else []
+    out = [row for row in columns if isinstance(row, dict)][:4]
+    if out:
+        return out
+    bullets = _pptx_bullet_rows(slide, limit=6)
+    midpoint = max(1, math.ceil(len(bullets) / 2))
+    labels = [
+        _pptx_hint_value(slide, ["leftLabel", "左列", "左侧"]) or "现状 / 问题",
+        _pptx_hint_value(slide, ["rightLabel", "右列", "右侧"]) or "方案 / 增量",
+    ]
+    return [
+        {"label": labels[0], "items": bullets[:midpoint] or [_field_value(slide.get("headline"))]},
+        {"label": labels[1], "items": bullets[midpoint:] or [_field_value(slide.get("visual"))]},
+    ]
+
+
+def _pptx_feature_matrix_features(columns: list[dict[str, Any]], slide: dict[str, Any]) -> list[str]:
+    features: list[str] = []
+    for col in columns:
+        items = col.get("items") if isinstance(col.get("items"), list) else []
+        for item in _presentation_list_strings(items, limit=8):
+            label = re.split(r"[：:，,；;（(]", item, 1)[0].strip()
+            if label and not any(existing == label for existing in features):
+                features.append(label[:22])
+            if len(features) >= 5:
+                break
+        if len(features) >= 5:
+            break
+    if not features:
+        features = [row[:22] for row in _pptx_bullet_rows(slide, limit=5)]
+    return features[:5] or ["能力完整度", "数据链路", "可编辑导出"]
+
+
+def _pptx_feature_matrix_cell_text(column: dict[str, Any], feature: str) -> tuple[str, str]:
+    items = _presentation_list_strings(column.get("items"), limit=8)
+    haystack = " ".join(items + [_field_value(column.get("detail"))]).lower()
+    score = _field_value(column.get("score")).lower()
+    if feature and feature.lower() in haystack:
+        return "支持", "high"
+    if score in {"high", "强", "高"}:
+        return "强", "high"
+    if score in {"low", "弱", "低"}:
+        return "弱", "low"
+    if score in {"medium", "中", "中等"}:
+        return "部分", "medium"
+    return "部分" if items else "待补", "medium"
+
+
+def _pptx_add_feature_matrix_table(slide_obj: Any, deck_slide: dict[str, Any], columns: list[dict[str, Any]], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float) -> bool:
+    from pptx.enum.shapes import MSO_SHAPE  # type: ignore
+    cols = columns[:4]
+    if len(cols) < 2:
+        return False
+    features = _pptx_feature_matrix_features(cols, deck_slide)
+    header_h = min(0.48, max(0.34, h * 0.14))
+    feature_w = min(1.45, max(0.95, w * 0.26))
+    cell_w = max(0.55, (w - feature_w) / len(cols))
+    row_h = max(0.34, (h - header_h) / max(1, len(features)))
+    _pptx_shape(slide_obj, MSO_SHAPE.RECTANGLE, x, y, feature_w, header_h, fill=tokens["primary"], line=tokens["background"])
+    _pptx_add_text(slide_obj, "能力项", {"x": (x + 0.06) / slide_w * 100, "y": (y + 0.08) / slide_h * 100, "width": (feature_w - 0.12) / slide_w * 100, "height": (header_h - 0.12) / slide_h * 100, "fontSize": 9, "fontWeight": 900, "color": "FFFFFF", "maxLines": 1, "align": "center"}, slide_w, slide_h, bold=True)
+    for col_idx, col in enumerate(cols):
+        cx = x + feature_w + col_idx * cell_w
+        _pptx_shape(slide_obj, MSO_SHAPE.RECTANGLE, cx, y, cell_w, header_h, fill=tokens["palette"][col_idx % len(tokens["palette"])], line=tokens["background"])
+        _pptx_add_text(slide_obj, _field_value(col.get("label") or col.get("title")) or f"对象 {col_idx + 1}", {"x": (cx + 0.05) / slide_w * 100, "y": (y + 0.07) / slide_h * 100, "width": (cell_w - 0.10) / slide_w * 100, "height": (header_h - 0.10) / slide_h * 100, "fontSize": 9, "fontWeight": 900, "color": "FFFFFF", "maxLines": 1, "align": "center", "minFontSize": 7}, slide_w, slide_h, bold=True)
+    fills = {
+        "high": tokens["accent_soft"],
+        "medium": tokens["surface_alt"],
+        "low": tokens["surface"],
+    }
+    for row_idx, feature in enumerate(features):
+        cy = y + header_h + row_idx * row_h
+        _pptx_shape(slide_obj, MSO_SHAPE.RECTANGLE, x, cy, feature_w, row_h, fill=tokens["surface_alt"], line=tokens["border"])
+        _pptx_add_text(slide_obj, feature, {"x": (x + 0.08) / slide_w * 100, "y": (cy + 0.06) / slide_h * 100, "width": (feature_w - 0.16) / slide_w * 100, "height": (row_h - 0.10) / slide_h * 100, "fontSize": 9, "fontWeight": 760, "color": tokens["text"], "maxLines": 2, "minFontSize": 7}, slide_w, slide_h, bold=True)
+        for col_idx, col in enumerate(cols):
+            cx = x + feature_w + col_idx * cell_w
+            cell_text, strength = _pptx_feature_matrix_cell_text(col, feature)
+            _pptx_shape(slide_obj, MSO_SHAPE.RECTANGLE, cx, cy, cell_w, row_h, fill=fills.get(strength, tokens["surface_alt"]), line=tokens["border"])
+        _pptx_add_text(slide_obj, cell_text, {"x": (cx + 0.05) / slide_w * 100, "y": (cy + 0.07) / slide_h * 100, "width": (cell_w - 0.10) / slide_w * 100, "height": (row_h - 0.12) / slide_h * 100, "fontSize": 9, "fontWeight": 850, "color": tokens["primary"] if strength != "low" else tokens["muted"], "maxLines": 2, "align": "center", "minFontSize": 6}, slide_w, slide_h, bold=True)
+    return True
+
+
+def _pptx_add_compare_visual(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float, template: str) -> bool:
+    from pptx.enum.shapes import MSO_SHAPE  # type: ignore
+    columns = _pptx_spec_columns(spec, deck_slide)
+    if not columns:
+        return False
+    gap = 0.13
+    if template == "feature_matrix_table":
+        return _pptx_add_feature_matrix_table(slide_obj, deck_slide, columns, tokens, slide_w, slide_h, x, y, w, h)
+    if template == "comparison_table":
+        row_h = max(0.55, (h - gap * (len(columns) - 1)) / len(columns))
+        for idx, col in enumerate(columns[:3]):
+            cy = y + idx * (row_h + gap)
+            fill = tokens["accent_soft"] if idx % 2 else tokens["surface_alt"]
+            _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, x, cy, w, row_h, fill=fill, line=tokens["border"])
+            label_w = min(1.35, w * 0.34)
+            _pptx_add_text(slide_obj, _field_value(col.get("label") or col.get("title")) or f"对象 {idx + 1}", {"x": (x + 0.16) / slide_w * 100, "y": (cy + 0.12) / slide_h * 100, "width": (label_w - 0.22) / slide_w * 100, "height": (row_h - 0.2) / slide_h * 100, "fontSize": 12, "fontWeight": 880, "color": tokens["primary"], "maxLines": 2, "minFontSize": 8}, slide_w, slide_h, bold=True)
+            items = col.get("items") if isinstance(col.get("items"), list) else []
+            text = "；".join(_presentation_list_strings(items, limit=4)) or _field_value(col.get("detail")) or _field_value(deck_slide.get("visual"))
+            _pptx_add_text(slide_obj, text, {"x": (x + label_w + 0.12) / slide_w * 100, "y": (cy + 0.12) / slide_h * 100, "width": (w - label_w - 0.28) / slide_w * 100, "height": (row_h - 0.2) / slide_h * 100, "fontSize": 10, "fontWeight": 650, "color": tokens["text"], "maxLines": 3, "minFontSize": 7}, slide_w, slide_h)
+        return True
+    col_count = max(2, min(4, len(columns)))
+    card_w = max(0.8, (w - gap * (col_count - 1)) / col_count)
+    for idx, col in enumerate(columns[:col_count]):
+        cx = x + idx * (card_w + gap)
+        fill = tokens["surface_alt"] if idx % 2 == 0 else tokens["accent_soft"]
+        _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, cx, y, card_w, h, fill=fill, line=tokens["border"])
+        _pptx_shape(slide_obj, MSO_SHAPE.RECTANGLE, cx, y, card_w, 0.07, fill=tokens["palette"][idx % len(tokens["palette"])])
+        _pptx_add_text(slide_obj, _field_value(col.get("label") or col.get("title")) or f"对象 {idx + 1}", {"x": (cx + 0.15) / slide_w * 100, "y": (y + 0.18) / slide_h * 100, "width": (card_w - 0.3) / slide_w * 100, "height": min(16, h * 0.20 / slide_h * 100), "fontSize": 12, "fontWeight": 900, "color": tokens["primary"], "maxLines": 2, "minFontSize": 8}, slide_w, slide_h, bold=True)
+        raw_items = col.get("items") if isinstance(col.get("items"), list) else []
+        items = _presentation_list_strings(raw_items, limit=4)
+        if not items:
+            items = _presentation_list_strings(col.get("detail"), limit=4)
+        text = "\n".join(items or [_field_value(col.get("detail")) or "待补充"])
+        _pptx_add_text(slide_obj, text, {"x": (cx + 0.15) / slide_w * 100, "y": (y + 0.66) / slide_h * 100, "width": (card_w - 0.3) / slide_w * 100, "height": max(4, (h - 0.82) / slide_h * 100), "fontSize": 9 if col_count >= 3 else 10, "fontWeight": 650, "color": tokens["text"], "maxLines": 6, "minFontSize": 7}, slide_w, slide_h, bullets=True)
+    return True
+
+
+def _pptx_spec_layers(spec: dict[str, Any], slide: dict[str, Any]) -> list[dict[str, Any]]:
+    layers = spec.get("layers") if isinstance(spec.get("layers"), list) else []
+    out = [row for row in layers if isinstance(row, dict)][:6]
+    if out:
+        return out
+    return [{"label": f"层级 {idx + 1}", "detail": row} for idx, row in enumerate(_pptx_bullet_rows(slide, limit=5))]
+
+
+def _pptx_add_architecture_visual(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float) -> bool:
+    from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE  # type: ignore
+    from pptx.util import Inches, Pt  # type: ignore
+    layers = _pptx_spec_layers(spec, deck_slide)
+    if not layers:
+        return False
+    gap = 0.13
+    layer_h = max(0.48, (h - gap * (len(layers) - 1)) / len(layers))
+    for idx, layer in enumerate(layers):
+        indent = 0.18 if idx % 2 else 0
+        ly = y + idx * (layer_h + gap)
+        _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, x + indent, ly, w - indent, layer_h, fill=tokens["surface_alt"], line=tokens["border"])
+        _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, x + indent + 0.12, ly + 0.14, 0.38, max(0.26, layer_h - 0.28), fill=tokens["palette"][idx % len(tokens["palette"])])
+        _pptx_add_text(slide_obj, _field_value(layer.get("label") or layer.get("title")) or f"层级 {idx + 1}", {"x": (x + indent + 0.62) / slide_w * 100, "y": (ly + 0.10) / slide_h * 100, "width": (w - indent - 0.78) / slide_w * 100, "height": min(7, layer_h * 0.34 / slide_h * 100), "fontSize": 12, "fontWeight": 880, "color": tokens["text"], "maxLines": 1, "minFontSize": 8}, slide_w, slide_h, bold=True)
+        detail = _field_value(layer.get("detail")) or " / ".join(_presentation_list_strings(layer.get("items"), limit=3))
+        _pptx_add_text(slide_obj, detail, {"x": (x + indent + 0.62) / slide_w * 100, "y": (ly + layer_h * 0.48) / slide_h * 100, "width": (w - indent - 0.78) / slide_w * 100, "height": max(4, layer_h * 0.42 / slide_h * 100), "fontSize": 9, "fontWeight": 620, "color": tokens["muted"], "maxLines": 2, "minFontSize": 7}, slide_w, slide_h)
+        if idx < len(layers) - 1:
+            cx = x + 0.32 + indent
+            connector = slide_obj.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(cx), Inches(ly + layer_h), Inches(cx), Inches(ly + layer_h + gap))
+            connector.line.color.rgb = _pptx_rgb(tokens["accent"])
+            connector.line.width = Pt(1.5)
+    return True
+
+
+def _pptx_process_items(spec: dict[str, Any], slide: dict[str, Any]) -> list[str]:
+    rows = spec.get("rows") if isinstance(spec.get("rows"), list) else []
+    out = []
+    for idx, row in enumerate(rows[:8]):
+        if isinstance(row, dict):
+            label = _field_value(row.get("label") or row.get("title")) or f"步骤 {idx + 1}"
+            detail = _field_value(row.get("detail")) or "、".join(_presentation_list_strings(row.get("items"), limit=3))
+            out.append(f"{label}：{detail}" if detail else label)
+    return out or _pptx_bullet_rows(slide, limit=6)
+
+
+def _pptx_add_timeline_visual(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float, template: str) -> bool:
+    from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE  # type: ignore
+    from pptx.util import Inches, Pt  # type: ignore
+    items = _pptx_process_items(spec, deck_slide)[:8]
+    if not items:
+        return False
+    if template in {"roadmap_vertical", "gantt_chart"}:
+        gap = 0.12
+        row_h = max(0.48, (h - gap * (len(items) - 1)) / len(items))
+        line_x = x + 0.22
+        connector = slide_obj.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(line_x), Inches(y + 0.15), Inches(line_x), Inches(y + h - 0.15))
+        connector.line.color.rgb = _pptx_rgb(tokens["accent"])
+        connector.line.width = Pt(2)
+        for idx, item in enumerate(items):
+            cy = y + idx * (row_h + gap)
+            _pptx_shape(slide_obj, MSO_SHAPE.OVAL, line_x - 0.08, cy + 0.16, 0.16, 0.16, fill=tokens["palette"][idx % len(tokens["palette"])])
+            if template == "gantt_chart":
+                _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, x + 0.48, cy + 0.14, max(0.5, w * (0.42 + idx * 0.06)), 0.16, fill=tokens["palette"][idx % len(tokens["palette"])])
+                text_y = cy + 0.34
+            else:
+                text_y = cy + 0.08
+            _pptx_add_text(slide_obj, item, {"x": (x + 0.55) / slide_w * 100, "y": text_y / slide_h * 100, "width": (w - 0.65) / slide_w * 100, "height": max(5, (row_h - 0.12) / slide_h * 100), "fontSize": 10, "fontWeight": 700, "color": tokens["text"], "maxLines": 2, "minFontSize": 7}, slide_w, slide_h)
+        return True
+    lane_count = 2 if len(items) > 5 else 1
+    per_lane = math.ceil(len(items) / lane_count)
+    lane_h = h / lane_count
+    for lane in range(lane_count):
+        lane_items = items[lane * per_lane:(lane + 1) * per_lane]
+        if not lane_items:
+            continue
+        line_y = y + lane * lane_h + lane_h * 0.30
+        connector = slide_obj.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(x + 0.18), Inches(line_y), Inches(x + w - 0.18), Inches(line_y))
+        connector.line.color.rgb = _pptx_rgb(tokens["accent"])
+        connector.line.width = Pt(2)
+        step = (w - 0.36) / max(1, len(lane_items) - 1)
+        card_w = max(0.72, min(1.45, w / max(3, len(lane_items)) - 0.08))
+        for idx, item in enumerate(lane_items):
+            global_idx = lane * per_lane + idx
+            cx = x + 0.18 + step * idx if len(lane_items) > 1 else x + w * 0.50
+            _pptx_shape(slide_obj, MSO_SHAPE.OVAL, cx - 0.08, line_y - 0.08, 0.16, 0.16, fill=tokens["palette"][global_idx % len(tokens["palette"])])
+            card_x = min(max(x, cx - card_w / 2), x + w - card_w)
+            card_y = line_y + 0.18
+            _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, card_x, card_y, card_w, max(0.58, lane_h * 0.52), fill=tokens["surface_alt"], line=tokens["border"])
+            _pptx_add_text(slide_obj, item, {"x": (card_x + 0.10) / slide_w * 100, "y": (card_y + 0.08) / slide_h * 100, "width": (card_w - 0.20) / slide_w * 100, "height": max(5, (lane_h * 0.48) / slide_h * 100), "fontSize": 9, "fontWeight": 720, "color": tokens["text"], "align": "center", "maxLines": 3, "minFontSize": 7}, slide_w, slide_h, bold=True)
+    return True
+
+
+def _pptx_add_waterfall_visual(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float, metrics: list[dict[str, Any]]) -> bool:
+    from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE  # type: ignore
+    from pptx.util import Inches, Pt  # type: ignore
+    rows = metrics[:6]
+    if len(rows) < 3:
+        return False
+    values = [_pptx_number(row.get("value")) or 0 for row in rows]
+    total_abs = max(1.0, sum(abs(value) for value in values))
+    baseline = y + h * 0.78
+    plot_h = max(0.8, h * 0.52)
+    gap = 0.10
+    bar_w = max(0.35, (w - gap * (len(rows) - 1)) / len(rows))
+    cursor = 0.0
+    _pptx_shape(slide_obj, MSO_SHAPE.RECTANGLE, x, baseline, w, 0.025, fill=tokens["border"])
+    prev_end: tuple[float, float] | None = None
+    for idx, (row, value) in enumerate(zip(rows, values)):
+        bx = x + idx * (bar_w + gap)
+        bar_h = max(0.16, abs(value) / total_abs * plot_h * len(rows) / 2)
+        if idx == 0:
+            top = baseline - bar_h
+            cursor = value
+        else:
+            top = baseline - max(cursor + value, cursor, 0) / total_abs * plot_h * len(rows) / 2
+            cursor += value
+        fill = tokens["palette"][idx % len(tokens["palette"])] if value >= 0 else tokens["muted"]
+        _pptx_shape(slide_obj, MSO_SHAPE.RECTANGLE, bx, top, bar_w, bar_h, fill=fill)
+        _pptx_add_text(slide_obj, _pptx_metric_display(row), {"x": bx / slide_w * 100, "y": max(y, top - 0.24) / slide_h * 100, "width": bar_w / slide_w * 100, "height": 3.4, "fontSize": 10, "fontWeight": 900, "color": fill, "align": "center", "maxLines": 1, "minFontSize": 7}, slide_w, slide_h, bold=True)
+        _pptx_add_text(slide_obj, _pptx_metric_label(row, idx), {"x": bx / slide_w * 100, "y": (baseline + 0.08) / slide_h * 100, "width": bar_w / slide_w * 100, "height": 6, "fontSize": 8, "fontWeight": 720, "color": tokens["text"], "align": "center", "maxLines": 2, "minFontSize": 6}, slide_w, slide_h, bold=True)
+        current_end = (bx + bar_w, top)
+        if prev_end:
+            connector = slide_obj.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(prev_end[0]), Inches(prev_end[1]), Inches(bx), Inches(top))
+            connector.line.color.rgb = _pptx_rgb(tokens["border"])
+            connector.line.width = Pt(1)
+        prev_end = current_end
+    return True
+
+
+def _pptx_add_funnel_visual(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float, metrics: list[dict[str, Any]]) -> bool:
+    from pptx.enum.shapes import MSO_SHAPE  # type: ignore
+    rows = metrics[:6] or [{"label": item.split("：", 1)[0], "value": max(10, 100 - idx * 14), "detail": item} for idx, item in enumerate(_pptx_bullet_rows(deck_slide, limit=5))]
+    if len(rows) < 3:
+        return False
+    gap = 0.10
+    row_h = max(0.34, (h - gap * (len(rows) - 1)) / len(rows))
+    max_value = max([_pptx_number(row.get("value")) or 0 for row in rows] + [1])
+    for idx, row in enumerate(rows):
+        value = _pptx_number(row.get("value")) or max(1, max_value - idx * max_value / len(rows))
+        ratio = max(0.38, min(1.0, value / max_value))
+        fw = w * ratio
+        fx = x + (w - fw) / 2
+        fy = y + idx * (row_h + gap)
+        fill = tokens["palette"][idx % len(tokens["palette"])]
+        _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, fx, fy, fw, row_h, fill=fill)
+        label = f"{_pptx_metric_label(row, idx)} · {_pptx_metric_display(row)}"
+        _pptx_add_text(slide_obj, label, {"x": (fx + 0.10) / slide_w * 100, "y": (fy + 0.08) / slide_h * 100, "width": (fw - 0.20) / slide_w * 100, "height": (row_h - 0.12) / slide_h * 100, "fontSize": 11, "fontWeight": 900, "color": "FFFFFF", "align": "center", "maxLines": 1, "minFontSize": 7}, slide_w, slide_h, bold=True)
+    return True
+
+
+def _pptx_add_quadrant_visual(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float) -> bool:
+    from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE  # type: ignore
+    from pptx.util import Inches, Pt  # type: ignore
+    columns = _pptx_spec_columns(spec, deck_slide)
+    items: list[dict[str, Any]] = []
+    for col in columns:
+        items.append({
+            "label": _field_value(col.get("label") or col.get("title")) or f"象限 {len(items) + 1}",
+            "detail": "；".join(_presentation_list_strings(col.get("items"), limit=3)) or _field_value(col.get("detail")),
+        })
+    if len(items) < 4:
+        bullets = _pptx_bullet_rows(deck_slide, limit=4)
+        items = [{"label": f"象限 {idx + 1}", "detail": item} for idx, item in enumerate(bullets)]
+    if len(items) < 4:
+        return False
+    mid_x = x + w / 2
+    mid_y = y + h / 2
+    vline = slide_obj.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(mid_x), Inches(y), Inches(mid_x), Inches(y + h))
+    hline = slide_obj.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(x), Inches(mid_y), Inches(x + w), Inches(mid_y))
+    for line in (vline, hline):
+        line.line.color.rgb = _pptx_rgb(tokens["border"])
+        line.line.width = Pt(1.2)
+    quadrant_boxes = [(x, y), (mid_x, y), (x, mid_y), (mid_x, mid_y)]
+    for idx, item in enumerate(items[:4]):
+        qx, qy = quadrant_boxes[idx]
+        qw, qh = w / 2 - 0.06, h / 2 - 0.06
+        _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, qx + 0.03, qy + 0.03, qw, qh, fill=tokens["surface_alt"] if idx % 2 == 0 else tokens["accent_soft"], line=tokens["border"])
+        _pptx_add_text(slide_obj, item["label"], {"x": (qx + 0.18) / slide_w * 100, "y": (qy + 0.16) / slide_h * 100, "width": (qw - 0.36) / slide_w * 100, "height": 7, "fontSize": 12, "fontWeight": 920, "color": tokens["palette"][idx % len(tokens["palette"])], "maxLines": 1, "minFontSize": 8}, slide_w, slide_h, bold=True)
+        _pptx_add_text(slide_obj, item["detail"], {"x": (qx + 0.18) / slide_w * 100, "y": (qy + 0.55) / slide_h * 100, "width": (qw - 0.36) / slide_w * 100, "height": (qh - 0.70) / slide_h * 100, "fontSize": 9, "fontWeight": 650, "color": tokens["text"], "maxLines": 4, "minFontSize": 7}, slide_w, slide_h)
+    return True
+
+
+def _pptx_add_hub_spoke_visual(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float) -> bool:
+    from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE  # type: ignore
+    from pptx.util import Inches, Pt  # type: ignore
+    layers = _pptx_spec_layers(spec, deck_slide)[:6]
+    if len(layers) < 3:
+        return False
+    cx = x + w * 0.50
+    cy = y + h * 0.50
+    hub_size = max(1.05, min(min(w, h) * 0.34, 1.55))
+    _pptx_shape(slide_obj, MSO_SHAPE.OVAL, cx - hub_size / 2, cy - hub_size / 2, hub_size, hub_size, fill=tokens["primary"], line=tokens["primary"])
+    _pptx_add_text(slide_obj, _field_value(spec.get("title")) or _field_value(deck_slide.get("visual")) or "核心能力", {"x": (cx - hub_size * 0.42) / slide_w * 100, "y": (cy - 0.16) / slide_h * 100, "width": (hub_size * 0.84) / slide_w * 100, "height": 8, "fontSize": 12, "fontWeight": 920, "color": "FFFFFF", "align": "center", "maxLines": 2, "minFontSize": 7}, slide_w, slide_h, bold=True)
+    positions = [(0.50, 0.06), (0.78, 0.18), (0.84, 0.62), (0.50, 0.78), (0.16, 0.62), (0.22, 0.18)]
+    card_w = min(1.65, max(1.12, w * 0.28))
+    card_h = min(0.82, max(0.58, h * 0.18))
+    for idx, layer in enumerate(layers[:6]):
+        px, py = positions[idx]
+        sx = x + w * px - card_w / 2
+        sy = y + h * py - card_h / 2
+        connector = slide_obj.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(cx), Inches(cy), Inches(sx + card_w / 2), Inches(sy + card_h / 2))
+        connector.line.color.rgb = _pptx_rgb(tokens["border"])
+        connector.line.width = Pt(1)
+        _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, sx, sy, card_w, card_h, fill=tokens["surface_alt"], line=tokens["border"])
+        _pptx_shape(slide_obj, MSO_SHAPE.RECTANGLE, sx, sy, 0.06, card_h, fill=tokens["palette"][idx % len(tokens["palette"])])
+        _pptx_add_text(slide_obj, _field_value(layer.get("label") or layer.get("title")) or f"模块 {idx + 1}", {"x": (sx + 0.14) / slide_w * 100, "y": (sy + 0.10) / slide_h * 100, "width": (card_w - 0.24) / slide_w * 100, "height": (card_h - 0.16) / slide_h * 100, "fontSize": 9, "fontWeight": 850, "color": tokens["text"], "align": "center", "maxLines": 2, "minFontSize": 7}, slide_w, slide_h, bold=True)
+    return True
+
+
+def _pptx_add_business_canvas_visual(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float) -> bool:
+    from pptx.enum.shapes import MSO_SHAPE  # type: ignore
+    labels = ["客户细分", "价值主张", "渠道", "客户关系", "收入来源", "关键资源", "关键活动", "关键伙伴", "成本结构"]
+    rows = _pptx_spec_columns(spec, deck_slide)
+    details: list[str] = []
+    for row in rows:
+        details.extend(_presentation_list_strings(row.get("items"), limit=2) or [_field_value(row.get("detail"))])
+    if not details:
+        details = _pptx_bullet_rows(deck_slide, limit=9)
+    cell_gap = 0.08
+    cols = 3
+    cell_w = (w - cell_gap * (cols - 1)) / cols
+    cell_h = (h - cell_gap * 2) / 3
+    for idx, label in enumerate(labels):
+        col = idx % 3
+        row = idx // 3
+        sx = x + col * (cell_w + cell_gap)
+        sy = y + row * (cell_h + cell_gap)
+        _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, sx, sy, cell_w, cell_h, fill=tokens["surface_alt"] if idx % 2 == 0 else tokens["accent_soft"], line=tokens["border"])
+        _pptx_add_text(slide_obj, label, {"x": (sx + 0.12) / slide_w * 100, "y": (sy + 0.10) / slide_h * 100, "width": (cell_w - 0.24) / slide_w * 100, "height": 5, "fontSize": 9, "fontWeight": 900, "color": tokens["primary"], "maxLines": 1, "minFontSize": 7}, slide_w, slide_h, bold=True)
+        _pptx_add_text(slide_obj, details[idx % len(details)] if details else "待补", {"x": (sx + 0.12) / slide_w * 100, "y": (sy + 0.40) / slide_h * 100, "width": (cell_w - 0.24) / slide_w * 100, "height": (cell_h - 0.48) / slide_h * 100, "fontSize": 8, "fontWeight": 620, "color": tokens["text"], "maxLines": 3, "minFontSize": 6}, slide_w, slide_h)
+    return True
+
+
+def _pptx_add_case_study_cards(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float) -> bool:
+    from pptx.enum.shapes import MSO_SHAPE  # type: ignore
+    columns = _pptx_spec_columns(spec, deck_slide)[:3]
+    if len(columns) < 2:
+        return False
+    gap = 0.16
+    card_w = (w - gap * (len(columns) - 1)) / len(columns)
+    for idx, col in enumerate(columns):
+        sx = x + idx * (card_w + gap)
+        _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, sx, y, card_w, h, fill=tokens["surface_alt"], line=tokens["border"])
+        _pptx_shape(slide_obj, MSO_SHAPE.RECTANGLE, sx, y, card_w, 0.08, fill=tokens["palette"][idx % len(tokens["palette"])])
+        _pptx_add_text(slide_obj, _field_value(col.get("label") or col.get("title")) or f"案例 {idx + 1}", {"x": (sx + 0.16) / slide_w * 100, "y": (y + 0.20) / slide_h * 100, "width": (card_w - 0.32) / slide_w * 100, "height": 8, "fontSize": 12, "fontWeight": 920, "color": tokens["text"], "maxLines": 2, "minFontSize": 8}, slide_w, slide_h, bold=True)
+        items = _presentation_list_strings(col.get("items"), limit=4) or [_field_value(col.get("detail"))]
+        _pptx_add_text(slide_obj, "\n".join(items), {"x": (sx + 0.16) / slide_w * 100, "y": (y + 0.90) / slide_h * 100, "width": (card_w - 0.32) / slide_w * 100, "height": (h - 1.05) / slide_h * 100, "fontSize": 9, "fontWeight": 650, "color": tokens["text"], "maxLines": 6, "minFontSize": 7}, slide_w, slide_h, bullets=True)
+    return True
+
+
+def _pptx_add_process_visual(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float, template: str) -> bool:
+    from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE  # type: ignore
+    from pptx.util import Inches, Pt  # type: ignore
+    if template in {"timeline", "roadmap_vertical", "gantt_chart"}:
+        return _pptx_add_timeline_visual(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h, template)
+    items = _pptx_process_items(spec, deck_slide)[:8]
+    if not items:
+        return False
+    gap = 0.12
+    if len(items) > 5:
+        cols = min(4, len(items))
+        rows_count = math.ceil(len(items) / cols)
+        card_w = max(0.72, (w - gap * (cols - 1)) / cols)
+        card_h = max(0.56, (h - gap * (rows_count - 1)) / rows_count)
+        for idx, item in enumerate(items):
+            col = idx % cols
+            row = idx // cols
+            sx = x + col * (card_w + gap)
+            sy = y + row * (card_h + gap)
+            _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, sx, sy, card_w, card_h, fill=tokens["surface_alt"], line=tokens["border"])
+            _pptx_shape(slide_obj, MSO_SHAPE.OVAL, sx + 0.10, sy + 0.12, 0.22, 0.22, fill=tokens["palette"][idx % len(tokens["palette"])])
+            _pptx_add_text(slide_obj, str(idx + 1), {"x": (sx + 0.10) / slide_w * 100, "y": (sy + 0.125) / slide_h * 100, "width": 0.22 / slide_w * 100, "height": 0.17 / slide_h * 100, "fontSize": 8, "fontWeight": 900, "color": "FFFFFF", "align": "center", "maxLines": 1}, slide_w, slide_h, bold=True)
+            _pptx_add_text(slide_obj, item, {"x": (sx + 0.12) / slide_w * 100, "y": (sy + 0.40) / slide_h * 100, "width": (card_w - 0.24) / slide_w * 100, "height": (card_h - 0.48) / slide_h * 100, "fontSize": 9, "fontWeight": 720, "color": tokens["text"], "align": "center", "maxLines": 3, "minFontSize": 7}, slide_w, slide_h, bold=True)
+        return True
+    step_w = max(0.72, (w - gap * (len(items) - 1)) / len(items))
+    for idx, item in enumerate(items):
+        sx = x + idx * (step_w + gap)
+        shape_type = MSO_SHAPE.CHEVRON if template in {"process_flow", "pipeline_with_stages"} and step_w >= 0.8 else MSO_SHAPE.ROUNDED_RECTANGLE
+        _pptx_shape(slide_obj, shape_type, sx, y + h * 0.18, step_w, h * 0.56, fill=tokens["surface_alt"], line=tokens["border"])
+        _pptx_shape(slide_obj, MSO_SHAPE.OVAL, sx + 0.12, y + h * 0.26, 0.28, 0.28, fill=tokens["palette"][idx % len(tokens["palette"])])
+        _pptx_add_text(slide_obj, str(idx + 1), {"x": (sx + 0.12) / slide_w * 100, "y": (y + h * 0.265) / slide_h * 100, "width": 0.28 / slide_w * 100, "height": 0.20 / slide_h * 100, "fontSize": 9, "fontWeight": 900, "color": "FFFFFF", "align": "center", "maxLines": 1}, slide_w, slide_h, bold=True)
+        _pptx_add_text(slide_obj, item, {"x": (sx + 0.14) / slide_w * 100, "y": (y + h * 0.45) / slide_h * 100, "width": (step_w - 0.28) / slide_w * 100, "height": (h * 0.30) / slide_h * 100, "fontSize": 9, "fontWeight": 720, "color": tokens["text"], "align": "center", "maxLines": 3, "minFontSize": 7}, slide_w, slide_h, bold=True)
+    return True
+
+
+def _pptx_add_template_visual(slide_obj: Any, deck_slide: dict[str, Any], spec: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float, x: float, y: float, w: float, h: float, chart_kind: str, metrics: list[dict[str, Any]]) -> bool:
+    template = _pptx_chart_template(deck_slide)
+    layout = _field_value(deck_slide.get("layout"))
+    if template == "waterfall_chart":
+        if _pptx_add_waterfall_visual(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h, metrics):
+            return True
+    if template == "funnel_chart":
+        if _pptx_add_funnel_visual(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h, metrics):
+            return True
+    if template in {"quadrant_text_bullets", "matrix_2x2"}:
+        if _pptx_add_quadrant_visual(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h):
+            return True
+    if template in {"hub_spoke", "system_map"}:
+        if _pptx_add_hub_spoke_visual(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h):
+            return True
+    if template == "business_model_canvas":
+        if _pptx_add_business_canvas_visual(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h):
+            return True
+    if template == "case_study_cards":
+        if _pptx_add_case_study_cards(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h):
+            return True
+    if template == "line_chart" and metrics:
+        chart_h = max(1.2, h * 0.62)
+        if _pptx_add_native_chart(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, chart_h, "line", metrics):
+            card_y = y + chart_h + 0.16
+            _pptx_add_metric_cards(slide_obj, metrics, tokens, slide_w, slide_h, x, card_y, w, max(0.8, h - chart_h - 0.16), "bullet_chart")
+            return True
+    if template in {"line_chart", "multi_line_chart", "bar_chart", "grouped_bar_chart", "horizontal_bar_chart"}:
+        native_kind = "line" if template in {"line_chart", "multi_line_chart"} else "horizontal_bar" if template == "horizontal_bar_chart" else "bar"
+        if _pptx_add_native_chart(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h, native_kind, metrics):
+            return True
+    if template in {"kpi_cards", "metric_dashboard", "hero_metric", "bullet_chart", "unit_economics"} or (layout == "metrics" and metrics and chart_kind not in {"bar", "line"}):
+        metric_template = template if template in {"kpi_cards", "metric_dashboard", "hero_metric", "bullet_chart"} else "metric_dashboard" if template == "unit_economics" else "kpi_cards"
+        if _pptx_add_metric_cards(slide_obj, metrics, tokens, slide_w, slide_h, x, y, w, h, metric_template):
+            return True
+    if template in {"comparison_table", "comparison_columns", "feature_matrix_table", "quadrant_text_bullets", "matrix_2x2"} or layout == "compare":
+        if _pptx_add_compare_visual(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h, template or "comparison_table"):
+            return True
+    if template in {"layered_architecture", "hub_spoke", "system_map"} or layout == "diagram" or spec.get("type") == "architecture":
+        if _pptx_add_architecture_visual(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h):
+            return True
+    if template in {"process_flow", "pipeline_with_stages", "numbered_steps", "agenda_list", "timeline", "roadmap_vertical", "gantt_chart", "journey_map"} or layout in {"process", "timeline", "checklist"}:
+        if _pptx_add_process_visual(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h, template or "process_flow"):
+            return True
+    return False
+
+
+def _pptx_add_visual(slide_obj: Any, deck_slide: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float):
+    from pptx.enum.shapes import MSO_SHAPE  # type: ignore
+    from pptx.enum.shapes import MSO_CONNECTOR  # type: ignore
+    from pptx.util import Inches, Pt  # type: ignore
+    visual_style = _pptx_style(deck_slide, "visual", tokens)
+    if visual_style.get("visible") is False:
+        return
+    x, y, w, h = _pptx_box(visual_style, slide_w, slide_h)
+    design = deck_slide.get("design") if isinstance(deck_slide.get("design"), dict) else {}
+    media = design.get("media") if isinstance(design.get("media"), list) else []
+    media_row = media[0] if media and isinstance(media[0], dict) else {}
+    image_url = _field_value(media_row.get("url"))
+    svg = _pptx_svg_image_bytes(image_url)
+    if svg and _pptx_add_svg_picture(slide_obj, svg, x, y, w, h, alt=_field_value(media_row.get("alt")) or _field_value(deck_slide.get("title")) or "SVG image"):
+        return
+    image = _pptx_data_image_bytes(image_url)
+    if image:
+        slide_obj.shapes.add_picture(io.BytesIO(image[0]), Inches(x), Inches(y), width=Inches(w), height=Inches(h))
+        return
+    spec = _pptx_visual_spec(deck_slide)
+    chart = spec.get("chart") if isinstance(spec.get("chart"), dict) else {}
+    chart_kind = _field_value(chart.get("kind")) or _field_value(spec.get("type"))
+    metrics = _pptx_metric_values(spec, deck_slide)
+    if _pptx_add_template_visual(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h, chart_kind, metrics):
+        return
+    if chart_kind in {"bar", "line"}:
+        if _pptx_add_native_chart(slide_obj, deck_slide, spec, tokens, slide_w, slide_h, x, y, w, h, chart_kind, metrics):
+            return
+        labels = chart.get("labels") if isinstance(chart.get("labels"), list) else [f"P{i+1}" for i in range(4)]
+        series = chart.get("series") if isinstance(chart.get("series"), list) else []
+        values = []
+        if series and isinstance(series[0], dict):
+            values = [_pptx_number(v) or 0 for v in (series[0].get("values") or [])][:8]
+        if not values:
+            values = [float(i + 1) for i in range(min(len(labels), 4) or 4)]
+        bg = slide_obj.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+        bg.fill.solid(); bg.fill.fore_color.rgb = _pptx_rgb(tokens["surface_alt"])
+        bg.line.color.rgb = _pptx_rgb(tokens["border"])
+        max_v = max(values + [1]); min_v = min(values + [0]); rng = max(max_v - min_v, 1)
+        plot_x, plot_y, plot_w, plot_h = x + 0.35, y + 0.7, max(0.6, w - 0.7), max(0.6, h - 1.0)
+        if chart_kind == "bar":
+            bar_w = plot_w / max(len(values), 1) * 0.58
+            for i, value in enumerate(values):
+                bh = max(0.06, (value - min_v) / rng * plot_h)
+                bx = plot_x + i * (plot_w / max(len(values), 1)) + bar_w * 0.25
+                by = plot_y + plot_h - bh
+                bar = slide_obj.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(bx), Inches(by), Inches(bar_w), Inches(bh))
+                bar.fill.solid(); bar.fill.fore_color.rgb = _pptx_rgb(tokens["palette"][i % len(tokens["palette"])])
+                bar.line.fill.background()
+        else:
+            pts = []
+            for i, value in enumerate(values):
+                px = plot_x + (plot_w / max(len(values) - 1, 1)) * i
+                py = plot_y + plot_h - ((value - min_v) / rng * plot_h)
+                pts.append((px, py))
+                dot = slide_obj.shapes.add_shape(MSO_SHAPE.OVAL, Inches(px - 0.05), Inches(py - 0.05), Inches(0.1), Inches(0.1))
+                dot.fill.solid(); dot.fill.fore_color.rgb = _pptx_rgb(tokens["accent"])
+            for p1, p2 in zip(pts, pts[1:]):
+                line = slide_obj.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(p1[0]), Inches(p1[1]), Inches(p2[0]), Inches(p2[1]))
+                line.line.color.rgb = _pptx_rgb(tokens["accent"])
+                line.line.width = Pt(2)
+        _pptx_add_text(slide_obj, _field_value(spec.get("title")) or _field_value(deck_slide.get("visual")) or "图表", {"x": (x + 0.25) / slide_w * 100, "y": (y + 0.22) / slide_h * 100, "width": (w - 0.5) / slide_w * 100, "height": 5, "fontSize": 16, "fontWeight": 800, "color": tokens["text"]}, slide_w, slide_h, bold=True)
+        return
+    if metrics:
+        gap = 0.14
+        card_w = max(0.9, (w - gap * (len(metrics) - 1)) / len(metrics))
+        for i, metric in enumerate(metrics):
+            card = slide_obj.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x + i * (card_w + gap)), Inches(y), Inches(card_w), Inches(h))
+            card.fill.solid(); card.fill.fore_color.rgb = _pptx_rgb(tokens["surface_alt"] if i % 2 == 0 else tokens["accent_soft"])
+            card.line.color.rgb = _pptx_rgb(tokens["border"])
+            _pptx_add_text(slide_obj, str(metric.get("value") or ""), {"x": (x + i * (card_w + gap) + 0.15) / slide_w * 100, "y": (y + 0.2) / slide_h * 100, "width": (card_w - 0.3) / slide_w * 100, "height": 18, "fontSize": 28, "fontWeight": 900, "color": tokens["primary"]}, slide_w, slide_h, bold=True)
+            _pptx_add_text(slide_obj, _field_value(metric.get("label") or metric.get("title")) or f"指标 {i+1}", {"x": (x + i * (card_w + gap) + 0.15) / slide_w * 100, "y": (y + h * 0.55) / slide_h * 100, "width": (card_w - 0.3) / slide_w * 100, "height": 10, "fontSize": 14, "fontWeight": 800, "color": tokens["text"]}, slide_w, slide_h, bold=True)
+        return
+    box = slide_obj.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+    box.fill.solid(); box.fill.fore_color.rgb = _pptx_rgb(tokens["surface_alt"])
+    box.line.color.rgb = _pptx_rgb(tokens["border"])
+    _pptx_add_text(slide_obj, _field_value(deck_slide.get("visual")) or "视觉区", {"x": (x + 0.22) / slide_w * 100, "y": (y + h - 0.7) / slide_h * 100, "width": (w - 0.44) / slide_w * 100, "height": 8, "fontSize": 18, "fontWeight": 800, "color": tokens["primary"]}, slide_w, slide_h, bold=True)
+
+
+def _pptx_safe_fill(value: Any, fallback: str, *, allow_transparent: bool = False) -> str:
+    clean = _field_value(value).strip()
+    if clean.lower() in {"transparent", "none", "rgba(0,0,0,0)", "rgba(0, 0, 0, 0)"}:
+        return "" if allow_transparent else fallback
+    if re.match(r"^#?[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$", clean):
+        return clean
+    rgb_match = re.match(r"^rgba?\(([^)]+)\)$", clean, flags=re.IGNORECASE)
+    if rgb_match:
+        parts = [part.strip() for part in rgb_match.group(1).split(",")]
+        if len(parts) >= 3:
+            try:
+                r, g, b = [max(0, min(255, int(float(parts[index])))) for index in range(3)]
+                return f"#{r:02x}{g:02x}{b:02x}"
+            except ValueError:
+                pass
+    return fallback
+
+
+def _pptx_custom_elements(deck_slide: dict[str, Any]) -> list[dict[str, Any]]:
+    design = deck_slide.get("design") if isinstance(deck_slide.get("design"), dict) else {}
+    raw_items = design.get("customElements") if isinstance(design.get("customElements"), list) else []
+    return [item for item in raw_items if isinstance(item, dict)]
+
+
+def _pptx_custom_style(element: dict[str, Any], tokens: dict[str, Any]) -> dict[str, Any]:
+    item_type = _field_value(element.get("type")) or "text"
+    defaults = {
+        "text": {"x": 56, "y": 26, "width": 26, "height": 12, "zIndex": 80, "fontSize": 18, "fontWeight": 760, "align": "left", "color": tokens["text"], "background": tokens["surface"]},
+        "image": {"x": 61, "y": 50, "width": 27, "height": 24, "zIndex": 82, "fontSize": 16, "fontWeight": 850, "align": "center", "color": tokens["primary"], "background": tokens["surface_alt"]},
+        "shape": {"x": 58, "y": 72, "width": 24, "height": 8, "zIndex": 4, "fontSize": 14, "fontWeight": 700, "align": "center", "color": tokens["text"], "background": tokens["accent_soft"]},
+        "metric": {"x": 66, "y": 58, "width": 20, "height": 18, "zIndex": 86, "fontSize": 28, "fontWeight": 930, "align": "left", "color": tokens["primary"], "background": tokens["surface_alt"]},
+    }.get(item_type, {})
+    style = {**defaults, **element}
+    style["color"] = _pptx_safe_fill(style.get("color"), tokens["text"])
+    style["background"] = _pptx_safe_fill(style.get("background"), tokens["surface_alt"], allow_transparent=True)
+    return style
+
+
+def _pptx_add_custom_element(slide_obj: Any, element: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float) -> None:
+    if element.get("visible") is False:
+        return
+    from pptx.enum.shapes import MSO_SHAPE  # type: ignore
+    from pptx.util import Inches  # type: ignore
+    style = _pptx_custom_style(element, tokens)
+    item_type = _field_value(style.get("type")) or "text"
+    x, y, w, h = _pptx_box(style, slide_w, slide_h)
+    radius_shape = MSO_SHAPE.OVAL if _field_value(style.get("shape")) == "circle" else MSO_SHAPE.ROUNDED_RECTANGLE
+    if item_type == "image":
+        image_url = _field_value(style.get("url"))
+        svg = _pptx_svg_image_bytes(image_url)
+        if svg and _pptx_add_svg_picture(slide_obj, svg, x, y, w, h, alt=_field_value(style.get("alt")) or "图片素材"):
+            return
+        image = _pptx_data_image_bytes(image_url)
+        if image:
+            slide_obj.shapes.add_picture(io.BytesIO(image[0]), Inches(x), Inches(y), width=Inches(w), height=Inches(h))
+            return
+        _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, x, y, w, h, fill=style["background"] or tokens["surface_alt"], line=tokens["border"])
+        _pptx_add_text(slide_obj, _field_value(style.get("alt") or style.get("label") or "图片/素材"), {**style, "x": style.get("x"), "y": style.get("y"), "width": style.get("width"), "height": style.get("height"), "fontSize": 14, "fontWeight": 850, "align": "center", "color": tokens["primary"]}, slide_w, slide_h, bold=True)
+        return
+    if item_type == "shape":
+        if _field_value(style.get("background")):
+            _pptx_shape(slide_obj, radius_shape, x, y, w, h, fill=style["background"], line=tokens["border"])
+        return
+    if item_type == "metric":
+        _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, x, y, w, h, fill=style["background"] or tokens["surface_alt"], line=tokens["border"])
+        _pptx_shape(slide_obj, MSO_SHAPE.RECTANGLE, x, y, 0.07, h, fill=tokens["primary"])
+        _pptx_add_text(slide_obj, f"{_field_value(style.get('value')) or '128%'}{_field_value(style.get('unit'))}", {**style, "x": (x + 0.18) / slide_w * 100, "y": (y + 0.18) / slide_h * 100, "width": (w - 0.36) / slide_w * 100, "height": max(8, h * 0.40 / slide_h * 100), "fontSize": style.get("fontSize") or 28, "fontWeight": 930, "color": style.get("color") or tokens["primary"]}, slide_w, slide_h, bold=True)
+        _pptx_add_text(slide_obj, _field_value(style.get("label")) or "核心指标", {**style, "x": (x + 0.18) / slide_w * 100, "y": (y + h * 0.60) / slide_h * 100, "width": (w - 0.36) / slide_w * 100, "height": max(6, h * 0.24 / slide_h * 100), "fontSize": 12, "fontWeight": 800, "color": tokens["muted"]}, slide_w, slide_h)
+        return
+    if _field_value(style.get("background")):
+        _pptx_shape(slide_obj, MSO_SHAPE.ROUNDED_RECTANGLE, x, y, w, h, fill=style["background"], line=tokens["border"])
+    _pptx_add_text(slide_obj, _field_value(style.get("content")) or "补充一条关键说明", style, slide_w, slide_h)
+
+
+def _pptx_add_custom_elements(slide_obj: Any, deck_slide: dict[str, Any], tokens: dict[str, Any], slide_w: float, slide_h: float) -> None:
+    for element in sorted(_pptx_custom_elements(deck_slide), key=lambda item: float(item.get("zIndex") or 80)):
+        _pptx_add_custom_element(slide_obj, element, tokens, slide_w, slide_h)
+
+
+def _build_aippt_pptx(plan: dict[str, Any], config: dict[str, Any]) -> bytes:
+    from pptx import Presentation  # type: ignore
+    from pptx.util import Inches, Pt  # type: ignore
+    plan = _presentation_prepare_delivery_plan(plan, config)
+    prs = Presentation()
+    slide_w, slide_h = _pptx_dimensions(config)
+    prs.slide_width = Inches(slide_w)
+    prs.slide_height = Inches(slide_h)
+    tokens = _pptx_tokens(config)
+    blank = prs.slide_layouts[6]
+    sections = {str(s.get("id")): s for s in plan.get("sections", []) if isinstance(s, dict)}
+    for idx, deck_slide in enumerate([s for s in plan.get("slides", []) if isinstance(s, dict)], start=1):
+        slide_obj = prs.slides.add_slide(blank)
+        bg = slide_obj.background.fill
+        bg.solid(); bg.fore_color.rgb = _pptx_rgb(tokens["background"])
+        section = sections.get(str(deck_slide.get("sectionId"))) or {}
+        eyebrow = f"{_field_value(section.get('title')) or _field_value(config.get('useCase')) or 'AIPPT'} · {tokens['name']}"
+        layer_keys = ["visual", "eyebrow", "title", "headline", "bullets"]
+        layer_keys.sort(key=lambda key: float(_pptx_style(deck_slide, key, tokens).get("zIndex") or _AIPPT_DESIGN_DEFAULTS[key].get("zIndex") or 0))
+        for key in layer_keys:
+            if key == "visual":
+                _pptx_add_visual(slide_obj, deck_slide, tokens, slide_w, slide_h)
+                continue
+            if key == "eyebrow":
+                _pptx_add_text(slide_obj, eyebrow, _pptx_style(deck_slide, key, tokens), slide_w, slide_h, bold=True)
+            elif key == "title":
+                _pptx_add_text(slide_obj, _field_value(deck_slide.get("title")) or f"Slide {idx}", _pptx_style(deck_slide, key, tokens), slide_w, slide_h, bold=True)
+            elif key == "headline":
+                _pptx_add_text(slide_obj, _field_value(deck_slide.get("headline")), _pptx_style(deck_slide, key, tokens), slide_w, slide_h)
+            elif key == "bullets":
+                bullets = "\n".join(str(b) for b in (deck_slide.get("bullets") or [])[:6])
+                _pptx_add_text(slide_obj, bullets, _pptx_style(deck_slide, key, tokens), slide_w, slide_h, bullets=True)
+        _pptx_add_custom_elements(slide_obj, deck_slide, tokens, slide_w, slide_h)
+        _pptx_add_text(slide_obj, str(deck_slide.get("index") or idx).zfill(2), {"x": 94, "y": 4.2, "width": 3, "height": 4, "fontSize": 12, "fontWeight": 900, "color": tokens["muted"], "align": "right"}, slide_w, slide_h, bold=True)
+        notes = _field_value(deck_slide.get("speakerNotes"))
+        if notes:
+            slide_obj.notes_slide.notes_text_frame.text = notes
+    out = io.BytesIO()
+    prs.save(out)
+    return out.getvalue()
+
+
+def _pptx_text_font_pt(shape: Any) -> int:
+    sizes: list[float] = []
+    try:
+        for paragraph in shape.text_frame.paragraphs:
+            if paragraph.font.size is not None:
+                sizes.append(float(paragraph.font.size.pt))
+            for run in paragraph.runs:
+                if run.font.size is not None:
+                    sizes.append(float(run.font.size.pt))
+    except Exception:
+        pass
+    if sizes:
+        return max(6, min(48, round(max(sizes))))
+    return 12
+
+
+def _scan_aippt_pptx_text_overflow(content: bytes, *, limit: int = 60) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    try:
+        from pptx import Presentation  # type: ignore
+        prs = Presentation(io.BytesIO(content))
+    except Exception as exc:
+        return [{"slide": 0, "shape": "", "reason": f"python-pptx 无法打开，跳过溢出扫描：{exc}", "severity": "error"}]
+    emu_per_inch = 914400.0
+    for slide_index, slide in enumerate(prs.slides, start=1):
+        for shape_index, shape in enumerate(slide.shapes, start=1):
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            try:
+                text = str(shape.text_frame.text or "").strip()
+            except Exception:
+                continue
+            if not text:
+                continue
+            w = max(0.05, float(getattr(shape, "width", 0) or 0) / emu_per_inch)
+            h = max(0.05, float(getattr(shape, "height", 0) or 0) / emu_per_inch)
+            font_pt = _pptx_text_font_pt(shape)
+            bullets = "\n" in text
+            max_units = _pptx_text_max_units_for_box(w, font_pt)
+            max_lines = _pptx_text_max_lines_for_box(h, font_pt, bullets=bullets)
+            wrapped: list[str] = []
+            for source in text.splitlines() or [text]:
+                wrapped.extend(row for row in _pptx_wrap_line(source, max_units) if row.strip())
+            too_wide = any(_pptx_text_units(row) > max_units * 1.08 for row in wrapped)
+            too_tall = len(wrapped) > max_lines
+            if too_tall and len(wrapped) <= 2 and font_pt <= 8 and h >= 0.32 and w >= 0.9:
+                too_tall = False
+            if not too_wide and not too_tall:
+                continue
+            reason = []
+            if too_wide:
+                reason.append("line_width")
+            if too_tall:
+                reason.append(f"line_count {len(wrapped)}/{max_lines}")
+            issues.append({
+                "slide": slide_index,
+                "shape": _field_value(getattr(shape, "name", "")) or f"shape-{shape_index}",
+                "reason": ", ".join(reason),
+                "fontPt": font_pt,
+                "boxInches": {"w": round(w, 2), "h": round(h, 2)},
+                "estimatedLines": len(wrapped),
+                "maxLines": max_lines,
+                "text": text[:120],
+                "severity": "warning",
+            })
+            if len(issues) >= limit:
+                return issues
+    return issues
+
+
+def _aippt_repetition_runs(values: list[str]) -> list[str]:
+    repeated: list[str] = []
+    for idx in range(len(values) - 2):
+        if values[idx] and values[idx] == values[idx + 1] == values[idx + 2]:
+            repeated.append(f"{idx + 1}-{idx + 3}:{values[idx]}")
+    return repeated
+
+
+def _presentation_spec_lock_route_drifts(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    slides = [slide for slide in plan.get("slides", []) if isinstance(slide, dict)]
+    pages = _presentation_spec_lock_pages(plan)
+    if not slides or not pages:
+        return []
+    drifts: list[dict[str, Any]] = []
+    for idx, slide in enumerate(slides, start=1):
+        page = _presentation_spec_lock_page_for_slide(plan, slide, idx)
+        if not page:
+            drifts.append({
+                "slideId": _field_value(slide.get("id")) or f"slide-{idx}",
+                "index": idx,
+                "field": "specLock.pages",
+                "locked": "",
+                "actual": "missing",
+            })
+            continue
+        locked_layout = _field_value(page.get("layout"))
+        actual_layout = _field_value(slide.get("layout")) or "two_column"
+        if locked_layout and locked_layout != actual_layout:
+            drifts.append({
+                "slideId": _field_value(slide.get("id")) or f"slide-{idx}",
+                "index": idx,
+                "field": "layout",
+                "locked": locked_layout,
+                "actual": actual_layout,
+            })
+        locked_template = _presentation_canonical_template_id(page.get("templateId") or page.get("chartTemplate"))
+        actual_template = _presentation_template_id_for_slide(slide, actual_layout)
+        if locked_template and actual_template and locked_template != actual_template:
+            drifts.append({
+                "slideId": _field_value(slide.get("id")) or f"slide-{idx}",
+                "index": idx,
+                "field": "templateId",
+                "locked": locked_template,
+                "actual": actual_template,
+            })
+        spec = slide.get("visualSpec") if isinstance(slide.get("visualSpec"), dict) else {}
+        spec_template = _presentation_canonical_template_id(spec.get("templateId") or spec.get("chartTemplate") or spec.get("visualTemplate"))
+        if locked_template and actual_layout in {"metrics", "compare", "diagram", "process", "timeline", "checklist"} and spec_template != locked_template:
+            drifts.append({
+                "slideId": _field_value(slide.get("id")) or f"slide-{idx}",
+                "index": idx,
+                "field": "visualSpec.templateId",
+                "locked": locked_template,
+                "actual": spec_template,
+            })
+    return drifts[:40]
+
+
+def _presentation_quality_checks(plan: dict[str, Any], config: dict[str, Any], *, native_chart_count: int = 0, pdf_rendered: bool | None = None) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+
+    def add(key: str, ok: bool, detail: str, severity: str = "warning") -> None:
+        checks.append({"key": key, "ok": ok, "detail": detail, "severity": severity})
+
+    locked = _presentation_prepare_delivery_plan(plan, config)
+    spec_lock = locked.get("specLock") if isinstance(locked.get("specLock"), dict) else {}
+    slides = [slide for slide in locked.get("slides", []) if isinstance(slide, dict)]
+    pages = spec_lock.get("pages") if isinstance(spec_lock.get("pages"), list) else []
+    add("spec_lock", bool(spec_lock), "Deck Spec Lock 已生成" if spec_lock else "缺少 Deck Spec Lock", "error")
+    add(
+        "spec_lock_v2",
+        _field_value(spec_lock.get("version")) == "aippt-spec-lock-v2" and isinstance(spec_lock.get("layoutPlan"), dict),
+        "Deck Spec Lock v2 已锁定 layoutPlan/font/color/exportPolicy" if _field_value(spec_lock.get("version")) == "aippt-spec-lock-v2" else "Spec Lock 未升级到 v2",
+        "warning",
+    )
+    page_templates = spec_lock.get("pageTemplates") if isinstance(spec_lock.get("pageTemplates"), dict) else {}
+    add(
+        "template_id_coverage",
+        len(page_templates) >= len(slides),
+        "每页均已锁定 templateId" if len(page_templates) >= len(slides) else "部分页面缺少 templateId 锁定",
+        "warning",
+    )
+    route_drifts = _presentation_spec_lock_route_drifts(locked)
+    add(
+        "spec_lock_route_alignment",
+        not route_drifts,
+        "Spec Lock 与 slide.layout/renderHints/visualSpec 路由一致" if not route_drifts else f"发现 {len(route_drifts)} 个 Spec Lock 路由偏移",
+        "error",
+    )
+    required_layouts = {"metrics", "compare", "diagram", "process", "timeline"}
+    missing_templates = [
+        _field_value(slide.get("title")) or f"slide-{idx + 1}"
+        for idx, slide in enumerate(slides)
+        if _field_value(slide.get("layout")) in required_layouts and not _presentation_locked_chart_template(slide)
+    ]
+    add(
+        "chart_template_coverage",
+        not missing_templates,
+        "重点页面均已锁定 chartTemplate" if not missing_templates else f"缺少 chartTemplate：{', '.join(missing_templates[:5])}",
+        "warning",
+    )
+    layouts = [_field_value(slide.get("layout")) or "two_column" for slide in slides]
+    repeated = _aippt_repetition_runs(layouts)
+    add(
+        "layout_repetition",
+        not repeated,
+        "未发现连续 3 页同版式" if not repeated else f"连续同版式：{', '.join(repeated[:4])}",
+        "warning",
+    )
+    templates = [_presentation_template_id_for_slide(slide, _field_value(slide.get("layout"))) for slide in slides]
+    repeated_templates = _aippt_repetition_runs(templates)
+    add(
+        "template_repetition",
+        not repeated_templates,
+        "未发现连续 3 页同模板" if not repeated_templates else f"连续同模板：{', '.join(repeated_templates[:4])}",
+        "warning",
+    )
+    content_layouts = [layout for layout in layouts if layout not in {"cover", "section", "quote"}]
+    content_templates = [
+        template for template, layout in zip(templates, layouts)
+        if layout not in {"cover", "section", "quote"} and template
+    ]
+    min_layout_variety = min(4, max(2, math.ceil(len(content_layouts) * 0.28))) if content_layouts else 0
+    layout_variety = len(set(content_layouts))
+    add(
+        "layout_family_diversity",
+        not content_layouts or layout_variety >= min_layout_variety,
+        f"内容页覆盖 {layout_variety}/{min_layout_variety} 类版式" if content_layouts else "当前 deck 无内容页",
+        "warning",
+    )
+    min_template_variety = min(6, max(3, math.ceil(len(content_templates) * 0.34))) if content_templates else 0
+    template_variety = len(set(content_templates))
+    add(
+        "visual_template_diversity",
+        not content_templates or template_variety >= min_template_variety,
+        f"内容页覆盖 {template_variety}/{min_template_variety} 个视觉模板" if content_templates else "当前 deck 无视觉模板",
+        "warning",
+    )
+    two_column_share = (content_layouts.count("two_column") / len(content_layouts)) if content_layouts else 0
+    add(
+        "two_column_share",
+        two_column_share <= 0.35,
+        f"two_column 占比 {two_column_share:.0%}，符合上限" if two_column_share <= 0.35 else f"two_column 占比 {two_column_share:.0%}，建议继续拆成图表/矩阵/流程页",
+        "warning",
+    )
+    first_layout = layouts[0] if layouts else ""
+    last_layout = layouts[-1] if layouts else ""
+    qa_fixture_deck = bool(re.search(
+        r"模板|画廊|fixture|qa",
+        f"{_field_value(plan.get('title'))} {_field_value(config.get('topic'))}",
+        flags=re.I,
+    ))
+    story_boundary_ok = qa_fixture_deck or not slides or (first_layout == "cover" and last_layout in {"checklist", "quote", "process", "timeline"})
+    add(
+        "story_boundary_roles",
+        story_boundary_ok,
+        "模板画廊跳过首尾叙事检查" if qa_fixture_deck else "首尾页已承担封面/收束叙事角色" if story_boundary_ok else f"首尾页角色偏弱：first={first_layout or '-'}, last={last_layout or '-'}",
+        "warning",
+    )
+    missing_visual_templates = [
+        _field_value(slide.get("title")) or f"slide-{idx + 1}"
+        for idx, slide in enumerate(slides)
+        if _field_value(slide.get("layout")) in required_layouts
+        and not _field_value((slide.get("visualSpec") if isinstance(slide.get("visualSpec"), dict) else {}).get("templateId"))
+    ]
+    add(
+        "visual_spec_template_alignment",
+        not missing_visual_templates,
+        "重点页面 visualSpec 已对齐 templateId" if not missing_visual_templates else f"visualSpec 缺少 templateId：{', '.join(missing_visual_templates[:5])}",
+        "warning",
+    )
+    native_expected = [
+        page for page in pages
+        if isinstance(page, dict) and _field_value(page.get("pptxSupport")) == "native_chart"
+    ]
+    native_detail = (
+        f"检测到 {native_chart_count} 个原生 PPTX 图表"
+        if native_expected and native_chart_count
+        else "未检测到原生 PPTX 图表"
+        if native_expected
+        else "当前 deck 无原生图表硬性要求"
+    )
+    add(
+        "native_chart_presence",
+        native_chart_count >= min(1, len(native_expected)),
+        native_detail,
+        "warning" if not native_expected else "error",
+    )
+    if pdf_rendered is not None:
+        add(
+            "pptx_pdf_render",
+            pdf_rendered,
+            "PPTX 已成功转 PDF，可被办公套件解析" if pdf_rendered else "PPTX 转 PDF 失败，需要检查兼容性",
+            "error",
+        )
+    return checks
+
+
+def _validate_aippt_pptx_package(content: bytes, plan: dict[str, Any] | None = None, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    errors: list[str] = []
+    native_chart_count = 0
+    editable_text_shape_count = 0
+    potential_overflows: list[dict[str, Any]] = []
+
+    def add_check(key: str, ok: bool, detail: str, severity: str = "error") -> None:
+        checks.append({"key": key, "ok": ok, "detail": detail, "severity": severity})
+        if not ok:
+            (warnings if severity == "warning" else errors).append(detail)
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            bad_file = zf.testzip()
+            names = set(zf.namelist())
+            add_check("zip_integrity", bad_file is None, "PPTX zip 包完整" if bad_file is None else f"PPTX zip 损坏：{bad_file}")
+            required = {"[Content_Types].xml", "ppt/presentation.xml", "ppt/_rels/presentation.xml.rels"}
+            missing = sorted(required - names)
+            add_check("required_parts", not missing, "核心 presentation parts 完整" if not missing else f"缺少核心 parts：{', '.join(missing)}")
+
+            content_types = zf.read("[Content_Types].xml").decode("utf-8", errors="ignore") if "[Content_Types].xml" in names else ""
+            slides = sorted(name for name in names if re.match(r"ppt/slides/slide\d+\.xml$", name))
+            slide_rels = sorted(name for name in names if re.match(r"ppt/slides/_rels/slide\d+\.xml\.rels$", name))
+            charts = sorted(name for name in names if re.match(r"ppt/charts/chart\d+\.xml$", name))
+            native_chart_count = len(charts)
+            svgs = sorted(name for name in names if name.startswith("ppt/media/") and name.lower().endswith(".svg"))
+
+            add_check("slides", bool(slides), f"检测到 {len(slides)} 页幻灯片" if slides else "未检测到幻灯片 XML")
+            add_check("slide_relationships", len(slide_rels) >= max(0, len(slides) - 1), f"检测到 {len(slide_rels)} 个 slide relationship 文件", "warning")
+            if charts:
+                add_check("native_charts", "application/vnd.openxmlformats-officedocument.drawingml.chart+xml" in content_types, f"检测到 {len(charts)} 个原生图表并声明 chart content type")
+            else:
+                add_check("native_charts", True, "未生成原生图表，本项跳过", "warning")
+            if svgs:
+                add_check("svg_vector_media", "image/svg+xml" in content_types or 'Extension="svg"' in content_types, f"检测到 {len(svgs)} 个 SVG 矢量媒体并声明 content type")
+            else:
+                add_check("svg_vector_media", True, "未生成 SVG 媒体，本项跳过", "warning")
+
+            try:
+                from pptx import Presentation  # type: ignore
+                prs = Presentation(io.BytesIO(content))
+                add_check("python_pptx_open", len(prs.slides) == len(slides), f"python-pptx 可打开，页数 {len(prs.slides)}")
+                editable_text_shape_count = sum(
+                    1
+                    for ppt_slide in prs.slides
+                    for shape in ppt_slide.shapes
+                    if getattr(shape, "has_text_frame", False) and str(getattr(shape.text_frame, "text", "") or "").strip()
+                )
+                add_check("editable_text_shapes", editable_text_shape_count > 0, f"检测到 {editable_text_shape_count} 个可编辑文本形状", "warning")
+            except Exception as exc:
+                add_check("python_pptx_open", False, f"python-pptx 打开失败：{exc}")
+    except zipfile.BadZipFile:
+        add_check("zip_integrity", False, "不是合法 PPTX zip 包")
+    except Exception as exc:
+        add_check("package_validation", False, f"PPTX 结构检查失败：{exc}")
+
+    if not errors:
+        potential_overflows = _scan_aippt_pptx_text_overflow(content)
+        add_check(
+            "text_overflow_scan",
+            not potential_overflows,
+            "未发现潜在文本溢出" if not potential_overflows else f"发现 {len(potential_overflows)} 个潜在文本溢出风险",
+            "warning",
+        )
+
+    quality = _presentation_quality_checks(plan or {}, config or {}, native_chart_count=native_chart_count) if isinstance(plan, dict) and isinstance(config, dict) else []
+    for item in quality:
+        if not item.get("ok"):
+            (warnings if item.get("severity") == "warning" else errors).append(_field_value(item.get("detail")))
+
+    return {
+        "ok": not errors,
+        "checks": checks,
+        "quality": quality,
+        "native_chart_count": native_chart_count,
+        "editable_text_shape_count": editable_text_shape_count,
+        "potential_overflows": potential_overflows,
+        "warnings": warnings,
+        "errors": errors,
+        "compatibility_scope": "结构级自动检查；Office/WPS 视觉打开仍需发布前人工验收。",
+    }
+
+
+def _presentation_next_version_no(db: Session, deck_id: str) -> int:
+    latest = (
+        db.query(PresentationDeckVersion)
+        .filter(PresentationDeckVersion.deck_id == deck_id)
+        .order_by(PresentationDeckVersion.version_no.desc())
+        .first()
+    )
+    return int(latest.version_no) + 1 if latest else 1
+
+
+def _save_presentation_deck_version(
+    db: Session,
+    p: Principal,
+    *,
+    deck: PresentationDeckDocument,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    change_summary: str,
+) -> PresentationDeckVersion:
+    plan = _presentation_with_spec_lock(plan, config)
+    version = PresentationDeckVersion(
+        deck_id=deck.id,
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        version_no=_presentation_next_version_no(db, deck.id),
+        title=deck.title,
+        config_json=json.dumps(config, ensure_ascii=False),
+        plan_json=json.dumps(plan, ensure_ascii=False),
+        change_summary=(change_summary or "保存 Designer schema 版本")[:1000],
+    )
+    db.add(version)
+    return version
+
+
+def _update_presentation_deck_row(
+    row: PresentationDeckDocument,
+    *,
+    query: str,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    status: str,
+    source: str | None = None,
+    model: str | None = None,
+    warnings: list[str] | None = None,
+) -> PresentationDeckDocument:
+    title = _field_value(plan.get("title")) or _field_value(config.get("topic")) or row.title or "AIPPT"
+    plan = _presentation_with_spec_lock(plan, config)
+    slides = plan.get("slides") if isinstance(plan.get("slides"), list) else []
+    knowledge = plan.get("knowledge") if isinstance(plan.get("knowledge"), list) else []
+    row.title = title[:255]
+    row.use_case = (_field_value(config.get("useCase")) or row.use_case or "report")[:32]
+    row.aspect_ratio = (_field_value(config.get("aspectRatio")) or row.aspect_ratio or "16:9")[:16]
+    row.style_key = (_field_value(config.get("styleKey")) or row.style_key or "executive_blue")[:64]
+    row.status = (_field_value(status) or row.status or "outline_review")[:32]
+    if source:
+        row.source = source[:64]
+    if model:
+        row.model = model[:80]
+    row.query = query or row.query or ""
+    row.config_json = json.dumps(config, ensure_ascii=False)
+    row.plan_json = json.dumps(plan, ensure_ascii=False)
+    if warnings is not None:
+        row.warnings_json = json.dumps(warnings[:10], ensure_ascii=False)
+    row.slide_count = len(slides)
+    row.knowledge_count = len(knowledge)
+    row.updated_at = datetime.now(timezone.utc)
+    return row
+
+
+def _save_presentation_deck(
+    db: Session,
+    p: Principal,
+    *,
+    resource_id: str,
+    query: str,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    source: str,
+    model: str,
+    warnings: list[str],
+    status: str = "outline_review",
+) -> PresentationDeckDocument:
+    title = _field_value(plan.get("title")) or _field_value(config.get("topic")) or "AIPPT"
+    plan = _presentation_with_spec_lock(plan, config)
+    slides = plan.get("slides") if isinstance(plan.get("slides"), list) else []
+    knowledge = plan.get("knowledge") if isinstance(plan.get("knowledge"), list) else []
+    row = PresentationDeckDocument(
+        id=resource_id,
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        title=title[:255],
+        use_case=(_field_value(config.get("useCase")) or "report")[:32],
+        aspect_ratio=(_field_value(config.get("aspectRatio")) or "16:9")[:16],
+        style_key=(_field_value(config.get("styleKey")) or "executive_blue")[:64],
+        status=status[:32],
+        source=source[:64],
+        model=model[:80],
+        query=query or "",
+        config_json=json.dumps(config, ensure_ascii=False),
+        plan_json=json.dumps(plan, ensure_ascii=False),
+        warnings_json=json.dumps(warnings[:10], ensure_ascii=False),
+        slide_count=len(slides),
+        knowledge_count=len(knowledge),
+    )
+    return db.merge(row)
+
+
+def _ensure_presentation_deck(db: Session, deck_id: str, p: Principal) -> PresentationDeckDocument:
+    row = db.get(PresentationDeckDocument, deck_id)
+    if not row or row.tenant_id != p.tenant.id:
+        raise HTTPException(404, "AIPPT deck not found")
+    if not _is_admin_user(p.user) and row.user_id != p.user.id:
+        raise HTTPException(404, "AIPPT deck not found")
+    return row
+
+
+@app.get("/api/presentation-canvas/decks")
+def list_presentation_decks(
+    limit: int = Query(default=30, ge=1, le=100),
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    query = db.query(PresentationDeckDocument).filter(PresentationDeckDocument.tenant_id == p.tenant.id)
+    if not _is_admin_user(p.user):
+        query = query.filter(PresentationDeckDocument.user_id == p.user.id)
+    rows = query.order_by(PresentationDeckDocument.updated_at.desc()).limit(limit).all()
+    return {"items": [_presentation_deck_to_dict(row, include_plan=False) for row in rows]}
+
+
+@app.post("/api/presentation-canvas/decks")
+def create_presentation_deck(
+    body: PresentationDeckSaveIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    config = _presentation_config_from_input(body.query or _field_value(body.config.get("topic")), body.config)
+    plan = body.plan if isinstance(body.plan, dict) else _presentation_empty_plan(config)
+    resource_id = _uuid.uuid4().hex
+    deck = _save_presentation_deck(
+        db,
+        p,
+        resource_id=resource_id,
+        query=body.query,
+        config=config,
+        plan=plan,
+        source="designer",
+        model="schema-designer",
+        warnings=[],
+        status=body.status or "outline_review",
+    )
+    version = _save_presentation_deck_version(
+        db,
+        p,
+        deck=deck,
+        config=config,
+        plan=plan,
+        change_summary=body.change_summary or "创建 Designer schema 草稿",
+    )
+    audit(
+        db,
+        principal=p,
+        action="presentation_canvas.create_designer_deck",
+        resource_type="presentation_canvas",
+        resource_id=resource_id,
+        request=request,
+        extra={"slide_count": deck.slide_count, "version_no": version.version_no},
+    )
+    db.commit()
+    db.refresh(deck)
+    db.refresh(version)
+    payload = _presentation_deck_to_dict(deck, include_plan=True)
+    payload["version"] = _presentation_deck_version_to_dict(version)
+    return payload
+
+
+@app.get("/api/presentation-canvas/decks/{deck_id}")
+def get_presentation_deck(
+    deck_id: str,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _presentation_deck_to_dict(_ensure_presentation_deck(db, deck_id, p), include_plan=True)
+
+
+@app.put("/api/presentation-canvas/decks/{deck_id}")
+def update_presentation_deck(
+    deck_id: str,
+    body: PresentationDeckSaveIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    deck = _ensure_presentation_deck(db, deck_id, p)
+    old_config = _json_loads_obj(deck.config_json, {})
+    old_plan = _json_loads_obj(deck.plan_json, {})
+    config = _presentation_config_from_input(body.query or _field_value(body.config.get("topic")) or _field_value(old_config.get("topic")), body.config or old_config)
+    plan = body.plan if isinstance(body.plan, dict) and body.plan else old_plan if isinstance(old_plan, dict) else _presentation_empty_plan(config)
+    _update_presentation_deck_row(
+        deck,
+        query=body.query or deck.query,
+        config=config,
+        plan=plan,
+        status=body.status or deck.status or "outline_review",
+        source="designer",
+        model=deck.model or "schema-designer",
+    )
+    version = _save_presentation_deck_version(
+        db,
+        p,
+        deck=deck,
+        config=config,
+        plan=plan,
+        change_summary=body.change_summary or "保存 Designer schema 版本",
+    )
+    audit(
+        db,
+        principal=p,
+        action="presentation_canvas.save_designer_version",
+        resource_type="presentation_canvas",
+        resource_id=deck_id,
+        request=request,
+        extra={"slide_count": deck.slide_count, "version_no": version.version_no},
+    )
+    db.commit()
+    db.refresh(deck)
+    db.refresh(version)
+    payload = _presentation_deck_to_dict(deck, include_plan=True)
+    payload["version"] = _presentation_deck_version_to_dict(version)
+    return payload
+
+
+@app.get("/api/presentation-canvas/decks/{deck_id}/versions")
+def list_presentation_deck_versions(
+    deck_id: str,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    _ensure_presentation_deck(db, deck_id, p)
+    rows = (
+        db.query(PresentationDeckVersion)
+        .filter(PresentationDeckVersion.deck_id == deck_id, PresentationDeckVersion.tenant_id == p.tenant.id)
+        .order_by(PresentationDeckVersion.version_no.desc())
+        .limit(80)
+        .all()
+    )
+    return {"items": [_presentation_deck_version_to_dict(row) for row in rows]}
+
+
+@app.post("/api/presentation-canvas/decks/{deck_id}/export-pptx")
+def export_presentation_deck_pptx(
+    deck_id: str,
+    body: PresentationDeckSaveIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    _ensure_presentation_deck(db, deck_id, p)
+    config = _presentation_config_from_input(body.query or _field_value(body.config.get("topic")), body.config)
+    plan = _presentation_prepare_delivery_plan(body.plan if isinstance(body.plan, dict) and body.plan else _presentation_empty_plan(config), config)
+    try:
+        content = _build_aippt_pptx(plan, config)
+    except ImportError as exc:
+        raise HTTPException(500, "python-pptx is required for PPTX export") from exc
+    except Exception as exc:
+        raise HTTPException(500, f"PPTX export failed: {exc}") from exc
+    title = _field_value(plan.get("title")) or _field_value(config.get("topic")) or "AIPPT"
+    filename = _safe_filename(f"{title}.pptx")
+    audit(
+        db,
+        principal=p,
+        action="presentation_canvas.export_pptx",
+        resource_type="presentation_canvas",
+        resource_id=deck_id,
+        request=request,
+        extra={"slide_count": len(plan.get("slides") or []), "filename": filename},
+    )
+    db.commit()
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
+@app.post("/api/presentation-canvas/decks/{deck_id}/validate-pptx")
+def validate_presentation_deck_pptx(
+    deck_id: str,
+    body: PresentationDeckSaveIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    _ensure_presentation_deck(db, deck_id, p)
+    config = _presentation_config_from_input(body.query or _field_value(body.config.get("topic")), body.config)
+    plan = _presentation_prepare_delivery_plan(body.plan if isinstance(body.plan, dict) and body.plan else _presentation_empty_plan(config), config)
+    try:
+        content = _build_aippt_pptx(plan, config)
+    except ImportError as exc:
+        raise HTTPException(500, "python-pptx is required for PPTX validation") from exc
+    except Exception as exc:
+        raise HTTPException(500, f"PPTX validation export failed: {exc}") from exc
+    report = _validate_aippt_pptx_package(content, plan, config)
+    audit(
+        db,
+        principal=p,
+        action="presentation_canvas.validate_pptx",
+        resource_type="presentation_canvas",
+        resource_id=deck_id,
+        request=request,
+        extra={
+            "slide_count": len(plan.get("slides") or []),
+            "ok": report.get("ok"),
+            "error_count": len(report.get("errors") or []),
+            "warning_count": len(report.get("warnings") or []),
+        },
+    )
+    db.commit()
+    return report
+
+
+@app.post("/api/presentation-canvas/decks/{deck_id}/versions/{version_id}/restore")
+def restore_presentation_deck_version(
+    deck_id: str,
+    version_id: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    deck = _ensure_presentation_deck(db, deck_id, p)
+    version = db.get(PresentationDeckVersion, version_id)
+    if not version or version.deck_id != deck_id or version.tenant_id != p.tenant.id:
+        raise HTTPException(404, "AIPPT version not found")
+    if not _is_admin_user(p.user) and version.user_id != p.user.id:
+        raise HTTPException(404, "AIPPT version not found")
+    config = _json_loads_obj(version.config_json, {})
+    plan = _json_loads_obj(version.plan_json, {})
+    _update_presentation_deck_row(
+        deck,
+        query=deck.query,
+        config=config if isinstance(config, dict) else {},
+        plan=plan if isinstance(plan, dict) else _presentation_empty_plan(config if isinstance(config, dict) else {}),
+        status="outline_review",
+        source="designer-restore",
+        model=deck.model or "schema-designer",
+    )
+    restored = _save_presentation_deck_version(
+        db,
+        p,
+        deck=deck,
+        config=config if isinstance(config, dict) else {},
+        plan=plan if isinstance(plan, dict) else {},
+        change_summary=f"从 v{version.version_no} 回退",
+    )
+    audit(
+        db,
+        principal=p,
+        action="presentation_canvas.restore_designer_version",
+        resource_type="presentation_canvas",
+        resource_id=deck_id,
+        request=request,
+        extra={"from_version": version.version_no, "new_version": restored.version_no},
+    )
+    db.commit()
+    db.refresh(deck)
+    db.refresh(restored)
+    payload = _presentation_deck_to_dict(deck, include_plan=True)
+    payload["version"] = _presentation_deck_version_to_dict(restored)
+    return payload
+
+
+@app.post("/api/presentation-canvas/decks/{deck_id}/slide-action")
+async def run_presentation_slide_action(
+    deck_id: str,
+    body: PresentationDeckSlideActionIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    _ensure_presentation_deck(db, deck_id, p)
+    action = _field_value(body.action) or "rewrite"
+    if action not in {"rewrite", "enhance_chart", "roadshow_style"}:
+        raise HTTPException(400, "Unsupported AIPPT slide action")
+    config = _presentation_config_from_input(_field_value(body.config.get("topic")), body.config)
+    plan = body.plan if isinstance(body.plan, dict) else {}
+    slide = body.slide if isinstance(body.slide, dict) else {}
+    if not slide.get("id"):
+        raise HTTPException(400, "Missing slide")
+    patch, rationale, warnings, source = await _presentation_designer_slide_action(
+        db,
+        p,
+        action=action,
+        instruction=body.instruction,
+        config=config,
+        plan=plan,
+        slide=slide,
+    )
+    changed_fields = _presentation_patch_changed_fields(slide, patch)
+    linked_knowledge = _presentation_linked_knowledge(plan, slide)
+    neighbors = _presentation_slide_neighbors(plan, slide)
+    audit(
+        db,
+        principal=p,
+        action=f"presentation_canvas.designer_action.{action}",
+        resource_type="presentation_canvas",
+        resource_id=deck_id,
+        request=request,
+        extra={"slide_id": _field_value(slide.get("id")), "warnings": warnings[:4]},
+    )
+    db.commit()
+    return {
+        "id": _uuid.uuid4().hex,
+        "action": action,
+        "slide_id": _field_value(slide.get("id")),
+        "slide_patch": patch,
+        "rationale": rationale,
+        "warnings": warnings,
+        "source": source,
+        "diff_summary": _presentation_patch_diff_summary(slide, patch),
+        "quality": {
+            "fallback": source == "fallback",
+            "repaired": source == "hermes-repaired",
+            "warning_count": len(warnings),
+            "changed_fields": changed_fields,
+            "context_slide_count": _presentation_int(neighbors.get("totalSlides"), 0),
+            "knowledge_count": len(linked_knowledge),
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/api/presentation-canvas/generate")
+async def generate_presentation_canvas(
+    body: PresentationDeckGenerateIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    config = _presentation_config_from_input(body.query, body.config)
+    warnings: list[str] = []
+    plan, next_config, agent_warnings = await _presentation_agent_plan(
+        db,
+        p,
+        query=body.query,
+        config=config,
+    )
+    warnings.extend(agent_warnings)
+    source = "hermes" if plan else "hermes-error"
+    model = "hermes-agent"
+    if not plan:
+        next_config = config
+        plan = _presentation_empty_plan(next_config)
+    elif len(plan.get("slides") or []) < max(8, _presentation_int(next_config.get("pageCount"), 8, minimum=8, maximum=40)):
+        source = "hermes-stream-partial"
+    resource_id = _uuid.uuid4().hex
+    if plan.get("slides"):
+        _save_presentation_deck(
+            db,
+            p,
+            resource_id=resource_id,
+            query=body.query,
+            config=next_config,
+            plan=plan,
+            source=source,
+            model=model,
+            warnings=warnings,
+            status="outline_partial" if source == "hermes-stream-partial" else "outline_review" if source == "hermes" else "failed",
+        )
+    audit(
+        db,
+        principal=p,
+        action="presentation_canvas.generate",
+        resource_type="presentation_canvas",
+        resource_id=resource_id,
+        request=request,
+        extra={
+            "source": source,
+            "use_case": next_config.get("useCase"),
+            "page_count": len(plan.get("slides") or []),
+            "warnings": warnings[:6],
+        },
+    )
+    db.commit()
+    return {
+        "id": resource_id,
+        "source": source,
+        "model": model,
+        "config": next_config,
+        "plan": plan,
+        "warnings": warnings,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/api/presentation-canvas/generate/stream")
+async def stream_presentation_canvas(
+    body: PresentationDeckGenerateIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    config = _presentation_config_from_input(body.query, body.config)
+    resource_id = _uuid.uuid4().hex
+
+    async def event_gen():
+        warnings: list[str] = []
+        segmented_first = _presentation_segmented_first_enabled()
+        plan = _presentation_stream_empty_plan(config)
+        source = "hermes-segmented" if segmented_first else "hermes-stream"
+        model = "hermes-agent"
+
+        def plan_payload(stage: str, *, partial: bool = True) -> dict[str, Any]:
+            return {
+                "id": resource_id,
+                "event_type": "presentation.plan",
+                "source": source,
+                "model": model,
+                "stage": stage,
+                "partial": partial,
+                "config": config,
+                "plan": plan,
+                "warnings": warnings,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        async def emit_waiting_status(task: asyncio.Task, *, stage: str, message_factory: Any, interval: float | None = None):
+            started_at = asyncio.get_running_loop().time()
+            tick = 0
+            status_interval = interval or _presentation_status_interval_seconds()
+            while not task.done():
+                if await request.is_disconnected():
+                    task.cancel()
+                    raise asyncio.CancelledError()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=status_interval)
+                except asyncio.TimeoutError:
+                    tick += 1
+                    elapsed_seconds = max(1, int(asyncio.get_running_loop().time() - started_at))
+                    message = message_factory(elapsed_seconds, tick) if callable(message_factory) else str(message_factory)
+                    yield _format_sse_event("presentation.status", {
+                        "id": resource_id,
+                        "event_type": "presentation.status",
+                        "source": source,
+                        "model": model,
+                        "stage": stage,
+                        "message": message,
+                        "elapsed_seconds": elapsed_seconds,
+                        "warnings": warnings,
+                    })
+
+        try:
+            yield _format_sse_event("presentation.started", {
+                "id": resource_id,
+                "event_type": "presentation.started",
+                "source": source,
+                "model": model,
+                "stage": "outline_planning" if segmented_first else "outline_streaming",
+                "config": config,
+                "message": "Hermes 已接收任务，正在用分段 Agent 准备 AIPPT 大纲。" if segmented_first else "Hermes 已接收任务，正在准备 AIPPT 章节、页面和知识依赖。",
+            })
+            if not _presentation_agent_enabled():
+                source = "hermes-disabled"
+                warnings.append("Presentation Agent 已被环境变量关闭。")
+                yield _format_sse_event("presentation.failed", {
+                    **plan_payload("failed", partial=False),
+                    "event_type": "presentation.failed",
+                    "message": "AIPPT Agent 当前被关闭，请开启后重试。",
+                })
+
+            raw_parts: list[str] = []
+            buffer = ""
+            changed = False
+            if source != "hermes-disabled" and not segmented_first:
+                try:
+                    yield _format_sse_event("presentation.status", {
+                        "id": resource_id,
+                        "event_type": "presentation.status",
+                        "source": source,
+                        "model": model,
+                        "stage": "agent_connecting",
+                        "message": "正在连接 Hermes，并要求模型按 NDJSON 分页输出。",
+                        "warnings": warnings,
+                    })
+                    target = await hermes_client.resolve_target(db, p.tenant.id)
+                    session = await hermes_client.create_session(target, title=f"AIPPT流式生成-{resource_id[:8]}")
+                    session_id = _official_hermes_session_id(session)
+                    if not session_id:
+                        raise RuntimeError("missing hermes session_id")
+                    timeout_seconds = _presentation_agent_timeout_seconds()
+                    deadline = asyncio.get_running_loop().time() + timeout_seconds
+                    stream = hermes_client.stream_chat(
+                        target,
+                        session_id,
+                        message=_presentation_stream_prompt(query=body.query, config=config),
+                        system_message=_presentation_stream_system_message(),
+                    )
+                    agen = stream.__aiter__()
+                    try:
+                        while True:
+                            if await request.is_disconnected():
+                                return
+                            remaining = deadline - asyncio.get_running_loop().time()
+                            if remaining <= 0:
+                                warnings.append("Hermes 流式生成超时，已保留已生成内容。")
+                                break
+                            try:
+                                ev = await asyncio.wait_for(agen.__anext__(), timeout=min(remaining, 10.0))
+                            except StopAsyncIteration:
+                                break
+                            except asyncio.TimeoutError:
+                                yield _format_sse_event("presentation.heartbeat", {
+                                    "id": resource_id,
+                                    "event_type": "presentation.heartbeat",
+                                    "source": source,
+                                    "model": model,
+                                    "stage": "outline_streaming",
+                                    "message": "Hermes 仍在生成，正在等待下一页或下一条知识依赖。",
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                })
+                                continue
+                            if ev.get("event") == "error":
+                                warnings.append("Hermes 流式生成返回 error 事件。")
+                                break
+                            delta = _presentation_stream_delta(ev)
+                            if not delta:
+                                continue
+                            raw_parts.append(delta)
+                            buffer += delta
+                            items, buffer = _presentation_json_lines_from_buffer(buffer)
+                            for item in items:
+                                if _field_value(item.get("type") or item.get("event") or item.get("kind")).lower() == "done":
+                                    continue
+                                if _presentation_apply_stream_item(plan, item, config):
+                                    changed = True
+                                    yield _format_sse_event("presentation.plan", plan_payload("outline_streaming", partial=True))
+                    finally:
+                        try:
+                            await agen.aclose()
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    warnings.append(f"Hermes 流式生成失败：{exc.__class__.__name__}")
+
+            items, buffer = _presentation_json_lines_from_buffer(buffer, flush=True)
+            for item in items:
+                if _field_value(item.get("type") or item.get("event") or item.get("kind")).lower() == "done":
+                    continue
+                if _presentation_apply_stream_item(plan, item, config):
+                    changed = True
+                    yield _format_sse_event("presentation.plan", plan_payload("outline_streaming", partial=True))
+
+            min_slides = max(8, _presentation_int(config.get("pageCount"), 8, minimum=8, maximum=40))
+            if source != "hermes-disabled" and len(plan.get("slides") or []) < min_slides:
+                if not segmented_first:
+                    yield _format_sse_event("presentation.status", {
+                        "id": resource_id,
+                        "event_type": "presentation.status",
+                        "source": source,
+                        "model": model,
+                        "stage": "json_recovery",
+                        "message": "流式内容不足，正在尝试把模型原始输出恢复为 DeckPlan JSON。",
+                        "warnings": warnings,
+                    })
+                parsed = None if segmented_first else _official_json_object_from_text("".join(raw_parts).strip())
+                normalized = _presentation_normalize_agent_plan(parsed, config) if parsed else None
+                if normalized:
+                    next_config, normalized_plan = normalized
+                    config.update(next_config)
+                    plan = normalized_plan
+                    source = "hermes"
+                    changed = True
+                    yield _format_sse_event("presentation.plan", plan_payload("outline_streaming", partial=True))
+                elif changed:
+                    generated_count = len(plan.get("slides") or [])
+                    warnings.append(f"Hermes 只流式生成 {generated_count}/{min_slides} 页，已保留真实草案，没有生成替代草案。")
+                    source = "hermes-stream-partial"
+                    yield _format_sse_event("presentation.status", {
+                        "id": resource_id,
+                        "event_type": "presentation.status",
+                        "source": source,
+                        "model": model,
+                        "stage": "partial_ready",
+                        "message": "Hermes 只生成了部分页面，正在保存真实草案。",
+                        "warnings": warnings,
+                    })
+                else:
+                    yield _format_sse_event("presentation.status", {
+                        "id": resource_id,
+                        "event_type": "presentation.status",
+                        "source": source,
+                        "model": model,
+                        "stage": "outline_planning",
+                        "message": "正在用分段 Agent 生成轻量大纲。" if segmented_first else "流式没有可解析节点，正在切换为分段 Agent：先生成轻量大纲。",
+                        "warnings": warnings,
+                    })
+                    outline_task = asyncio.create_task(_presentation_segmented_outline_plan(
+                        db,
+                        p,
+                        query=body.query,
+                        config=config,
+                    ))
+                    async for status_event in emit_waiting_status(
+                        outline_task,
+                        stage="outline_planning",
+                        message_factory=lambda elapsed, _tick: f"Hermes 正在规划章节、页面和知识依赖，已等待 {elapsed} 秒。",
+                    ):
+                        yield status_event
+                    outline_plan, outline_warnings = await outline_task
+                    if outline_plan:
+                        if not segmented_first:
+                            warnings.append("Hermes 流式输出未被解析，已切换为分段 Agent：轻量大纲 + 批量扩写。")
+                        warnings.extend(warning for warning in outline_warnings if warning not in warnings)
+                        plan = outline_plan
+                        source = "hermes-segmented"
+                        model = "hermes-agent"
+                        changed = True
+                        yield _format_sse_event("presentation.plan", {
+                            **plan_payload("outline_planning", partial=True),
+                            "message": f"轻量大纲已生成 {len(plan.get('slides') or [])} 页，开始批量扩写。",
+                        })
+                        slides = plan.get("slides") if isinstance(plan.get("slides"), list) else []
+                        valid_slides = [(idx, slide) for idx, slide in enumerate(list(slides)) if isinstance(slide, dict)]
+                        expected_slides = len(valid_slides)
+                        completed_slides = 0
+                        batch_size = _presentation_slide_batch_size()
+                        for batch_start in range(0, len(valid_slides), batch_size):
+                            if await request.is_disconnected():
+                                return
+                            batch = valid_slides[batch_start:batch_start + batch_size]
+                            if not batch:
+                                continue
+                            first_no = batch[0][0] + 1
+                            last_no = batch[-1][0] + 1
+                            titles = "、".join((_field_value(slide.get("title")) or f"第 {idx + 1} 页") for idx, slide in batch)
+                            yield _format_sse_event("presentation.status", {
+                                "id": resource_id,
+                                "event_type": "presentation.status",
+                                "source": source,
+                                "model": model,
+                                "stage": "slide_batch_expanding",
+                                "message": f"正在批量扩写第 {first_no}-{last_no}/{len(slides)} 页：{titles}",
+                                "warnings": warnings,
+                            })
+                            batch_task = asyncio.create_task(_presentation_agent_slide_batch_patches(
+                                db,
+                                p,
+                                query=body.query,
+                                config=config,
+                                plan=plan,
+                                slides=batch,
+                            ))
+                            async for status_event in emit_waiting_status(
+                                batch_task,
+                                stage="slide_batch_expanding",
+                                message_factory=lambda elapsed, _tick, first_no=first_no, last_no=last_no, total=len(slides): (
+                                    f"Hermes 正在扩写第 {first_no}-{last_no}/{total} 页，已等待 {elapsed} 秒。"
+                                ),
+                            ):
+                                yield status_event
+                            patches, patch_warnings = await batch_task
+                            for warning in patch_warnings:
+                                if warning not in warnings and len(warnings) < 24:
+                                    warnings.append(warning)
+                            batch_completed = 0
+                            if not patches:
+                                warning = f"第 {first_no}-{last_no} 页批量扩写未返回可用 JSON，正在降级为单页扩写。"
+                                if warning not in warnings and len(warnings) < 24:
+                                    warnings.append(warning)
+                                yield _format_sse_event("presentation.status", {
+                                    "id": resource_id,
+                                    "event_type": "presentation.status",
+                                    "source": source,
+                                    "model": model,
+                                    "stage": "slide_batch_repair",
+                                    "message": warning,
+                                    "warnings": warnings,
+                                })
+
+                            for order, (idx, slide) in enumerate(batch):
+                                patch = _presentation_pick_batch_patch(patches, slide=slide, slide_index=idx, fallback_order=order)
+                                applied = bool(patch and _presentation_apply_slide_patch(plan, idx, patch, config))
+                                if not applied:
+                                    title = _field_value(slide.get("title")) or f"第 {idx + 1} 页"
+                                    yield _format_sse_event("presentation.status", {
+                                        "id": resource_id,
+                                        "event_type": "presentation.status",
+                                        "source": source,
+                                        "model": model,
+                                        "stage": "slide_repair",
+                                        "message": f"第 {idx + 1}/{len(slides)} 页批量结果不可用，正在单页补救：{title}",
+                                        "warnings": warnings,
+                                    })
+                                    single_task = asyncio.create_task(_presentation_agent_slide_patch(
+                                        db,
+                                        p,
+                                        query=body.query,
+                                        config=config,
+                                        plan=plan,
+                                        slide=slide,
+                                    ))
+                                    async for status_event in emit_waiting_status(
+                                        single_task,
+                                        stage="slide_repair",
+                                        message_factory=lambda elapsed, _tick, idx=idx, total=len(slides), title=title: (
+                                            f"Hermes 正在补救第 {idx + 1}/{total} 页：{title}，已等待 {elapsed} 秒。"
+                                        ),
+                                    ):
+                                        yield status_event
+                                    single_patch, single_warnings = await single_task
+                                    for warning in single_warnings:
+                                        if warning not in warnings and len(warnings) < 24:
+                                            warnings.append(warning)
+                                    applied = bool(single_patch and _presentation_apply_slide_patch(plan, idx, single_patch, config))
+                                if applied:
+                                    completed_slides += 1
+                                    batch_completed += 1
+                                else:
+                                    warning = f"第 {idx + 1} 页扩写失败，已保留大纲骨架。"
+                                    if warning not in warnings and len(warnings) < 24:
+                                        warnings.append(warning)
+                                    yield _format_sse_event("presentation.status", {
+                                        "id": resource_id,
+                                        "event_type": "presentation.status",
+                                        "source": source,
+                                        "model": model,
+                                        "stage": "slide_partial",
+                                        "message": f"第 {idx + 1}/{len(slides)} 页未完成扩写，已保留大纲骨架并继续后续页面。",
+                                        "warnings": warnings,
+                                    })
+                            if batch_completed:
+                                yield _format_sse_event("presentation.plan", {
+                                    **plan_payload("slide_expanding", partial=True),
+                                    "message": f"已完成第 {first_no}-{last_no}/{len(slides)} 页扩写，成功 {batch_completed}/{len(batch)} 页。",
+                                })
+                        if len(plan.get("slides") or []) < min_slides or completed_slides < expected_slides:
+                            source = "hermes-segmented-partial"
+                            yield _format_sse_event("presentation.status", {
+                                "id": resource_id,
+                                "event_type": "presentation.status",
+                                "source": source,
+                                "model": model,
+                                "stage": "partial_ready",
+                                "message": "分段 Agent 只完成了部分页面扩写，正在保存真实草案。",
+                                "warnings": warnings,
+                            })
+                        else:
+                            yield _format_sse_event("presentation.status", {
+                                "id": resource_id,
+                                "event_type": "presentation.status",
+                                "source": source,
+                                "model": model,
+                                "stage": "outline_review",
+                                "message": "分段 Agent 已完成大纲和逐页内容，可进入人工确认。",
+                                "warnings": warnings,
+                            })
+                    else:
+                        warnings.extend(warning for warning in outline_warnings if warning not in warnings)
+                        yield _format_sse_event("presentation.status", {
+                            "id": resource_id,
+                            "event_type": "presentation.status",
+                            "source": source,
+                            "model": model,
+                            "stage": "agent_recovery",
+                            "message": "分段大纲未通过校验，正在最后请求 Hermes 输出完整 DeckPlan JSON。",
+                            "warnings": warnings,
+                        })
+                        recovery_task = asyncio.create_task(_presentation_agent_plan(
+                            db,
+                            p,
+                            query=body.query,
+                            config=config,
+                        ))
+                        async for status_event in emit_waiting_status(
+                            recovery_task,
+                            stage="agent_recovery",
+                            message_factory=lambda elapsed, _tick: f"Hermes 正在重新输出完整 DeckPlan JSON，已等待 {elapsed} 秒。",
+                        ):
+                            yield status_event
+                        recovery_plan, next_config, recovery_warnings = await recovery_task
+                        if recovery_plan:
+                            warnings.append("Hermes 分段大纲失败，已用完整 DeckPlan JSON 结构化恢复。")
+                            warnings.extend(warning for warning in recovery_warnings if warning not in warnings)
+                            config.update(next_config)
+                            plan = recovery_plan
+                            source = "hermes-stream-partial" if len(plan.get("slides") or []) < min_slides else "hermes"
+                            model = "hermes-agent"
+                            yield _format_sse_event("presentation.plan", {
+                                **plan_payload("outline_streaming", partial=True),
+                                "message": "完整 DeckPlan JSON 已恢复，可进入大纲确认。",
+                            })
+                        else:
+                            warnings.append("Hermes 未流式输出可解析 AIPPT 内容，分段恢复和完整 JSON 恢复也失败；没有生成替代草案。")
+                            warnings.extend(warning for warning in recovery_warnings if warning not in warnings)
+                            source = "hermes-error"
+                            model = "hermes-agent"
+                            yield _format_sse_event("presentation.failed", {
+                                **plan_payload("failed", partial=False),
+                                "event_type": "presentation.failed",
+                                "message": "Hermes 没有返回可解析的 AIPPT 结构。已保留诊断信息，请调整需求或重试。",
+                            })
+
+            if plan.get("slides"):
+                _save_presentation_deck(
+                    db,
+                    p,
+                    resource_id=resource_id,
+                    query=body.query,
+                    config=config,
+                    plan=plan,
+                    source=source,
+                    model=model,
+                    warnings=warnings,
+                    status="outline_partial" if "partial" in source else "outline_review",
+                )
+            audit(
+                db,
+                principal=p,
+                action="presentation_canvas.generate_stream",
+                resource_type="presentation_canvas",
+                resource_id=resource_id,
+                request=request,
+                extra={
+                    "source": source,
+                    "use_case": config.get("useCase"),
+                    "page_count": len(plan.get("slides") or []),
+                    "warnings": warnings[:6],
+                },
+            )
+            db.commit()
+            if source == "hermes-error" or source == "hermes-disabled":
+                return
+            if "partial" in source:
+                yield _format_sse_event("presentation.partial", {
+                    **plan_payload("outline_review", partial=True),
+                    "event_type": "presentation.partial",
+                    "message": "Hermes 只生成了部分页面，已保留真实草案，可继续编辑或重新生成。",
+                })
+                return
+            yield _format_sse_event("presentation.complete", {
+                **plan_payload("outline_review", partial=False),
+                "event_type": "presentation.complete",
+            })
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            db.rollback()
+            yield _format_sse_event("error", {
+                "id": resource_id,
+                "event_type": "error",
+                "message": str(exc)[:500],
+            })
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/presentation-canvas/research")
+async def research_presentation_canvas(
+    body: PresentationDeckResearchIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    config = _presentation_config_from_input(body.query or _field_value(body.config.get("topic")), body.config)
+    warnings: list[str] = []
+    query = _presentation_research_query(config, body.knowledge, body.slide, body.query)
+    sources: list[dict[str, str]] = []
+    try:
+        sources = await asyncio.to_thread(_presentation_web_search, query, limit=5)
+    except Exception as exc:
+        warnings.append(f"WebSearch 暂不可用：{exc.__class__.__name__}")
+    payload = await _presentation_agent_research_payload(
+        db,
+        p,
+        config=config,
+        knowledge=body.knowledge,
+        slide=body.slide,
+        sources=sources,
+        warnings=warnings,
+        raw_query=body.query,
+    )
+    if not payload:
+        payload = _presentation_research_payload(config, body.knowledge, body.slide, sources, warnings)
+    resource_id = _uuid.uuid4().hex
+    audit(
+        db,
+        principal=p,
+        action="presentation_canvas.research",
+        resource_type="presentation_canvas",
+        resource_id=resource_id,
+        request=request,
+        extra={
+            "query": query[:260],
+            "source_count": len(sources),
+            "knowledge_title": _field_value(body.knowledge.get("title"))[:100],
+            "warnings": warnings[:4],
+        },
+    )
+    db.commit()
+    return {"id": resource_id, **payload}
+
+
+# ── Official Writing Workspace ─────────────────────────────────────────────
+@app.get("/api/official-documents")
+def list_official_documents(
+    limit: int = Query(default=50, ge=1, le=200),
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    query = db.query(OfficialDocument).filter(OfficialDocument.tenant_id == p.tenant.id)
+    if not _is_admin_user(p.user):
+        query = query.filter(OfficialDocument.user_id == p.user.id)
+    rows = query.order_by(OfficialDocument.updated_at.desc()).limit(limit).all()
+    return {"items": [_official_document_to_dict(db, row) for row in rows]}
+
+
+@app.post("/api/official-documents/intent")
+async def extract_official_document_intent(
+    body: OfficialDocumentIntentIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    surface = await _official_intent_surface(db, p, body.query)
+    audit(db, principal=p, action="official_document.intent", resource_type="official_document",
+          resource_id=surface["surface_id"], request=request,
+          extra={"doc_type": surface["intent"]["doc_type"], "missing": surface["missing"]})
+    db.commit()
+    return surface
+
+
+@app.post("/api/official-documents/generate")
+async def generate_official_document(
+    body: OfficialDocumentGenerateIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    doc_type = body.doc_type if body.doc_type in _OFFICIAL_DOC_TYPES else "notice"
+    meta = _official_doc_meta(doc_type)
+    inferred = _official_fields_from_query(body.query or "", doc_type, p.tenant.name)
+    fields = {**inferred, **(body.fields or {})}
+    fields = _official_normalize_publicity_fields(doc_type, fields, body.query or "")
+    title = _field_value(fields.get("title")) or _official_title_for(doc_type, _official_topic_from_query(body.query or "", doc_type))
+    title = _official_normalize_title_for_doc_type(doc_type, title, fields, query=body.query or "")
+    fields["title"] = title
+    fields["issuer"] = _field_value(fields.get("issuer")) or p.tenant.name or "本单位"
+    template_key = body.template_key or meta["template"]
+    fields, draft_summary = await _official_prepare_draft_fields(
+        db,
+        p,
+        doc_type=doc_type,
+        template_key=template_key,
+        fields=fields,
+        query=body.query or "",
+    )
+    fields = _official_normalize_publicity_fields(doc_type, fields, body.query or "")
+    title = _official_normalize_title_for_doc_type(
+        doc_type,
+        _field_value(fields.get("title")) or title,
+        fields,
+        query=body.query or "",
+    )
+    fields["title"] = title
+    compliance = _official_compliance_items(doc_type, fields, template_key)
+
+    document = OfficialDocument(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        title=title[:255],
+        doc_type=doc_type,
+        template_key=template_key[:80],
+        status="generating",
+        query=body.query or "",
+        fields_json=json.dumps(fields, ensure_ascii=False),
+        compliance_json=json.dumps(compliance, ensure_ascii=False),
+        summary=f"{meta['label']}已生成，模板：{template_key}。{draft_summary}",
+    )
+    db.add(document)
+    db.flush()
+    version = _create_official_document_version(
+        db,
+        p,
+        document,
+        fields=fields,
+        doc_type=doc_type,
+        template_key=template_key,
+    )
+    document.current_version_id = version.id
+    document.status = "generated"
+    document.updated_at = datetime.now(timezone.utc)
+    audit(db, principal=p, action="official_document.generate", resource_type="official_document",
+          resource_id=document.id, request=request,
+          extra={"doc_type": doc_type, "template_key": template_key, "version_id": version.id})
+    db.commit()
+    db.refresh(document)
+    return _official_document_to_dict(db, document, include_detail=True)
+
+
+@app.post("/api/official-documents/{document_id}/revise")
+async def revise_official_document(
+    document_id: str,
+    body: OfficialDocumentReviseIn,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    document = _ensure_official_document(db, document_id, p)
+    current_doc_type = document.doc_type if document.doc_type in _OFFICIAL_DOC_TYPES else "notice"
+    doc_type = _official_doc_type_from_revision_instruction(body.instruction or "", current_doc_type)
+    template_key = document.template_key or _official_doc_meta(current_doc_type)["template"]
+    if doc_type != current_doc_type:
+        template_key = _official_doc_meta(doc_type)["template"]
+    fields = _json_loads_obj(document.fields_json, {})
+    if not isinstance(fields, dict):
+        fields = {}
+    fields = _official_strip_runtime_draft_fields(fields)
+    fields.update({k: v for k, v in (body.fields or {}).items() if not str(k).startswith("__")})
+    if doc_type != current_doc_type:
+        inferred = _official_fields_from_query(document.query or "", doc_type, p.tenant.name)
+        carry: dict[str, Any] = {}
+        for key in ("issuer", "company_name", "topic", "event", "matter", "background", "highlights", "audience", "style", "outline"):
+            value = fields.get(key)
+            if _field_value(value):
+                carry[key] = value
+        topic = _official_topic_from_fields(fields, document.query or "")
+        fields = _official_merge_field_patch(inferred, carry)
+        if topic:
+            fields["topic"] = topic
+            fields["event"] = fields.get("event") or topic
+            fields["matter"] = fields.get("matter") or topic
+            fields["highlights"] = fields.get("highlights") or topic
+            fields["title"] = _official_title_for(doc_type, topic)
+        fields["__previous_doc_type"] = current_doc_type
+        fields["__revision_template_changed"] = True
+    fields = _official_merge_field_patch(fields, _official_instruction_field_patch(body.instruction or "", doc_type))
+    fields = _official_normalize_publicity_fields(doc_type, fields, document.query or "")
+    fields["title"] = _official_normalize_title_for_doc_type(
+        doc_type,
+        _field_value(fields.get("title")) or document.title or _official_title_for(doc_type, _official_topic_from_query(document.query or "", doc_type)),
+        fields,
+        query=document.query or "",
+    )
+    fields["issuer"] = _field_value(fields.get("issuer")) or p.tenant.name or "本单位"
+
+    current_version: OfficialDocumentVersion | None = None
+    if document.current_version_id:
+        current_version = db.get(OfficialDocumentVersion, document.current_version_id)
+    if not current_version:
+        current_version = db.query(OfficialDocumentVersion).filter(
+            OfficialDocumentVersion.document_id == document.id,
+            OfficialDocumentVersion.tenant_id == p.tenant.id,
+        ).order_by(OfficialDocumentVersion.version_no.desc(), OfficialDocumentVersion.created_at.desc()).first()
+    previous_text = current_version.extracted_text if current_version else ""
+
+    fields, draft_summary = await _official_prepare_draft_fields(
+        db,
+        p,
+        doc_type=doc_type,
+        template_key=template_key,
+        fields=fields,
+        query=document.query or "",
+        instruction=body.instruction,
+        previous_text=previous_text or "",
+    )
+    title = _official_normalize_title_for_doc_type(
+        doc_type,
+        _field_value(fields.get("title")) or document.title,
+        fields,
+        query=document.query or "",
+    )
+    fields["title"] = title
+    compliance = _official_compliance_items(doc_type, fields, template_key)
+    document.title = title[:255]
+    document.doc_type = doc_type
+    document.template_key = template_key[:80]
+    document.fields_json = json.dumps(fields, ensure_ascii=False)
+    document.compliance_json = json.dumps(compliance, ensure_ascii=False)
+    document.status = "generated"
+    document.summary = f"已根据修改意见生成新版本：{body.instruction[:120]}。{draft_summary}"
+    document.updated_at = datetime.now(timezone.utc)
+
+    version = _create_official_document_version(
+        db,
+        p,
+        document,
+        fields=fields,
+        doc_type=doc_type,
+        template_key=template_key,
+    )
+    version.change_summary = f"v{version.version_no} · {draft_summary} · {body.instruction[:120]}"
+    document.current_version_id = version.id
+    audit(db, principal=p, action="official_document.revise", resource_type="official_document",
+          resource_id=document.id, request=request,
+          extra={"doc_type": doc_type, "template_key": template_key, "version_id": version.id, "instruction": body.instruction[:500]})
+    db.commit()
+    db.refresh(document)
+    return _official_document_to_dict(db, document, include_detail=True)
+
+
+@app.get("/api/official-documents/{document_id}")
+def get_official_document(
+    document_id: str,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    document = _ensure_official_document(db, document_id, p)
+    return _official_document_to_dict(db, document, include_detail=True)
+
+
+@app.get("/api/official-documents/versions/{version_id}/preview")
+def preview_official_document_version(
+    version_id: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    version = db.get(OfficialDocumentVersion, version_id)
+    if not version or version.tenant_id != p.tenant.id:
+        raise HTTPException(404, "official document version not found")
+    document = _ensure_official_document(db, version.document_id, p)
+    path = Path(version.storage_path)
+    if path.exists() and not _path_within(path, [_official_storage_root_for(tenant_id=version.tenant_id, user_id=version.user_id, document_id=document.id)]):
+        raise HTTPException(403, "official document path outside authorized workspace")
+    audit(db, principal=p, action="official_document.version.preview", resource_type="official_document_version",
+          resource_id=version.id, request=request, extra={"document_id": document.id, "kind": version.kind})
+    db.commit()
+    return _file_preview_payload(
+        id=version.id,
+        name=version.name,
+        path=path,
+        mime=version.mime_type,
+        source=f"official_document:{version.kind}",
+        extracted_text=version.extracted_text or "",
+        download_url=f"/api/official-documents/versions/{quote(version.id)}/download",
+    )
+
+
+@app.get("/api/official-documents/versions/{version_id}/download")
+def download_official_document_version(
+    version_id: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+):
+    version = db.get(OfficialDocumentVersion, version_id)
+    if not version or version.tenant_id != p.tenant.id:
+        raise HTTPException(404, "official document version not found")
+    document = _ensure_official_document(db, version.document_id, p)
+    path = Path(version.storage_path)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "official document file not found")
+    if not _path_within(path, [_official_storage_root_for(tenant_id=version.tenant_id, user_id=version.user_id, document_id=document.id)]):
+        raise HTTPException(403, "official document path outside authorized workspace")
+    audit(db, principal=p, action="official_document.version.download", resource_type="official_document_version",
+          resource_id=version.id, request=request, extra={"document_id": document.id, "kind": version.kind})
+    db.commit()
+    return FileResponse(
+        path=str(path),
+        media_type=version.mime_type or "application/octet-stream",
+        filename=_safe_filename(version.name),
+    )
+
+
+# ── Creative Whiteboards ───────────────────────────────────────────────────
+@app.get("/api/whiteboards")
+def list_whiteboards(
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    existing_count = db.query(WhiteboardDocument).filter(
+        WhiteboardDocument.tenant_id == p.tenant.id,
+        WhiteboardDocument.user_id == p.user.id,
+    ).count()
+    if existing_count == 0 and _ensure_whiteboard_examples_for_user(db, tenant_id=p.tenant.id, user_id=p.user.id):
+        db.commit()
+    rows = db.query(WhiteboardDocument).filter(
+        WhiteboardDocument.tenant_id == p.tenant.id,
+        WhiteboardDocument.user_id == p.user.id,
+    ).order_by(WhiteboardDocument.updated_at.desc()).all()
+    return {"items": [_whiteboard_to_dict(row) for row in rows]}
+
+
+@app.post("/api/whiteboards")
+def create_whiteboard(
+    body: WhiteboardIn, request: Request,
+    p: Principal = Depends(get_principal), db: Session = Depends(get_db),
+) -> dict:
+    scene = body.scene or {"type": "excalidraw", "version": 2, "elements": [], "appState": {}, "files": {}}
+    summary = body.summary.strip() or _whiteboard_summary_from_scene(scene)
+    row = WhiteboardDocument(
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        title=(body.title.strip() or "未命名白板")[:160],
+        description=body.description.strip(),
+        kind=(body.kind.strip() or "freeform")[:32],
+        scene_json=json.dumps(scene, ensure_ascii=False),
+        summary=summary,
+        element_count=_whiteboard_element_count(scene),
+    )
+    db.add(row)
+    db.flush()
+    audit(db, principal=p, action="whiteboard.create", resource_type="whiteboard",
+          resource_id=row.id, request=request,
+          extra={"kind": row.kind, "elements": row.element_count})
+    db.commit()
+    db.refresh(row)
+    return _whiteboard_to_dict(row, include_scene=True)
+
+
+@app.get("/api/whiteboards/{whiteboard_id}")
+def get_whiteboard(
+    whiteboard_id: str,
+    p: Principal = Depends(get_principal), db: Session = Depends(get_db),
+) -> dict:
+    row = db.get(WhiteboardDocument, whiteboard_id)
+    if not row or row.tenant_id != p.tenant.id or row.user_id != p.user.id:
+        raise HTTPException(404, "whiteboard not found")
+    return _whiteboard_to_dict(row, include_scene=True)
+
+
+@app.patch("/api/whiteboards/{whiteboard_id}")
+def patch_whiteboard(
+    whiteboard_id: str, body: WhiteboardPatchIn, request: Request,
+    p: Principal = Depends(get_principal), db: Session = Depends(get_db),
+) -> dict:
+    row = db.get(WhiteboardDocument, whiteboard_id)
+    if not row or row.tenant_id != p.tenant.id or row.user_id != p.user.id:
+        raise HTTPException(404, "whiteboard not found")
+    if body.title is not None:
+        row.title = (body.title.strip() or "未命名白板")[:160]
+    if body.description is not None:
+        row.description = body.description.strip()
+    if body.kind is not None:
+        row.kind = (body.kind.strip() or "freeform")[:32]
+    if body.scene is not None:
+        row.scene_json = json.dumps(body.scene, ensure_ascii=False)
+        row.element_count = _whiteboard_element_count(body.scene)
+        if body.summary is None:
+            row.summary = _whiteboard_summary_from_scene(body.scene)
+    if body.summary is not None:
+        row.summary = body.summary.strip() or _whiteboard_summary_from_scene(
+            json.loads(row.scene_json or "{}") if row.scene_json else {}
+        )
+    row.updated_at = datetime.now(timezone.utc)
+    audit(db, principal=p, action="whiteboard.update", resource_type="whiteboard",
+          resource_id=row.id, request=request,
+          extra={"kind": row.kind, "elements": row.element_count})
+    db.commit()
+    db.refresh(row)
+    return _whiteboard_to_dict(row, include_scene=True)
+
+
+@app.delete("/api/whiteboards/{whiteboard_id}")
+def delete_whiteboard(
+    whiteboard_id: str, request: Request,
+    p: Principal = Depends(get_principal), db: Session = Depends(get_db),
+) -> dict:
+    row = db.get(WhiteboardDocument, whiteboard_id)
+    if not row or row.tenant_id != p.tenant.id or row.user_id != p.user.id:
+        raise HTTPException(404, "whiteboard not found")
+    db.delete(row)
+    audit(db, principal=p, action="whiteboard.delete", resource_type="whiteboard",
+          resource_id=whiteboard_id, request=request)
+    db.commit()
+    return {"ok": True, "id": whiteboard_id}
+
+
+@app.post("/api/whiteboards/generate")
+def generate_whiteboard(
+    body: WhiteboardGenerateIn, request: Request,
+    p: Principal = Depends(get_principal), db: Session = Depends(get_db),
+) -> dict:
+    scene = _whiteboard_generate_scene(body.kind, body.prompt, body.title, body.slide_count)
+    result = {
+        "title": (body.title or body.prompt or "Atlas 创意白板").strip()[:80],
+        "kind": (body.kind or "flowchart").strip().lower(),
+        "scene": scene,
+        "summary": _whiteboard_summary_from_scene(scene),
+        "library_asset_refs": _whiteboard_scene_asset_refs(scene, limit=24),
+        "asset_plan": _whiteboard_scene_asset_plan(scene, limit=48),
+        "skill": "creative-whiteboard-draft",
+    }
+    audit(db, principal=p, action="whiteboard.skill.generate", resource_type="whiteboard_skill",
+          resource_id="creative-whiteboard-draft", request=request,
+          extra={"kind": result["kind"], "prompt_chars": len(body.prompt or "")})
+    db.commit()
+    return result
+
+
+@app.post("/api/whiteboards/read")
+def read_whiteboard(
+    body: WhiteboardReadIn, request: Request,
+    p: Principal = Depends(get_principal), db: Session = Depends(get_db),
+) -> dict:
+    result = _whiteboard_prompt(body.scene or {}, body.target, body.title)
+    result["skill"] = "canvas-to-prompt"
+    audit(db, principal=p, action="whiteboard.skill.read", resource_type="whiteboard_skill",
+          resource_id="canvas-to-prompt", request=request,
+          extra={"target": body.target, "elements": result.get("element_count", 0)})
+    db.commit()
+    return result
+
+
+@app.post("/api/whiteboards/refine")
+def refine_whiteboard(
+    body: WhiteboardRefineIn, request: Request,
+    p: Principal = Depends(get_principal), db: Session = Depends(get_db),
+) -> dict:
+    result = _whiteboard_refine_patch(body.scene or {}, body.instruction, body.mode, body.title)
+    result["skill"] = "diagram-refiner"
+    audit(db, principal=p, action="whiteboard.skill.refine", resource_type="whiteboard_skill",
+          resource_id="diagram-refiner", request=request,
+          extra={"mode": body.mode, "instruction_chars": len(body.instruction or "")})
+    db.commit()
+    return result
+
+
 # ── Digital Employees (CRUD) ───────────────────────────────────────────────
 @app.get("/api/employees")
 def list_employees(p: Principal = Depends(get_principal), db: Session = Depends(get_db)) -> dict:
-    rows = db.execute(
-        select(DigitalEmployee).where(
-            DigitalEmployee.tenant_id == p.tenant.id,
-            DigitalEmployee.status != EmployeeStatus.archived,
-        )
-        .order_by(DigitalEmployee.created_at.desc())
-    ).scalars().all()
-    return {"items": [_employee_to_dict(e) for e in rows]}
+    q = select(DigitalEmployee).where(
+        DigitalEmployee.tenant_id == p.tenant.id,
+        DigitalEmployee.status != EmployeeStatus.archived,
+    )
+    if not _is_admin_user(p.user):
+        admin_user_ids = _admin_user_ids_for_tenant(db, p.tenant.id)
+        q = q.where(or_(DigitalEmployee.created_by == p.user.id, DigitalEmployee.created_by.in_(admin_user_ids)))
+    rows = db.execute(q.order_by(DigitalEmployee.created_at.desc())).scalars().all()
+    return {"items": [_employee_to_dict(e, db) for e in rows]}
 
 
 @app.post("/api/employees")
@@ -3690,8 +18739,6 @@ def create_employee(
     body: EmployeeIn, request: Request,
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
-    if p.user.role == UserRole.user:
-        raise HTTPException(403, "only tenant_admin or system_admin can create employees")
     initial_skills = _resolve_initial_employee_skills(db, body.initial_skill_ids, p)
     # Phase 3.4 — resource limit
     if p.tenant.max_employees is not None:
@@ -3705,6 +18752,8 @@ def create_employee(
             )
     slug = _slugify(body.display_name)
     profile_name = f"tenant_{p.tenant.slug}__employee_{slug}"
+    if not _is_admin_user(p.user):
+        profile_name = f"{profile_name}__u_{p.user.id[:8]}"
     existing = db.execute(
         select(DigitalEmployee).where(
             DigitalEmployee.tenant_id == p.tenant.id,
@@ -3717,7 +18766,10 @@ def create_employee(
         tenant_id=p.tenant.id,
         display_name=body.display_name,
         profile_name=profile_name,
-        description=body.description,
+        description=_pack_employee_description(body.description, {
+            "avatar_image_url": body.avatar_image_url or "",
+            "card_image_url": body.card_image_url or "",
+        }),
         avatar=(body.avatar or body.display_name[:1] or "?").upper()[:1],
         status=EmployeeStatus.active,
         model=body.model,
@@ -3752,16 +18804,14 @@ def create_employee(
           resource_id=emp.id, request=request, extra={"profile_name": profile_name})
     db.commit()
     db.refresh(emp)
-    return _employee_to_dict(emp)
+    return _employee_to_dict(emp, db)
 
 
 @app.get("/api/employees/{emp_id}")
 def get_employee(
     emp_id: str, p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
-    emp = db.get(DigitalEmployee, emp_id)
-    if not emp or emp.tenant_id != p.tenant.id:
-        raise HTTPException(404, "employee not found")
+    emp = _ensure_employee_visible(db, db.get(DigitalEmployee, emp_id), p)
     # Skills bound to this employee
     bindings = db.execute(
         select(SkillBinding, SkillPackage)
@@ -3770,12 +18820,12 @@ def get_employee(
     ).all()
     skills = []
     for b, s in bindings:
-        d = _skill_to_dict(s)
+        d = _skill_to_dict(s, db)
         d["binding"] = {
             "id": b.id, "binding_mode": b.binding_mode, "enabled": b.enabled, "locked": b.locked,
         }
         skills.append(d)
-    out = _employee_to_dict(emp)
+    out = _employee_to_dict(emp, db)
     out["skills"] = skills
     return out
 
@@ -3788,19 +18838,34 @@ def patch_employee(
     emp = db.get(DigitalEmployee, emp_id)
     if not emp or emp.tenant_id != p.tenant.id:
         raise HTTPException(404, "employee not found")
-    for fld in ("display_name", "description", "avatar", "model", "provider",
+    _ensure_employee_mutable(emp, p)
+    updates = body.model_dump(exclude_unset=True) if hasattr(body, "model_dump") else body.dict(exclude_unset=True)
+    clean_description, visual_profile = _employee_visual_from_description(emp.description)
+    if "description" in updates or "avatar_image_url" in updates or "card_image_url" in updates:
+        next_description = updates.pop("description", clean_description)
+        for visual_key in ("avatar_image_url", "card_image_url"):
+            if visual_key in updates:
+                visual_value = updates.pop(visual_key)
+                if visual_value:
+                    visual_profile[visual_key] = str(visual_value).strip()
+                else:
+                    visual_profile.pop(visual_key, None)
+        emp.description = _pack_employee_description(next_description, visual_profile)
+    for fld in ("display_name", "avatar", "model", "provider",
                 "temperature", "max_tokens", "system_prompt", "toolsets"):
-        val = getattr(body, fld, None)
+        val = updates.get(fld)
         if val is not None:
             if fld == "toolsets":
                 emp.toolsets = json.dumps(val)
+            elif fld == "avatar":
+                emp.avatar = (str(val) or emp.display_name[:1] or "?").upper()[:1]
             else:
                 setattr(emp, fld, val)
     audit(db, principal=p, action="employee.update", resource_type="digital_employee",
           resource_id=emp.id, request=request)
     db.commit()
     db.refresh(emp)
-    return _employee_to_dict(emp)
+    return _employee_to_dict(emp, db)
 
 
 @app.patch("/api/employees/{emp_id}/toolsets")
@@ -3812,6 +18877,7 @@ async def patch_employee_toolsets(
     emp = db.get(DigitalEmployee, emp_id)
     if not emp or emp.tenant_id != p.tenant.id:
         raise HTTPException(404, "employee not found")
+    _ensure_employee_mutable(emp, p)
     target = await hermes_client.resolve_target(db, p.tenant.id)
     payload = await hermes_client.list_toolsets(target)
     valid = {item["name"] for item in _normalize_toolset_items(payload)}
@@ -3831,7 +18897,7 @@ async def patch_employee_toolsets(
           resource_id=emp.id, request=request, extra={"previous": previous, "toolsets": requested})
     db.commit()
     db.refresh(emp)
-    return _employee_to_dict(emp)
+    return _employee_to_dict(emp, db)
 
 
 @app.delete("/api/employees/{emp_id}")
@@ -3842,6 +18908,9 @@ def delete_employee(
     emp = db.get(DigitalEmployee, emp_id)
     if not emp or emp.tenant_id != p.tenant.id:
         raise HTTPException(404, "employee not found")
+    if not _is_admin_user(p.user):
+        raise HTTPException(403, "only administrators can dismiss digital employees")
+    _ensure_employee_mutable(emp, p)
     emp.status = EmployeeStatus.archived
     audit(db, principal=p, action="employee.archive", resource_type="digital_employee",
           resource_id=emp.id, request=request)
@@ -3858,11 +18927,26 @@ def list_sessions(
     # 也不过滤, 5+ 个 "0 条消息" 会话都展示在 LeftAside 列表里.  修法: 加 .where(
     # message_count > 0).  注: message_count 在 session_chat_stream 入口 +1, 只
     # 要发过消息就 >0, 还没说话的不显示.
+    visible_task_statuses = {
+        "queued",
+        "running",
+        "waiting_approval",
+        "waiting_input",
+        "needs_input",
+        "quota_waiting",
+        "stalled",
+        "completed",
+        "done",
+        "failed",
+        "stopped",
+        "cancelled",
+    }
     rows = db.execute(
         select(SessionRecord).where(SessionRecord.tenant_id == p.tenant.id,
                                     SessionRecord.user_id == p.user.id,
                                     SessionRecord.archived == False,  # noqa: E712
-                                    SessionRecord.message_count > 0)
+                                    or_(SessionRecord.message_count > 0,
+                                        SessionRecord.task_status.in_(visible_task_statuses)))
         .order_by(SessionRecord.pinned.desc(), SessionRecord.updated_at.desc())
     ).scalars().all()
     return {"items": [
@@ -3895,7 +18979,7 @@ def list_sessions(
 def run_queue(
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
-    statuses = {"running", "needs_input", "failed"}
+    statuses = {"running", "waiting_approval", "waiting_input", "quota_waiting", "stalled", "needs_input", "failed"}
     rows = (
         db.query(SessionRecord, DigitalEmployee)
         .outerjoin(DigitalEmployee, SessionRecord.employee_id == DigitalEmployee.id)
@@ -3917,8 +19001,10 @@ def run_queue(
                 "employee_id": r.employee_id,
                 "employee_name": emp.display_name if emp else "",
                 "title": r.title,
+                "display_title": (r.title if r.title and r.title != "新会话" else (r.last_message or "新会话")[:36]),
                 "task_status": r.task_status or "draft",
                 "task_summary": r.task_summary or "",
+                "progress": _session_progress_snapshot(db, r),
                 "is_stale": _is_stale_running_session(r),
                 "last_message": r.last_message,
                 "message_count": _session_message_count(db, r.id, r.message_count),
@@ -3947,8 +19033,9 @@ async def create_session(
             )
     if body.employee_id:
         emp = db.get(DigitalEmployee, body.employee_id)
-        if not emp or emp.tenant_id != p.tenant.id:
-            raise HTTPException(404, "employee not found in this tenant")
+        _ensure_employee_visible(db, emp, p)
+    for participant_id in body.participant_ids or []:
+        _ensure_employee_visible(db, db.get(DigitalEmployee, participant_id), p)
     # Hermes enforces unique titles, so always uniquify what we send.
     import uuid as _uuid
     unique_title = (body.title or "openatlas session") + "-" + _uuid.uuid4().hex[:6]
@@ -4296,7 +19383,7 @@ async def session_detail(
     if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
         raise HTTPException(404, "session not found")
     last_msg = db.query(MessageRecord).filter_by(session_id=sid).order_by(MessageRecord.created_at.desc()).first()
-    if (rec.task_status == "running" or _is_stale_running_session(rec) or (last_msg and last_msg.role == "user")):
+    if (rec.task_status in {"running", "stalled"} or _is_stale_running_session(rec) or (last_msg and last_msg.role == "user")):
         target = await hermes_client.resolve_target(db, p.tenant.id)
         emp = db.get(DigitalEmployee, rec.employee_id) if rec.employee_id else None
         await _reconcile_hermes_session_transcript(
@@ -4308,6 +19395,10 @@ async def session_detail(
             employee_id=rec.employee_id,
             speaker_name=emp.display_name if emp else "",
         )
+    if rec.task_status in {"running", "stalled", "waiting_approval", "waiting_input", "needs_input"}:
+        _sync_runtime_completion_from_reconcile(db, rec=rec, employee_id=rec.employee_id)
+        db.commit()
+        db.refresh(rec)
     # P3.11 (2026-06-06): 透传 participant_ids / is_group, 跟 list_sessions / create_session 一致
     import json as _json
     pid_list = _json.loads(rec.participant_ids or "[]")
@@ -4325,6 +19416,10 @@ async def session_detail(
         ContextInjection.session_id == rec.id,
         ContextInjection.tenant_id == p.tenant.id,
     ).order_by(ContextInjection.created_at.desc()).limit(120).all()
+    run_event_rows = db.query(SessionRunEvent).filter(
+        SessionRunEvent.session_id == rec.id,
+        SessionRunEvent.tenant_id == p.tenant.id,
+    ).order_by(SessionRunEvent.created_at.asc(), SessionRunEvent.sequence.asc()).limit(200).all()
     return {
         "id": rec.id,
         "employee_id": rec.employee_id,
@@ -4347,8 +19442,56 @@ async def session_detail(
         "summary": _session_summary(db, rec),
         "artifacts": [_artifact_to_dict(a, db) for a in artifacts],
         "context_injections": [_context_to_dict(c) for c in context_rows],
+        "run_events": [_session_run_event_to_dict(e) for e in run_event_rows],
         "health": _session_health_snapshot(db, rec),
+        "progress": _session_progress_snapshot(db, rec),
     }
+
+
+@app.get("/api/sessions/{sid}/events")
+async def session_events(
+    sid: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    rec = db.get(SessionRecord, sid)
+    if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
+        raise HTTPException(404, "session not found")
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=SESSION_EVENT_QUEUE_MAXSIZE)
+    subscribers = _SESSION_EVENT_SUBSCRIBERS.setdefault(sid, set())
+    subscribers.add(queue)
+
+    async def event_gen():
+        try:
+            yield _format_sse_event("session.connected", {
+                "event_type": "session.connected",
+                "session_id": sid,
+            })
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=20)
+                except asyncio.TimeoutError:
+                    yield _format_sse_event("session.heartbeat", {
+                        "event_type": "session.heartbeat",
+                        "session_id": sid,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    })
+                    continue
+                event_type = str(payload.get("event_type") or "session.updated")
+                yield _format_sse_event(event_type, payload)
+        finally:
+            subscribers.discard(queue)
+            if not subscribers:
+                _SESSION_EVENT_SUBSCRIBERS.pop(sid, None)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/sessions/{sid}/health")
@@ -4375,6 +19518,23 @@ async def session_health(
             speaker_name=emp.display_name if emp else "",
         )
     return {"id": rec.id, "imported": imported, "health": _session_health_snapshot(db, rec)}
+
+
+@app.get("/api/sessions/{sid}/run-events")
+def session_run_events(
+    sid: str,
+    limit: int = Query(default=200, ge=1, le=1000),
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    rec = db.get(SessionRecord, sid)
+    if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
+        raise HTTPException(404, "session not found")
+    rows = db.query(SessionRunEvent).filter(
+        SessionRunEvent.session_id == sid,
+        SessionRunEvent.tenant_id == p.tenant.id,
+    ).order_by(SessionRunEvent.created_at.asc(), SessionRunEvent.sequence.asc()).limit(limit).all()
+    return {"items": [_session_run_event_to_dict(r) for r in rows], "total": len(rows)}
 
 
 @app.get("/api/sessions/{sid}/runs")
@@ -4419,6 +19579,10 @@ def get_session_replay(
         SessionRun.session_id == sid,
         SessionRun.tenant_id == p.tenant.id,
     ).order_by(SessionRun.created_at.asc()).limit(80).all()
+    run_events = db.query(SessionRunEvent).filter(
+        SessionRunEvent.session_id == sid,
+        SessionRunEvent.tenant_id == p.tenant.id,
+    ).order_by(SessionRunEvent.created_at.asc(), SessionRunEvent.sequence.asc()).limit(500).all()
     steps: list[WorkflowStepEvent] = []
     checkpoints: list[WorkflowCheckpoint] = []
     forks: list[WorkflowRunFork] = []
@@ -4465,9 +19629,10 @@ def get_session_replay(
         "checkpoints": [_workflow_checkpoint_to_dict(c) for c in checkpoints],
         "forks": [_workflow_fork_to_dict(f) for f in forks],
         "runs": [_session_run_to_dict(r) for r in runs],
+        "run_events": [_session_run_event_to_dict(e) for e in run_events],
         "events": [_canvas_event_to_dict(e) for e in events],
         "artifacts": [_artifact_to_dict(a, db) for a in artifacts],
-        "total": len(events) + len(runs) + len(nodes) + len(steps),
+        "total": len(events) + len(run_events) + len(runs) + len(nodes) + len(steps),
     }
 
 
@@ -4910,10 +20075,32 @@ async def recover_session(
         parts.append("交付物: " + " / ".join(a.name for a in artifacts[:6]))
     rec.task_summary = "\n".join(parts)
     rec.summary_updated_at = datetime.now(timezone.utc)
-    if rec.task_status == "running" and not _is_stale_running_session(rec):
-        pass
-    elif rec.task_status == "running" and not imported:
-        rec.task_status = "needs_input"
+    latest_run = db.query(SessionRun).filter(
+        SessionRun.session_id == rec.id,
+        SessionRun.tenant_id == p.tenant.id,
+    ).order_by(SessionRun.created_at.desc()).first()
+    pending_run_ids = [
+        rid for rid, meta in _PENDING_HERMES_RUNS.items()
+        if meta.get("session_id") == rec.id and meta.get("tenant_id") == p.tenant.id
+    ]
+    latest_run_is_open = bool(
+        latest_run and latest_run.status in {"running", "stalled", "waiting_approval", "waiting_input", "failed"}
+    )
+    if imported:
+        _sync_runtime_completion_from_reconcile(db, rec=rec, employee_id=rec.employee_id)
+    elif pending_run_ids or latest_run_is_open:
+        if latest_run and latest_run.status in {"stalled", "waiting_approval"}:
+            _sync_runtime_completion_from_reconcile(db, rec=rec, employee_id=rec.employee_id)
+        if rec.task_status not in {"completed", "needs_input", "failed"}:
+            rec.task_status = "waiting_approval" if latest_run and latest_run.status == "waiting_approval" else "running"
+            rec.task_summary = (latest_run.reason if latest_run and latest_run.reason else None) or (
+                rec.task_summary or "后台处理中：Atlas 正在继续监听 Hermes 并自动同步最终结果。"
+            )
+        for rid in pending_run_ids:
+            _schedule_detached_run_reconcile(rid)
+    elif rec.task_status in {"running", "stalled"} and _is_stale_running_session(rec):
+        rec.task_status = "stalled"
+        rec.task_summary = "后台任务长时间未更新，可从回放检查点继续或重新执行。"
     rec.updated_at = datetime.now(timezone.utc)
     audit(db, principal=p, action="session.recover", resource_type="session",
           resource_id=rec.id, request=request, extra={"imported": imported, "artifacts": len(artifacts)})
@@ -4927,6 +20114,7 @@ async def recover_session(
         "summary_updated_at": rec.summary_updated_at.isoformat() if rec.summary_updated_at else None,
         "artifacts": [_artifact_to_dict(a, db) for a in artifacts],
         "health": _session_health_snapshot(db, rec),
+        "progress": _session_progress_snapshot(db, rec),
     }
 
 
@@ -5151,7 +20339,7 @@ async def session_messages(
     if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
         raise HTTPException(404, "session not found")
     last_msg = db.query(MessageRecord).filter_by(session_id=sid).order_by(MessageRecord.created_at.desc()).first()
-    if (rec.task_status == "running" or _is_stale_running_session(rec) or (last_msg and last_msg.role == "user")):
+    if (rec.task_status in {"running", "stalled"} or _is_stale_running_session(rec) or (last_msg and last_msg.role == "user")):
         target = await hermes_client.resolve_target(db, p.tenant.id)
         emp = db.get(DigitalEmployee, rec.employee_id) if rec.employee_id else None
         await _reconcile_hermes_session_transcript(
@@ -5163,6 +20351,10 @@ async def session_messages(
             employee_id=rec.employee_id,
             speaker_name=emp.display_name if emp else "",
         )
+    if rec.task_status in {"running", "stalled", "waiting_approval", "waiting_input", "needs_input"}:
+        _sync_runtime_completion_from_reconcile(db, rec=rec, employee_id=rec.employee_id)
+        db.commit()
+        db.refresh(rec)
     # P3.12 (2026-06-07) Bug 5b / 3.4.5: 默认返 OpenAtlas 侧 sanitized messages
     # (没注入 system_prompt / context / file_context 的真实 display_message).
     # 老 session (P3.11 之前) 没 MessageRecord, fallback 拿 Hermes raw + 清洗.
@@ -5281,7 +20473,7 @@ def patch_session_task_status(
     rec = db.get(SessionRecord, sid)
     if not rec or rec.tenant_id != p.tenant.id or rec.user_id != p.user.id or rec.archived:
         raise HTTPException(404, "session not found")
-    allowed = {"draft", "running", "needs_input", "completed", "failed"}
+    allowed = {"draft", "running", "needs_input", "waiting_input", "waiting_approval", "quota_waiting", "completed", "failed", "stopping", "stopped", "cancelled", "stalled"}
     if body.task_status not in allowed:
         raise HTTPException(400, f"task_status must be one of {sorted(allowed)}")
     rec.task_status = body.task_status
@@ -5320,8 +20512,155 @@ def list_session_artifacts(
     rows = db.query(TaskArtifact).filter(
         TaskArtifact.session_id == sid,
         TaskArtifact.tenant_id == p.tenant.id,
+        TaskArtifact.archived == False,  # noqa: E712
     ).order_by(TaskArtifact.created_at.desc()).all()
-    return {"items": [_artifact_to_dict(r, db) for r in rows]}
+    rows = _dedupe_artifact_rows_for_display(rows)
+    items = [_artifact_to_dict(r, db) for r in rows]
+    db.commit()
+    return {"items": items}
+
+
+@app.get("/api/artifacts")
+def list_artifacts(
+    session_id: str | None = Query(default=None),
+    employee_id: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    kind: str | None = Query(default=None),
+    managed_status: str | None = Query(default=None),
+    search: str | None = Query(default=None, alias="q"),
+    include_archived: bool = Query(default=False),
+    limit: int = Query(default=100, ge=1, le=500),
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    query = db.query(TaskArtifact).filter(TaskArtifact.tenant_id == p.tenant.id)
+    if p.user.role not in (UserRole.tenant_admin, UserRole.system_admin):
+        query = query.filter(TaskArtifact.user_id == p.user.id)
+    if session_id:
+        rec = db.get(SessionRecord, session_id)
+        if not rec or rec.tenant_id != p.tenant.id or (p.user.role not in (UserRole.tenant_admin, UserRole.system_admin) and rec.user_id != p.user.id):
+            raise HTTPException(404, "session not found")
+        query = query.filter(TaskArtifact.session_id == session_id)
+    if employee_id:
+        query = query.filter(TaskArtifact.employee_id == employee_id)
+    if status:
+        query = query.filter(TaskArtifact.status == status)
+    if kind:
+        query = query.filter(TaskArtifact.kind == kind)
+    if managed_status:
+        query = query.filter(TaskArtifact.managed_status == managed_status)
+    if search:
+        keyword = search.strip()
+        if keyword:
+            query = query.filter(TaskArtifact.name.ilike(f"%{keyword[:80]}%"))
+    if not include_archived:
+        query = query.filter(TaskArtifact.archived == False)  # noqa: E712
+    rows = query.order_by(TaskArtifact.created_at.desc()).limit(limit * 2).all()
+    rows = _dedupe_artifact_rows_for_display(rows)[:limit]
+    items = [_artifact_to_dict(r, db) for r in rows]
+    db.commit()
+    return {"items": items}
+
+
+@app.get("/api/artifacts/{artifact_id}/preview")
+def preview_artifact(
+    artifact_id: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+) -> dict:
+    art = db.get(TaskArtifact, artifact_id)
+    if not _can_access_artifact(art, p) or art.archived:
+        raise HTTPException(404, "artifact not found")
+    name = art.name or f"artifact-{art.id}.txt"
+    mime = art.mime_type or _guess_mime(name, None)
+    managed_path = _materialize_artifact_file(db, art)
+    if managed_path and managed_path.exists() and managed_path.is_file():
+        audit(db, principal=p, action="artifact.preview", resource_type="artifact",
+              resource_id=art.id, request=request, extra={"session_id": art.session_id, "kind": art.kind, "managed": True})
+        db.commit()
+        return _file_preview_payload(
+            id=art.id,
+            name=name,
+            path=managed_path,
+            mime=mime,
+            source=art.source or "artifact",
+            download_url=f"/api/artifacts/{quote(art.id)}/download",
+        )
+    content = art.content or ""
+    is_binary = _is_binary_artifact_name(name, mime) or _content_looks_binary_stub(content)
+    path = Path(art.source_path) if art.source_path else Path(name)
+    if content and not is_binary:
+        virtual_path = Path(name)
+        preview_kind = _preview_kind_for_path(virtual_path, mime)
+        audit(db, principal=p, action="artifact.preview", resource_type="artifact",
+              resource_id=art.id, request=request, extra={"session_id": art.session_id, "kind": art.kind})
+        db.commit()
+        return {
+            "id": art.id,
+            "name": name,
+            "mime_type": mime,
+            "size": len(content.encode("utf-8")),
+            "preview_kind": preview_kind,
+            "renderable": True,
+            "content": content,
+            "download_url": f"/api/artifacts/{quote(art.id)}/download",
+            "source": art.source or "artifact",
+        }
+    if not art.source_path:
+        raise HTTPException(404, "artifact has no previewable content")
+    if not _path_within(path, _allowed_user_file_roots(db, p, art.session_id)):
+        raise HTTPException(403, "artifact path outside authorized workspace")
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "artifact file not found")
+    audit(db, principal=p, action="artifact.preview", resource_type="artifact",
+          resource_id=art.id, request=request, extra={"session_id": art.session_id, "kind": art.kind})
+    db.commit()
+    return _file_preview_payload(
+        id=art.id,
+        name=name,
+        path=path,
+        mime=mime,
+        source=art.source or "artifact",
+        download_url=f"/api/artifacts/{quote(art.id)}/download",
+    )
+
+
+@app.get("/api/artifacts/{artifact_id}/download")
+def download_artifact(
+    artifact_id: str,
+    request: Request,
+    p: Principal = Depends(get_principal),
+    db: Session = Depends(get_db),
+):
+    art = db.get(TaskArtifact, artifact_id)
+    if not _can_access_artifact(art, p) or art.archived:
+        raise HTTPException(404, "artifact not found")
+    name = _safe_filename(art.name or f"artifact-{art.id}.txt")
+    mime = art.mime_type or _guess_mime(name, None)
+    managed_path = _materialize_artifact_file(db, art)
+    if managed_path and managed_path.exists() and managed_path.is_file():
+        audit(db, principal=p, action="artifact.download", resource_type="artifact",
+              resource_id=art.id, request=request, extra={"session_id": art.session_id, "kind": art.kind, "managed": True})
+        db.commit()
+        return FileResponse(path=str(managed_path), media_type=mime or "application/octet-stream", filename=name)
+    if art.source_path:
+        path = Path(art.source_path)
+        if _path_within(path, _allowed_user_file_roots(db, p, art.session_id)) and path.exists() and path.is_file():
+            audit(db, principal=p, action="artifact.download", resource_type="artifact",
+                  resource_id=art.id, request=request, extra={"session_id": art.session_id, "kind": art.kind})
+            db.commit()
+            return FileResponse(path=str(path), media_type=mime or "application/octet-stream", filename=name)
+    content = art.content or ""
+    if _is_binary_artifact_name(name, mime) or _content_looks_binary_stub(content):
+        raise HTTPException(404, "artifact binary content not materialized")
+    if not content:
+        raise HTTPException(404, "artifact content not found")
+    audit(db, principal=p, action="artifact.download", resource_type="artifact",
+          resource_id=art.id, request=request, extra={"session_id": art.session_id, "kind": art.kind})
+    db.commit()
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"}
+    return StreamingResponse(io.BytesIO(content.encode("utf-8")), media_type=mime or "text/plain;charset=utf-8", headers=headers)
 
 
 @app.patch("/api/artifacts/{artifact_id}")
@@ -5333,7 +20672,7 @@ def patch_artifact(
     db: Session = Depends(get_db),
 ) -> dict:
     art = db.get(TaskArtifact, artifact_id)
-    if not art or art.tenant_id != p.tenant.id or art.user_id != p.user.id:
+    if not _can_access_artifact(art, p):
         raise HTTPException(404, "artifact not found")
     changes: dict[str, Any] = {}
     if body.name is not None:
@@ -5359,7 +20698,9 @@ def patch_artifact(
           resource_id=art.id, request=request, extra={"session_id": art.session_id, **changes})
     db.commit()
     db.refresh(art)
-    return _artifact_to_dict(art, db)
+    item = _artifact_to_dict(art, db)
+    db.commit()
+    return item
 
 
 @app.post("/api/artifacts/{artifact_id}/archive")
@@ -5368,14 +20709,17 @@ def archive_artifact(
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
     art = db.get(TaskArtifact, artifact_id)
-    if not art or art.tenant_id != p.tenant.id or art.user_id != p.user.id:
+    if not _can_access_artifact(art, p):
         raise HTTPException(404, "artifact not found")
     art.archived = True
     art.status = "archived"
     audit(db, principal=p, action="artifact.archive", resource_type="artifact",
           resource_id=art.id, request=request, extra={"session_id": art.session_id, "kind": art.kind})
     db.commit()
-    return _artifact_to_dict(art, db)
+    db.refresh(art)
+    item = _artifact_to_dict(art, db)
+    db.commit()
+    return item
 
 
 @app.post("/api/hermes-runs/{run_id}/approval")
@@ -5387,13 +20731,25 @@ async def approve_hermes_run(
     run_meta = _get_authorized_hermes_run(run_id, p)
     target = await hermes_client.resolve_target(db, p.tenant.id)
     choice = {"approve": "once", "allow": "once", "approved": "once"}.get(body.choice, body.choice)
-    out = await hermes_client.respond_run_approval(
-        target,
-        run_id,
-        choice=choice,
-        resolve_all=body.resolve_all,
-        approval_id=body.approval_id,
-    )
+    try:
+        out = await hermes_client.respond_run_approval(
+            target,
+            run_id,
+            choice=choice,
+            resolve_all=body.resolve_all,
+            approval_id=body.approval_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        response = getattr(exc, "response", None)
+        status_code = int(getattr(response, "status_code", 502) or 502)
+        detail = ""
+        try:
+            detail = response.text[:500] if response is not None else ""
+        except Exception:
+            detail = ""
+        if status_code == 409:
+            detail = detail or "Hermes run 当前没有可处理的审批，可能已经继续、失败或过期。"
+        raise HTTPException(status_code, detail or str(exc)[:500]) from exc
     audit(db, principal=p, action="hermes_run.approval", resource_type="hermes_run",
           resource_id=run_id, request=request, extra={
               "choice": choice,
@@ -5403,21 +20759,156 @@ async def approve_hermes_run(
               "employee_id": run_meta.get("employee_id"),
               "hermes_session_id": run_meta.get("hermes_session_id"),
           })
+    session_id = str(run_meta.get("session_id") or "")
+    employee_id = str(run_meta.get("employee_id") or "")
+    rec = db.get(SessionRecord, session_id) if session_id else None
+    if rec and rec.tenant_id == p.tenant.id and rec.user_id == p.user.id and not rec.archived:
+        reason = "用户已确认工具授权，Hermes 正在继续执行。"
+        rec.task_status = "running"
+        rec.task_summary = reason
+        rec.updated_at = datetime.now(timezone.utc)
+        run_row = db.query(SessionRun).filter(
+            SessionRun.session_id == rec.id,
+            SessionRun.tenant_id == p.tenant.id,
+            SessionRun.hermes_run_id == run_id,
+        ).order_by(SessionRun.created_at.desc()).first()
+        if run_row:
+            _update_session_run(
+                db,
+                run_row.id,
+                status="running",
+                stage="runtime",
+                reason=reason,
+                event_type="approval.responded",
+                hermes_run_id=run_id,
+            )
+        wf = db.query(WorkflowRun).filter(
+            WorkflowRun.session_id == rec.id,
+            WorkflowRun.tenant_id == p.tenant.id,
+        ).order_by(WorkflowRun.created_at.desc()).first()
+        node = None
+        if wf:
+            wf.status = "running"
+            wf.summary = reason
+            wf.updated_at = datetime.now(timezone.utc)
+            node = db.query(WorkflowNodeRun).filter(
+                WorkflowNodeRun.workflow_run_id == wf.id,
+                WorkflowNodeRun.tenant_id == p.tenant.id,
+                WorkflowNodeRun.employee_id == (employee_id or rec.employee_id),
+            ).order_by(WorkflowNodeRun.created_at.desc()).first()
+            if node:
+                node.status = "running"
+                node.error = ""
+                node.updated_at = datetime.now(timezone.utc)
+            _record_workflow_step(
+                db,
+                tenant_id=p.tenant.id,
+                user_id=p.user.id,
+                session_id=rec.id,
+                workflow_run_id=wf.id,
+                workflow_node_run_id=node.id if node else None,
+                employee_id=employee_id or rec.employee_id,
+                event_type="approval.resolved",
+                title="审批已处理",
+                summary=str(choice or "用户已处理审批"),
+                payload={
+                    "choice": choice,
+                    "resolve_all": body.resolve_all,
+                    "approval_id": body.approval_id,
+                    "hermes_run_id": run_id,
+                    "response": out,
+                },
+                checkpoint_type="approval.resolved",
+                hermes_session_id=rec.hermes_session_id,
+                hermes_run_id=run_id,
+            )
+    db.commit()
+    _schedule_detached_run_reconcile(run_id)
     return out
 
 
 @app.post("/api/hermes-runs/{run_id}/stop")
 async def stop_hermes_run(
-    run_id: str, body: RunStopIn, request: Request,
+    run_id: str, request: Request, body: RunStopIn | None = None,
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
     """Stop a tenant-scoped Hermes run instead of only aborting the browser stream."""
     run_meta = _get_authorized_hermes_run(run_id, p)
     target = await hermes_client.resolve_target(db, p.tenant.id)
-    out = await hermes_client.stop_run(target, run_id)
+    stop_error = ""
+    try:
+        out = await hermes_client.stop_run(target, run_id)
+    except Exception as exc:  # noqa: BLE001
+        stop_error = str(exc)[:500]
+        out = {"ok": False, "error": stop_error}
+    session_id = str(run_meta.get("session_id") or "")
+    if session_id:
+        rec = db.get(SessionRecord, session_id)
+        if rec and rec.tenant_id == p.tenant.id and rec.user_id == p.user.id:
+            previous = rec.task_status or "draft"
+            rec.task_status = "stopped" if not stop_error else "stopping"
+            rec.task_summary = "用户已停止当前任务。" if not stop_error else f"已请求停止，但 Hermes 返回异常: {stop_error}"
+            rec.updated_at = datetime.now(timezone.utc)
+            run_row = db.query(SessionRun).filter(
+                SessionRun.session_id == rec.id,
+                SessionRun.tenant_id == p.tenant.id,
+                SessionRun.hermes_run_id == run_id,
+            ).order_by(SessionRun.created_at.desc()).first()
+            if not run_row:
+                run_row = db.query(SessionRun).filter(
+                    SessionRun.session_id == rec.id,
+                    SessionRun.tenant_id == p.tenant.id,
+                    SessionRun.status.in_(["queued", "running", "waiting_approval", "stalled"]),
+                ).order_by(SessionRun.created_at.desc()).first()
+            if run_row:
+                _update_session_run(
+                    db,
+                    run_row.id,
+                    status="cancelled" if not stop_error else "stopping",
+                    stage="stopped",
+                    reason=rec.task_summary,
+                    event_type="run.stop_requested",
+                    hermes_run_id=run_id,
+                )
+            wf = db.query(WorkflowRun).filter(
+                WorkflowRun.session_id == rec.id,
+                WorkflowRun.tenant_id == p.tenant.id,
+            ).order_by(WorkflowRun.created_at.desc()).first()
+            if wf:
+                wf.status = "cancelled" if not stop_error else "stopping"
+                wf.summary = rec.task_summary
+                wf.updated_at = datetime.now(timezone.utc)
+                if not stop_error:
+                    wf.completed_at = datetime.now(timezone.utc)
+                running_nodes = db.query(WorkflowNodeRun).filter(
+                    WorkflowNodeRun.workflow_run_id == wf.id,
+                    WorkflowNodeRun.status.in_(["queued", "running", "waiting_approval", "stalled", "idle"]),
+                ).all()
+                for node in running_nodes:
+                    node.status = "cancelled" if not stop_error else "stopping"
+                    node.error = rec.task_summary
+                    node.updated_at = datetime.now(timezone.utc)
+            if wf:
+                _record_workflow_step(
+                    db,
+                    tenant_id=p.tenant.id,
+                    user_id=p.user.id,
+                    session_id=rec.id,
+                    workflow_run_id=wf.id,
+                    workflow_node_run_id=None,
+                    employee_id=run_meta.get("employee_id") or rec.employee_id,
+                    event_type="run.stop_requested",
+                    title="用户停止任务",
+                    summary=rec.task_summary,
+                    payload={"hermes_run_id": run_id, "previous_status": previous, "error": stop_error},
+                    checkpoint_type="run.stop_requested",
+                    hermes_session_id=rec.hermes_session_id,
+                    hermes_run_id=run_id,
+                )
     audit(db, principal=p, action="hermes_run.stop", resource_type="hermes_run",
           resource_id=run_id, request=request, extra={
-              "reason": body.reason,
+              "reason": (body.reason if body else "user_requested"),
+              "stop_error": stop_error,
               "session_id": run_meta.get("session_id"),
               "employee_id": run_meta.get("employee_id"),
               "hermes_session_id": run_meta.get("hermes_session_id"),
@@ -5447,11 +20938,21 @@ async def session_chat_stream(
     turn_employees: list[DigitalEmployee] = []
     for eid in turn_employee_ids:
         emp = db.get(DigitalEmployee, eid)
-        if not emp or emp.tenant_id != p.tenant.id or emp.status != EmployeeStatus.active:
+        if not _employee_visible_to_principal(db, emp, p) or emp.status != EmployeeStatus.active:
             raise HTTPException(404, f"employee {eid} not found in this tenant")
         turn_employees.append(emp)
     if not turn_employees:
         raise HTTPException(400, "session has no employee to chat with")
+    # Persist an ad-hoc @ relay into the session so the war room keeps its team
+    # on refresh and on the next turn.
+    if primary_employee_id and not rec.employee_id:
+        rec.employee_id = primary_employee_id
+    persisted_participants = [
+        eid for eid in turn_employee_ids
+        if eid and eid != (primary_employee_id or rec.employee_id)
+    ]
+    if persisted_participants:
+        rec.participant_ids = json.dumps(persisted_participants, ensure_ascii=False)
 
     # P3.12 (2026-06-07) Bug 7: 附件 file_context 注入
     # 校验 attachment_ids 全部属于本 user / 本 session
@@ -5488,6 +20989,50 @@ async def session_chat_stream(
         })
     attachment_ids_injected = [f["id"] for f in file_provenance if f.get("id")]
     attachment_chars = sum(int(f.get("extracted_chars") or 0) for f in file_provenance)
+    capability_plan = _build_capability_plan(
+        db,
+        p,
+        message=body.message,
+        file_assets=file_assets,
+        employees=turn_employees,
+    )
+    auto_route = capability_plan.get("auto_route") or None
+    if auto_route and isinstance(auto_route, dict):
+        routed_emp = db.get(DigitalEmployee, str(auto_route.get("employee_id") or ""))
+        if routed_emp and _employee_visible_to_principal(db, routed_emp, p) and routed_emp.status == EmployeeStatus.active:
+            previous_emp = turn_employees[0]
+            turn_employees = [routed_emp]
+            turn_employee_ids = [routed_emp.id]
+            primary_employee_id = routed_emp.id
+            rec.employee_id = routed_emp.id
+            rec.participant_ids = json.dumps([], ensure_ascii=False)
+            capability_plan["routing_applied"] = {
+                "from_employee_id": previous_emp.id,
+                "from_employee_name": previous_emp.display_name,
+                "to_employee_id": routed_emp.id,
+                "to_employee_name": routed_emp.display_name,
+                "reason": capability_plan.get("summary") or "能力路由",
+            }
+            capability_plan = _build_capability_plan(
+                db,
+                p,
+                message=body.message,
+                file_assets=file_assets,
+                employees=turn_employees,
+            ) | {"routing_applied": capability_plan["routing_applied"]}
+    collaboration_policy = _build_collaboration_policy(body.message, turn_employees, capability_plan)
+    synthesis_employee: DigitalEmployee | None = None
+    synthesis_turn_index: int | None = None
+    if collaboration_policy.get("requires_synthesis"):
+        synthesis_employee = _select_synthesizer_employee(db, p, turn_employees)
+        if synthesis_employee:
+            turn_employees.append(synthesis_employee)
+            turn_employee_ids.append(synthesis_employee.id)
+            synthesis_turn_index = len(turn_employees) - 1
+            capability_plan["synthesis_employee"] = {
+                "employee_id": synthesis_employee.id,
+                "employee_name": synthesis_employee.display_name,
+            }
     hermes_home = _tenant_hermes_home(db, p.tenant.id)
     recent_context_block = _build_recent_conversation_block(
         db,
@@ -5505,6 +21050,7 @@ async def session_chat_stream(
         user_id=p.user.id,
         employee_id=turn_employees[0].id,
         hermes_home=hermes_home,
+        session_id=rec.id,
         file_ctx_block=file_ctx_block,
         recent_context_block=recent_context_block,
     )
@@ -5513,7 +21059,9 @@ async def session_chat_stream(
           extra={"memories_injected": [m["id"] for m in primary_eff],
                  "speaker_employee_ids": [e.id for e in turn_employees],
                  "attachments_injected": attachment_ids_injected,
-                 "attachment_chars": attachment_chars})
+                 "attachment_chars": attachment_chars,
+                 "capabilities": [c.get("key") for c in capability_plan.get("required_capabilities", [])],
+                 "collaboration_policy": collaboration_policy.get("mode")})
     # P3.12 (2026-06-07) Bug 5b: 落 MessageRecord, 只存 display_message (用户真实输入)
     user_msg = MessageRecord(
         session_id=rec.id,
@@ -5541,6 +21089,8 @@ async def session_chat_stream(
             "message_id": user_msg.id,
             "employee_ids": [e.id for e in turn_employees],
             "query_excerpt": body.message[:240],
+            "capability_plan": capability_plan,
+            "collaboration_policy": collaboration_policy,
         },
     )
     _update_workflow_node_run(
@@ -5557,6 +21107,39 @@ async def session_chat_stream(
         input_summary=body.message[:1000],
     )
     workflow_run_id = workflow_row.id
+    _record_workflow_step(
+        db,
+        tenant_id=p.tenant.id,
+        user_id=p.user.id,
+        session_id=rec.id,
+        workflow_run_id=workflow_run_id,
+        workflow_node_run_id=None,
+        employee_id=None,
+        event_type="capability.plan",
+        title="能力清单",
+        summary=capability_plan.get("summary") or "已完成任务能力预检",
+        input_summary=body.message[:1000],
+        payload=capability_plan,
+        checkpoint_type="capability.plan",
+        hermes_session_id=rec.hermes_session_id,
+    )
+    if len(turn_employees) > 1:
+        _record_workflow_step(
+            db,
+            tenant_id=p.tenant.id,
+            user_id=p.user.id,
+            session_id=rec.id,
+            workflow_run_id=workflow_run_id,
+            workflow_node_run_id=None,
+            employee_id=synthesis_employee.id if synthesis_employee else None,
+            event_type="collaboration.plan",
+            title="协作计划",
+            summary=f"{collaboration_policy.get('mode')} · {' -> '.join(collaboration_policy.get('steps') or [])}",
+            input_summary=body.message[:1000],
+            payload=collaboration_policy,
+            checkpoint_type="collaboration.plan",
+            hermes_session_id=rec.hermes_session_id,
+        )
     db.commit()
 
     async def event_gen():
@@ -5587,8 +21170,104 @@ async def session_chat_stream(
                 payload.update(speaker)
             return f"event: openatlas.task_state\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+        quota_snapshot: dict[str, Any] = {}
+        db_quota = SessionLocal()
+        try:
+            quota_snapshot = _runtime_quota_snapshot(db_quota, p.tenant.id, p.user.id)
+            if quota_snapshot.get("limited"):
+                first_emp = turn_employees[0]
+                reason = str(quota_snapshot.get("reason") or "模型运行额度暂不可用，本轮进入限流等待。")
+                retry_after = int(quota_snapshot.get("retry_after_seconds") or OPENATLAS_QUOTA_RETRY_AFTER_SECONDS)
+                session_row = db_quota.get(SessionRecord, rec.id)
+                if session_row:
+                    session_row.task_status = "quota_waiting"
+                    session_row.task_summary = reason
+                    session_row.updated_at = datetime.now(timezone.utc)
+                wf = db_quota.get(WorkflowRun, workflow_run_id)
+                run_row = _create_session_run(
+                    db_quota,
+                    tenant_id=p.tenant.id,
+                    user_id=p.user.id,
+                    session_id=rec.id,
+                    employee_id=first_emp.id,
+                    status="quota_waiting",
+                    stage="quota",
+                    reason=reason,
+                    payload=quota_snapshot,
+                )
+                node_row = _update_workflow_node_run(
+                    db_quota,
+                    workflow_run=wf,
+                    tenant_id=p.tenant.id,
+                    user_id=p.user.id,
+                    session_id=rec.id,
+                    employee_id=first_emp.id,
+                    label=first_emp.display_name,
+                    status="quota_waiting",
+                    event_type="runtime.quota_waiting",
+                    session_run_id=run_row.id,
+                    input_summary=body.message[:1000],
+                    error=reason,
+                    payload_patch=quota_snapshot,
+                )
+                _record_workflow_step(
+                    db_quota,
+                    tenant_id=p.tenant.id,
+                    user_id=p.user.id,
+                    session_id=rec.id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_node_run_id=node_row.id if node_row else None,
+                    employee_id=first_emp.id,
+                    event_type="runtime.quota_waiting",
+                    title="限流等待",
+                    summary=reason,
+                    input_summary=body.message[:1000],
+                    payload=quota_snapshot,
+                    risk_level="medium",
+                    checkpoint_type="runtime.quota_waiting",
+                    hermes_session_id=rec.hermes_session_id,
+                )
+                if wf:
+                    wf.status = "quota_waiting"
+                    wf.summary = reason
+                    wf.updated_at = datetime.now(timezone.utc)
+                db_quota.commit()
+                payload = {
+                    "openatlas_session_id": sess_marker,
+                    "session_id": sess_marker,
+                    "task_status": "quota_waiting",
+                    "reason": reason,
+                    "retry_after_seconds": retry_after,
+                    "quota": quota_snapshot,
+                }
+                yield task_state_event("quota_waiting", reason)
+                yield trace_event(
+                    "quota",
+                    "限流等待",
+                    f"{reason} 建议 {retry_after} 秒后重试，或换员工接力。",
+                    retry_after_seconds=retry_after,
+                )
+                yield f"event: openatlas.quota_waiting\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                yield f"event: done\ndata: {json.dumps({'openatlas_session_id': sess_marker, 'quota_waiting': True}, ensure_ascii=False)}\n\n"
+                return
+        finally:
+            db_quota.close()
+
         # 注入文件 provenance (不返 content, 只返 metadata)
         yield task_state_event("running", "chat stream started")
+        yield trace_event(
+            "capability",
+            "能力调度完成",
+            capability_plan.get("summary") or "已完成任务能力预检",
+            capability_count=len(capability_plan.get("required_capabilities") or []),
+            gap_count=len(capability_plan.get("gaps") or []),
+            routed=bool(capability_plan.get("routing_applied") or capability_plan.get("auto_route")),
+            collaboration_mode=collaboration_policy.get("mode"),
+        )
+        yield (
+            "event: openatlas.capability_plan\n"
+            f"data: {json.dumps({'openatlas_session_id': sess_marker, 'plan': capability_plan, 'collaboration_policy': collaboration_policy}, ensure_ascii=False)}\n\n"
+        )
         yield trace_event(
             "files",
             "附件上下文准备",
@@ -5684,6 +21363,26 @@ async def session_chat_stream(
                             hermes_run_id=hermes_run_id,
                             payload_patch=payload_patch,
                         )
+                        if event_type:
+                            _record_session_run_event(
+                                db_progress,
+                                tenant_id=p.tenant.id,
+                                user_id=p.user.id,
+                                session_id=rec.id,
+                                run_id=session_run_id,
+                                hermes_run_id=hermes_run_id or current_hermes_run_id,
+                                event_type=event_type,
+                                payload={
+                                    "status": status,
+                                    "node_status": node_status,
+                                    "stage": stage,
+                                    "reason": reason,
+                                    "artifact_ids": artifact_ids or [],
+                                    "error": error,
+                                    **(payload_patch or {}),
+                                },
+                                source="chat_stream",
+                            )
                         _update_workflow_node_run(
                             db_progress,
                             workflow_run=wf,
@@ -5772,6 +21471,12 @@ async def session_chat_stream(
                 yield f"event: agent_join\ndata: {json.dumps(speaker, ensure_ascii=False)}\n\n"
 
                 relay_context = "\n\n".join(relay_outputs)
+                is_synthesis_turn = synthesis_turn_index is not None and turn_index == synthesis_turn_index
+                is_final_serial_turn = (
+                    len(turn_employees) > 1
+                    and not collaboration_policy.get("requires_synthesis")
+                    and turn_index == len(turn_employees) - 1
+                )
                 if turn_index == 0:
                     system_message, eff, skill_evidence = primary_system_message, primary_eff, primary_skills
                 else:
@@ -5783,23 +21488,45 @@ async def session_chat_stream(
                             user_id=p.user.id,
                             employee_id=emp.id,
                             hermes_home=hermes_home,
+                            session_id=rec.id,
                             file_ctx_block=file_ctx_block,
                             recent_context_block=recent_context_block,
                             relay_context=relay_context,
                         )
                     finally:
                         db_ctx.close()
-                speaker_role_block = (
-                    "<current_speaker>\n"
-                    f"You are now speaking as OpenAtlas digital employee: {emp.display_name}.\n"
-                    f"speaker_employee_id: {emp.id}\n"
-                    f"turn_index: {turn_index}\n"
-                    "In this group chat turn, answer only for this current employee. "
-                    "If the user assigned different instructions to the primary employee, relay employee, or other participants, "
-                    "follow only the instruction that matches this current speaker and do not repeat previous employees' answers.\n"
-                    "</current_speaker>"
-                )
-                system_message = "\n\n".join([p for p in (system_message, speaker_role_block) if p and p.strip()])
+                capability_prompt_block = _capability_prompt_block(capability_plan, collaboration_policy)
+                if is_synthesis_turn:
+                    speaker_role_block = (
+                        "<current_speaker>\n"
+                        f"You are now speaking as OpenAtlas final synthesizer: {emp.display_name}.\n"
+                        f"speaker_employee_id: {emp.id}\n"
+                        f"turn_index: {turn_index}\n"
+                        "Your job is to integrate the previous employees' outputs from relay context into one coherent final deliverable. "
+                        "Do not simply concatenate sections. Resolve conflicts, fill missing transitions, call out assumptions, and produce a complete answer or artifact plan for the user.\n"
+                        "</current_speaker>"
+                    )
+                elif is_final_serial_turn:
+                    speaker_role_block = (
+                        "<current_speaker>\n"
+                        f"You are now speaking as the final relay employee: {emp.display_name}.\n"
+                        f"speaker_employee_id: {emp.id}\n"
+                        f"turn_index: {turn_index}\n"
+                        "This is the last handoff turn. Use the previous employees' outputs from relay context and produce the final usable result, not another partial note.\n"
+                        "</current_speaker>"
+                    )
+                else:
+                    speaker_role_block = (
+                        "<current_speaker>\n"
+                        f"You are now speaking as OpenAtlas digital employee: {emp.display_name}.\n"
+                        f"speaker_employee_id: {emp.id}\n"
+                        f"turn_index: {turn_index}\n"
+                        "In this group chat turn, answer only for this current employee. "
+                        "If the user assigned different instructions to the primary employee, relay employee, or other participants, "
+                        "follow only the instruction that matches this current speaker and do not repeat previous employees' answers.\n"
+                        "</current_speaker>"
+                    )
+                system_message = "\n\n".join([p for p in (system_message, capability_prompt_block, speaker_role_block) if p and p.strip()])
                 context_payload = {
                     **speaker,
                     "skills": skill_evidence,
@@ -5872,24 +21599,79 @@ async def session_chat_stream(
                 assistant_text_parts: list[str] = []
                 reasoning_parts: list[str] = []
                 tool_call_records: list[dict[str, Any]] = []
+                active_tool_payloads: dict[str, dict[str, Any]] = {}
                 persisted_artifact_ids: list[str] = []
+                emitted_artifact_ids: set[str] = set()
                 final_task_status = "running"
                 final_task_reason = ""
                 assistant_persisted = False
                 assistant_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
                 runtime_detached = False
+                saw_runtime_stall = False
+                waiting_for_approval = False
+                runtime_error_message = ""
                 scoped_msg = msg
                 if len(turn_employees) > 1:
                     other_names = [x.display_name for x in turn_employees if x.id != emp.id]
-                    scoped_msg = (
-                        f"{msg}\n\n"
-                        "<current_turn_instruction>\n"
-                        f"本轮只允许「{emp.display_name}」发言。请只完成用户任务中分配给「{emp.display_name}」的部分，"
-                        "不要替其他员工回答、不要输出其他员工的小节、不要生成最终汇总。\n"
-                        f"其他员工将单独发言: {', '.join(other_names) or '无'}。\n"
-                        "如果用户的原始任务包含多个角色，请忽略不属于当前员工的角色要求。\n"
-                        "</current_turn_instruction>"
-                    )
+                    if is_synthesis_turn:
+                        scoped_msg = (
+                            f"{msg}\n\n"
+                            "<final_synthesis_instruction>\n"
+                            f"你是「{emp.display_name}」，负责本轮多员工协作的最终合稿。请阅读 relay context 中所有前序员工输出，"
+                            "整合成一个完整、可直接交付给用户的最终结果。不要只罗列每个人的观点，不要再要求其他员工补充；"
+                            "如信息不足，请在终稿末尾列出待确认事项和可继续推进的下一步。\n"
+                            "</final_synthesis_instruction>"
+                        )
+                        record_step_event(
+                            "collaboration.synthesis_started",
+                            {"turn_index": turn_index, "employee_name": emp.display_name},
+                            title="进入合稿整合",
+                            summary=f"{emp.display_name} 正在整合前序员工输出并生成最终交付",
+                            checkpoint_type="collaboration.synthesis_started",
+                        )
+                    elif is_final_serial_turn:
+                        scoped_msg = (
+                            f"{msg}\n\n"
+                            "<final_relay_instruction>\n"
+                            f"本轮是串行接力的最后一棒，由「{emp.display_name}」完成最终交付。请引用并整合前序员工输出，"
+                            "输出完整结果，而不是只写自己的局部意见。\n"
+                            f"已参与员工: {', '.join(other_names) or '无'}。\n"
+                            "</final_relay_instruction>"
+                        )
+                    else:
+                        scoped_msg = (
+                            f"{msg}\n\n"
+                            "<current_turn_instruction>\n"
+                            f"本轮只允许「{emp.display_name}」发言。请只完成用户任务中分配给「{emp.display_name}」的部分，"
+                            "不要替其他员工回答、不要输出其他员工的小节、不要生成最终汇总。\n"
+                            f"其他员工将单独发言: {', '.join(other_names) or '无'}。\n"
+                            "如果用户的原始任务包含多个角色，请忽略不属于当前员工的角色要求。\n"
+                            "</current_turn_instruction>"
+                        )
+
+                def load_new_persisted_artifacts() -> list[dict[str, Any]]:
+                    new_ids = [
+                        artifact_id
+                        for artifact_id in persisted_artifact_ids
+                        if artifact_id and artifact_id not in emitted_artifact_ids
+                    ]
+                    if not new_ids:
+                        return []
+                    db_artifacts = SessionLocal()
+                    try:
+                        rows = db_artifacts.query(TaskArtifact).filter(
+                            TaskArtifact.tenant_id == p.tenant.id,
+                            TaskArtifact.user_id == p.user.id,
+                            TaskArtifact.session_id == sid,
+                            TaskArtifact.id.in_(new_ids),
+                            TaskArtifact.archived == False,  # noqa: E712
+                        ).all()
+                        items = [_artifact_to_dict(row, db_artifacts) for row in rows]
+                        db_artifacts.commit()
+                        emitted_artifact_ids.update(str(row.id) for row in rows)
+                        return items
+                    finally:
+                        db_artifacts.close()
 
                 def persist_assistant_once() -> None:
                     nonlocal assistant_persisted, final_task_status, final_task_reason, persisted_artifact_ids
@@ -5898,8 +21680,31 @@ async def session_chat_stream(
                     assistant_persisted = True
                     full_assistant = "".join(assistant_text_parts)
                     if not full_assistant.strip():
-                        final_task_status = "needs_input"
-                        final_task_reason = "assistant returned no visible content"
+                        if persisted_artifact_ids:
+                            final_task_status = "completed"
+                            final_task_reason = "工具已生成交付物，任务已完成。"
+                        elif runtime_error_message:
+                            if _is_quota_or_rate_limit_error(runtime_error_message):
+                                final_task_status = "quota_waiting"
+                                final_task_reason = _quota_waiting_reason(runtime_error_message)
+                            else:
+                                final_task_status = "failed"
+                                final_task_reason = runtime_error_message
+                        elif waiting_for_approval:
+                            final_task_status = "waiting_approval"
+                            final_task_reason = "等待用户确认工具授权"
+                        elif any(str(item.get("status") or "").lower() == "failed" or item.get("error") for item in tool_call_records):
+                            final_task_status = "failed"
+                            final_task_reason = "Hermes 工具执行失败，且没有返回可见结果。"
+                        elif saw_runtime_stall:
+                            final_task_status = "running"
+                            final_task_reason = "Hermes 长任务转入后台处理，Atlas 正在自动同步"
+                        elif tool_call_records:
+                            final_task_status = "running"
+                            final_task_reason = "Hermes 已完成工具事件，等待最终回复或交付物同步。"
+                        else:
+                            final_task_status = "failed"
+                            final_task_reason = "Hermes run 已结束但没有返回可见内容。"
                         db2 = SessionLocal()
                         try:
                             session_row = db2.get(SessionRecord, sid)
@@ -5911,6 +21716,13 @@ async def session_chat_stream(
                             db2.close()
                         return
                     final_task_status, final_task_reason = _infer_task_status_from_assistant(full_assistant)
+                    if (
+                        waiting_for_approval
+                        and not _assistant_has_final_delivery(full_assistant, len(persisted_artifact_ids))
+                        and not _assistant_has_substantive_answer(full_assistant, len(persisted_artifact_ids))
+                    ):
+                        final_task_status = "waiting_approval"
+                        final_task_reason = "等待用户确认工具授权"
                     db2 = SessionLocal()
                     try:
                         msg_row = MessageRecord(
@@ -5932,7 +21744,18 @@ async def session_chat_stream(
                             full_assistant,
                             prefix=f"{emp.display_name}-回复-{turn_index + 1}",
                         )
+                        artifacts.extend(_tool_artifacts_from_tool_calls(tool_call_records, source="assistant_tool_call"))
+                        artifacts.extend(_tool_artifacts_from_payload(full_assistant, source="assistant_path"))
+                        seen_artifact_keys: set[tuple[str, str, str]] = set()
                         for art in artifacts:
+                            source = art.get("source") or "assistant"
+                            dedupe_key = (art.get("source_path") or "", art.get("name") or "", art.get("content") or "")
+                            content_key = _artifact_content_key(art["name"], art.get("content") or "")
+                            if dedupe_key in seen_artifact_keys or (content_key and content_key in seen_artifact_keys):
+                                continue
+                            seen_artifact_keys.add(dedupe_key)
+                            if content_key:
+                                seen_artifact_keys.add(content_key)
                             artifact_row = TaskArtifact(
                                 tenant_id=p.tenant.id,
                                 user_id=p.user.id,
@@ -5941,8 +21764,9 @@ async def session_chat_stream(
                                 kind=art["kind"],
                                 name=art["name"],
                                 mime_type=art["mime_type"],
-                                content=art["content"],
-                                source="assistant",
+                                content=_artifact_inline_content_for_row(art),
+                                source=source,
+                                source_path=art.get("source_path") or "",
                                 run_id=session_run_id,
                                 employee_id=emp.id,
                                 version=_next_artifact_version(db2, session_id=sid, name=art["name"]),
@@ -5955,6 +21779,23 @@ async def session_chat_stream(
                             db2.add(artifact_row)
                             db2.flush()
                             persisted_artifact_ids.append(artifact_row.id)
+                        if persisted_artifact_ids and final_task_status == "running":
+                            final_task_status = "completed"
+                            final_task_reason = "assistant produced downloadable artifacts"
+                        final_task_status, final_task_reason = _validate_task_status_against_artifacts(
+                            final_task_status,
+                            final_task_reason,
+                            full_assistant,
+                            len(persisted_artifact_ids),
+                        )
+                        if (
+                            saw_runtime_stall
+                            and final_task_status == "completed"
+                            and not _assistant_has_final_delivery(full_assistant, len(persisted_artifact_ids))
+                            and not _assistant_has_substantive_answer(full_assistant, len(persisted_artifact_ids))
+                        ):
+                            final_task_status = "running"
+                            final_task_reason = "Hermes 长任务转入后台处理，Atlas 正在自动同步"
                         session_row = db2.get(SessionRecord, sid)
                         if session_row:
                             session_row.task_status = final_task_status
@@ -5972,7 +21813,7 @@ async def session_chat_stream(
                 )
 
                 async def runtime_stream():
-                    nonlocal current_hermes_run_id
+                    nonlocal current_hermes_run_id, waiting_for_approval
                     if use_run_events:
                         run = await hermes_client.create_run(
                             target,
@@ -6023,40 +21864,57 @@ async def session_chat_stream(
                         except ValueError:
                             detach_after_seconds = 900.0
                         pending_dangerous_tool: dict[str, Any] | None = None
-                        synthetic_approval_sent = False
-                        synthetic_approval_keys: set[str] = set()
                         last_event_at = datetime.now(timezone.utc)
                         while True:
                             try:
-                                wait_seconds = 8 if pending_dangerous_tool and not synthetic_approval_sent else idle_timeout_seconds
-                                run_ev = await asyncio.wait_for(run_events.__anext__(), timeout=wait_seconds)
+                                run_ev = await asyncio.wait_for(run_events.__anext__(), timeout=idle_timeout_seconds)
                                 last_event_at = datetime.now(timezone.utc)
                             except StopAsyncIteration:
+                                _schedule_detached_run_reconcile(run_id)
                                 break
                             except asyncio.TimeoutError:
-                                if pending_dangerous_tool and not synthetic_approval_sent:
-                                    synthetic_approval_sent = True
-                                    approval_payload = {
-                                        "command": pending_dangerous_tool.get("command") or "",
-                                        "description": "Hermes 工具已进入高风险等待态，需要人工确认",
-                                        "pattern_key": "openatlas synthetic dangerous terminal confirmation",
-                                        "choices": ["once", "session", "always", "deny"],
-                                        "hermes_run_id": run_id,
-                                        "source": "openatlas_timeout_guard",
-                                    }
+                                if pending_dangerous_tool:
                                     record_step_event(
-                                        "approval.required",
-                                        approval_payload,
-                                        title="等待人工确认",
-                                        summary=approval_payload["description"],
-                                        risk_level="high",
-                                        checkpoint_type="approval.required",
+                                        "openatlas.tool_waiting_diagnostic",
+                                        {**pending_dangerous_tool, "hermes_run_id": run_id},
+                                        title="工具长时间无新事件",
+                                        summary="Hermes 未发出真实审批请求，Atlas 仅记录诊断并继续后台同步。",
+                                        risk_level="medium",
+                                        checkpoint_type="stalled",
                                     )
-                                    yield {
-                                        "event": "openatlas.approval_required",
-                                        "data": approval_payload,
+                                    _schedule_detached_run_reconcile(run_id)
+                                    payload = {
+                                        "message": "工具调用长时间没有返回新事件，Atlas 会继续后台同步。若 Hermes 需要人工确认，会单独发出真实审批请求。",
+                                        "hermes_run_id": run_id,
+                                        "tool_name": pending_dangerous_tool.get("tool_name") or "",
+                                        "command": pending_dangerous_tool.get("command") or "",
                                     }
-                                    continue
+                                    mark_run_progress(
+                                        status="stalled",
+                                        node_status="stalled",
+                                        stage="runtime",
+                                        reason=payload["message"],
+                                        event_type="openatlas.tool_waiting_diagnostic",
+                                        hermes_run_id=run_id,
+                                    )
+                                    yield {"event": "openatlas.tool_waiting_diagnostic", "data": payload}
+                                    break
+                                if waiting_for_approval:
+                                    _schedule_detached_run_reconcile(run_id)
+                                    payload = {
+                                        "message": "Hermes 正在等待人工确认，Atlas 已暂停本轮执行。",
+                                        "hermes_run_id": run_id,
+                                    }
+                                    mark_run_progress(
+                                        status="waiting_approval",
+                                        node_status="waiting_approval",
+                                        stage="approval",
+                                        reason="等待用户确认工具授权",
+                                        event_type="openatlas.approval_waiting",
+                                        hermes_run_id=run_id,
+                                    )
+                                    yield {"event": "openatlas.approval_waiting", "data": payload}
+                                    break
                                 idle_for = (datetime.now(timezone.utc) - last_event_at).total_seconds()
                                 payload = {
                                     "message": (
@@ -6074,7 +21932,7 @@ async def session_chat_stream(
                                         "openatlas.run_detached",
                                         payload,
                                         title="长任务转后台",
-                                        summary="Hermes 长时间未推送新事件，OpenAtlas 转入后台补同步",
+                                        summary="Hermes 长时间未推送新事件，Atlas 转入后台监听并自动同步",
                                         risk_level="medium",
                                         checkpoint_type="stalled",
                                     )
@@ -6082,7 +21940,7 @@ async def session_chat_stream(
                                         "event": "openatlas.run_detached",
                                         "data": {
                                             **payload,
-                                            "message": "Hermes 后台可能仍在运行，OpenAtlas 已停止前端长连接等待，稍后会从 Hermes 会话补同步结果。",
+                                            "message": "Hermes 后台可能仍在运行，Atlas 已释放前端长连接，并会继续自动同步结果。",
                                         },
                                     }
                                     break
@@ -6091,8 +21949,57 @@ async def session_chat_stream(
                             ev_data = run_ev.get("data") or {}
                             if _is_approval_event(ev_name, ev_data):
                                 pending_dangerous_tool = None
-                                synthetic_approval_sent = False
                                 approval_payload = _normalize_approval_payload(ev_name, ev_data, run_id, source="hermes")
+                                approval_tool = str(
+                                    approval_payload.get("tool_name")
+                                    or ev_data.get("tool")
+                                    or ev_data.get("tool_name")
+                                    or ""
+                                )
+                                approval_command = str(approval_payload.get("command") or ev_data.get("command") or ev_data.get("preview") or "")
+                                tool_allowed, tool_block_reason = _tool_allowed_by_employee_toolsets(emp, approval_tool, approval_command)
+                                if not tool_allowed:
+                                    deny_payload = {
+                                        **approval_payload,
+                                        "blocked": True,
+                                        "reason": tool_block_reason,
+                                        "choice": "deny",
+                                    }
+                                    try:
+                                        deny_result = await hermes_client.respond_run_approval(
+                                            target,
+                                            run_id,
+                                            choice="deny",
+                                            approval_id=approval_payload.get("approval_id"),
+                                        )
+                                        deny_payload["response"] = deny_result
+                                    except Exception as exc:  # noqa: BLE001
+                                        deny_payload["deny_error"] = str(exc)[:500]
+                                    mark_run_progress(
+                                        status="running",
+                                        node_status="running",
+                                        stage="approval",
+                                        reason=tool_block_reason,
+                                        event_type="approval.denied",
+                                        hermes_run_id=run_id,
+                                    )
+                                    record_step_event(
+                                        "tool.blocked",
+                                        deny_payload,
+                                        title="工具已被权限策略阻断",
+                                        summary=tool_block_reason,
+                                        risk_level="high",
+                                        checkpoint_type="tool.blocked",
+                                    )
+                                    yield {
+                                        "event": "openatlas.tool_blocked",
+                                        "data": deny_payload,
+                                    }
+                                    yield {
+                                        "event": "openatlas.approval_responded",
+                                        "data": {"choice": "deny", "reason": tool_block_reason, "hermes_run_id": run_id},
+                                    }
+                                    continue
                                 mark_run_progress(
                                     status="waiting_approval",
                                     node_status="waiting_approval",
@@ -6113,14 +22020,17 @@ async def session_chat_stream(
                                     "event": "openatlas.approval_required",
                                     "data": approval_payload,
                                 }
+                                waiting_for_approval = True
                                 continue
                             if ev_name == "message.delta":
                                 yield {"event": "assistant.delta", "data": {"delta": ev_data.get("delta") or "", "hermes_run_id": run_id}}
                             elif ev_name == "reasoning.available":
                                 yield {"event": "openatlas.reasoning", "data": {"text": ev_data.get("text") or "", "hermes_run_id": run_id}}
                             elif ev_name == "approval.responded":
+                                waiting_for_approval = False
                                 yield {"event": "openatlas.approval_responded", "data": {**ev_data, "hermes_run_id": run_id}}
                             elif ev_name == "tool.started":
+                                observed_started_at = datetime.now(timezone.utc)
                                 preview = str(ev_data.get("preview") or ev_data.get("command") or "")
                                 tool_name = str(ev_data.get("tool") or ev_data.get("tool_name") or "tool")
                                 tool_call_id = ev_data.get("tool_call_id") or ev_data.get("id")
@@ -6133,53 +22043,87 @@ async def session_chat_stream(
                                     "preview": preview,
                                     "command": ev_data.get("command") or preview,
                                     "hermes_run_id": run_id,
+                                    "started_at": observed_started_at.isoformat(),
                                 }
-                                if _is_approval_sensitive_tool(tool_name):
-                                    pending_dangerous_tool = {"command": tool_started_payload.get("command") or preview, "tool_name": tool_name}
+                                if tool_call_id:
+                                    active_tool_payloads[f"id:{tool_call_id}"] = tool_started_payload
+                                active_tool_payloads[f"name:{tool_name}"] = tool_started_payload
+                                tool_allowed, tool_block_reason = _tool_allowed_by_employee_toolsets(
+                                    emp,
+                                    tool_name,
+                                    str(tool_started_payload.get("command") or preview),
+                                )
+                                if _is_approval_sensitive_tool(tool_name) and tool_allowed:
+                                    pending_dangerous_tool = {
+                                        "command": tool_started_payload.get("command") or preview,
+                                        "tool_name": tool_name,
+                                        "blocked_reason": "",
+                                    }
+                                elif _is_approval_sensitive_tool(tool_name):
+                                    pending_dangerous_tool = None
                                 yield {"event": "tool.started", "data": tool_started_payload}
-                                if _is_approval_sensitive_tool(tool_name) and os.environ.get("OPENATLAS_APPROVE_EXEC_TOOLS", "1") != "0":
-                                    approval_key = f"{run_id}:{tool_call_id or tool_name}:{tool_started_payload.get('command') or preview}"
-                                    if approval_key not in synthetic_approval_keys:
-                                        synthetic_approval_keys.add(approval_key)
-                                        synthetic_approval_sent = True
-                                        mark_run_progress(
-                                            status="waiting_approval",
-                                            node_status="waiting_approval",
-                                            stage="approval",
-                                            reason="等待用户确认工具调用",
-                                            event_type="openatlas.approval_required",
-                                            hermes_run_id=run_id,
-                                        )
-                                        approval_payload = _normalize_approval_payload(
-                                            "openatlas.synthetic_tool_approval",
-                                            tool_started_payload,
-                                            run_id,
-                                            source="openatlas_exec_tool_guard",
-                                        )
-                                        record_step_event(
-                                            "approval.required",
-                                            approval_payload,
-                                            title="等待工具授权",
-                                            summary=str(approval_payload.get("description") or approval_payload.get("command") or "等待用户确认工具调用"),
-                                            risk_level="high",
-                                            checkpoint_type="approval.required",
-                                        )
-                                        yield {
-                                            "event": "openatlas.approval_required",
-                                            "data": approval_payload,
-                                        }
+                                if _is_approval_sensitive_tool(tool_name) and not tool_allowed:
+                                    blocked_payload = {
+                                        **tool_started_payload,
+                                        "blocked": True,
+                                        "reason": tool_block_reason,
+                                    }
+                                    record_step_event(
+                                        "tool.blocked",
+                                        blocked_payload,
+                                        title="工具已被权限策略阻断",
+                                        summary=tool_block_reason,
+                                        risk_level="high",
+                                        checkpoint_type="tool.blocked",
+                                    )
+                                    yield {
+                                        "event": "openatlas.tool_blocked",
+                                        "data": blocked_payload,
+                                    }
                             elif ev_name == "tool.completed":
+                                observed_completed_at = datetime.now(timezone.utc)
                                 pending_dangerous_tool = None
-                                yield {"event": "tool.failed" if ev_data.get("error") else "tool.completed", "data": {
-                                    **ev_data,
-                                    "tool_name": ev_data.get("tool") or ev_data.get("tool_name") or "tool",
-                                    "label": ev_data.get("label") or ev_data.get("tool") or "",
-                                    "tool_call_id": ev_data.get("tool_call_id") or ev_data.get("id"),
-                                    "args": ev_data.get("args") or ev_data.get("input") or ev_data.get("parameters"),
-                                    "result": ev_data.get("result") or ev_data.get("output"),
-                                    "error": ev_data.get("error"),
-                                    "duration": ev_data.get("duration"),
+                                waiting_for_approval = False
+                                emitted_tool_name = str(ev_data.get("tool") or ev_data.get("tool_name") or "tool")
+                                completed_call_id = ev_data.get("tool_call_id") or ev_data.get("id")
+                                started_payload = (
+                                    active_tool_payloads.get(f"id:{completed_call_id}")
+                                    if completed_call_id else None
+                                ) or active_tool_payloads.get(f"name:{emitted_tool_name}") or {}
+                                completed_payload = {**started_payload, **ev_data}
+                                for key in ("command", "preview", "label", "args"):
+                                    if not completed_payload.get(key) and started_payload.get(key):
+                                        completed_payload[key] = started_payload[key]
+                                tool_error = _tool_error_text(completed_payload) if completed_payload.get("error") else None
+                                non_blocking_skill_lookup = bool(tool_error) and _is_bound_openatlas_skill_lookup_failure(
+                                    emitted_tool_name,
+                                    completed_payload,
+                                    skill_evidence,
+                                )
+                                observed_wait_ms = None
+                                observed_started_at_raw = completed_payload.get("started_at")
+                                if isinstance(observed_started_at_raw, str) and observed_started_at_raw:
+                                    try:
+                                        observed_started_at = datetime.fromisoformat(observed_started_at_raw.replace("Z", "+00:00"))
+                                        observed_wait_ms = max(0, int((observed_completed_at - observed_started_at).total_seconds() * 1000))
+                                    except Exception:
+                                        observed_wait_ms = None
+                                yield {"event": "tool.completed" if non_blocking_skill_lookup or not completed_payload.get("error") else "tool.failed", "data": {
+                                    **completed_payload,
+                                    "tool_name": emitted_tool_name,
+                                    "label": completed_payload.get("label") or completed_payload.get("preview") or completed_payload.get("tool") or "",
+                                    "tool_call_id": completed_call_id,
+                                    "args": completed_payload.get("args") or completed_payload.get("input") or completed_payload.get("parameters"),
+                                    "result": completed_payload.get("result") or completed_payload.get("output"),
+                                    "error": False if non_blocking_skill_lookup else (tool_error or completed_payload.get("error")),
+                                    "warning": (
+                                        "OpenAtlas 已注入该 Skill 指令，Hermes 原生 skill_view 查询失败不影响继续执行。"
+                                        if non_blocking_skill_lookup else completed_payload.get("warning")
+                                    ),
+                                    "duration": completed_payload.get("duration"),
                                     "hermes_run_id": run_id,
+                                    "completed_at": observed_completed_at.isoformat(),
+                                    "wait_duration_ms": observed_wait_ms,
                                 }}
                             elif ev_name == "run.failed":
                                 yield {"event": "error", "data": {"message": ev_data.get("error") or "Hermes run failed", "hermes_run_id": run_id}}
@@ -6200,24 +22144,30 @@ async def session_chat_stream(
                     completed_fallback = ""
                     if name in {"openatlas.run_detached", "openatlas.run_idle"}:
                         runtime_detached = True
+                        saw_runtime_stall = True
                         detached_run_id = ""
                         if isinstance(data, dict):
                             detached_run_id = str(data.get("hermes_run_id") or data.get("run_id") or "")
-                        if name == "openatlas.run_detached":
-                            _schedule_detached_run_reconcile(detached_run_id or current_hermes_run_id)
+                        # A number of Hermes gateways close the event stream
+                        # immediately after an idle heartbeat instead of
+                        # waiting for our longer detach threshold. Start the
+                        # reconcile watcher on every idle signal so late
+                        # assistant output/files are imported without requiring
+                        # a manual "同步最新结果" click.
+                        _schedule_detached_run_reconcile(detached_run_id or current_hermes_run_id)
                         mark_run_progress(
                             status="stalled",
                             node_status="stalled",
                             stage="runtime",
-                            reason="Hermes 长时间未推送新事件，等待后台补同步",
+                            reason="Hermes 长时间未推送新事件，Atlas 正在后台监听并自动同步",
                             event_type=name,
                             hermes_run_id=detached_run_id or current_hermes_run_id,
                         )
                         record_step_event(
                             name,
                             data if isinstance(data, dict) else {"message": str(data)},
-                            title="长任务停滞",
-                            summary="Hermes 长时间未推送新事件，OpenAtlas 已保留检查点并等待补同步",
+                            title="长任务后台处理中",
+                            summary="Hermes 长时间未推送新事件，Atlas 已保留检查点并继续监听；这不等于失败",
                             risk_level="medium",
                             checkpoint_type="stalled",
                         )
@@ -6274,8 +22224,56 @@ async def session_chat_stream(
                             summary=str(data.get("choice") or data.get("status") or "用户已处理审批"),
                             checkpoint_type="approval.resolved",
                         )
+                    if name == "error":
+                        if isinstance(data, dict):
+                            runtime_error_message = str(data.get("message") or data.get("error") or "Hermes runtime error")
+                            error_payload = data
+                        else:
+                            runtime_error_message = str(data or "Hermes runtime error")
+                            error_payload = {"message": runtime_error_message}
+                        quota_limited = _is_quota_or_rate_limit_error(runtime_error_message)
+                        if quota_limited:
+                            runtime_error_message = _quota_waiting_reason(runtime_error_message)
+                            error_payload = {
+                                **(error_payload if isinstance(error_payload, dict) else {}),
+                                "message": runtime_error_message,
+                                "task_status": "quota_waiting",
+                                "retry_after_seconds": OPENATLAS_QUOTA_RETRY_AFTER_SECONDS,
+                            }
+                        mark_run_progress(
+                            status="quota_waiting" if quota_limited else "failed",
+                            node_status="quota_waiting" if quota_limited else "failed",
+                            stage="quota" if quota_limited else "runtime",
+                            reason=runtime_error_message,
+                            event_type="runtime.quota_waiting" if quota_limited else name,
+                            hermes_run_id=current_hermes_run_id,
+                            error=None if quota_limited else runtime_error_message,
+                            payload_patch={"retry_after_seconds": OPENATLAS_QUOTA_RETRY_AFTER_SECONDS} if quota_limited else None,
+                        )
+                        record_step_event(
+                            "runtime.quota_waiting" if quota_limited else "runtime.error",
+                            error_payload,
+                            title="限流等待" if quota_limited else "运行失败",
+                            summary=runtime_error_message,
+                            risk_level="medium" if quota_limited else "high",
+                            checkpoint_type="runtime.quota_waiting" if quota_limited else "runtime.error",
+                        )
+                        if quota_limited:
+                            db_quota_error = SessionLocal()
+                            try:
+                                session_row = db_quota_error.get(SessionRecord, rec.id)
+                                if session_row:
+                                    session_row.task_status = "quota_waiting"
+                                    session_row.task_summary = runtime_error_message
+                                    session_row.updated_at = datetime.now(timezone.utc)
+                                db_quota_error.commit()
+                            finally:
+                                db_quota_error.close()
+                            yield task_state_event("quota_waiting", runtime_error_message, speaker)
                     if name.startswith("tool."):
                         tool_payload = data if isinstance(data, dict) else {}
+                        if name == "tool.failed" and _tool_error_is_false_marker(tool_payload.get("error")):
+                            name = "tool.completed"
                         raw_call_id = (
                             tool_payload.get("tool_call_id")
                             or tool_payload.get("id")
@@ -6307,6 +22305,9 @@ async def session_chat_stream(
                             "result": tool_payload.get("result"),
                             "error": tool_payload.get("error"),
                             "duration": tool_payload.get("duration"),
+                            "wait_duration_ms": tool_payload.get("wait_duration_ms"),
+                            "started_at": tool_payload.get("started_at"),
+                            "completed_at": tool_payload.get("completed_at"),
                             "preview": tool_payload.get("preview"),
                             "command": tool_payload.get("command"),
                             "hermes_run_id": tool_payload.get("hermes_run_id"),
@@ -6350,6 +22351,10 @@ async def session_chat_stream(
                             )
                             if live_artifacts:
                                 live_artifact_ids = [str(a.get("id")) for a in live_artifacts if a.get("id")]
+                                for artifact_id in live_artifact_ids:
+                                    if artifact_id not in persisted_artifact_ids:
+                                        persisted_artifact_ids.append(artifact_id)
+                                    emitted_artifact_ids.add(artifact_id)
                                 mark_run_progress(
                                     status="running",
                                     node_status="running",
@@ -6377,6 +22382,15 @@ async def session_chat_stream(
                                 yield (
                                     "event: openatlas.artifacts\n"
                                     f"data: {json.dumps({**speaker, 'items': live_artifacts}, ensure_ascii=False)}\n\n"
+                                )
+                                _publish_session_event(
+                                    sid,
+                                    "session.updated",
+                                    {
+                                        "reason": "tool_artifacts.created",
+                                        "artifact_ids": live_artifact_ids,
+                                        "openatlas_session_id": sess_marker,
+                                    },
                                 )
                                 _record_canvas_runtime_event(
                                     tenant_id=p.tenant.id,
@@ -6410,25 +22424,48 @@ async def session_chat_stream(
                             status="failed" if name == "tool.failed" else "running",
                             node_status="failed" if name == "tool.failed" else "running",
                             stage="tool",
-                            reason=str(tool_payload.get("error") or tool_payload.get("label") or tool_payload.get("tool_name") or tool_payload.get("name") or ""),
+                            reason=str((_tool_error_text(tool_payload) if name == "tool.failed" else None) or tool_payload.get("label") or tool_payload.get("tool_name") or tool_payload.get("name") or ""),
                             event_type=name,
                             hermes_run_id=current_hermes_run_id or tool_payload.get("hermes_run_id"),
-                            error=str(tool_payload.get("error") or "") if name == "tool.failed" else None,
+                            error=_tool_error_text(tool_payload) if name == "tool.failed" else None,
                         )
                         record_step_event(
                             name,
                             tool_payload,
                             title=f"工具: {tool_name}",
-                            summary=str(tool_payload.get("error") or tool_payload.get("label") or tool_payload.get("preview") or tool_payload.get("command") or tool_name),
+                            summary=str((_tool_error_text(tool_payload) if name == "tool.failed" else None) or tool_payload.get("label") or tool_payload.get("preview") or tool_payload.get("command") or tool_name),
                             risk_level="high" if _is_approval_sensitive_tool(tool_name) else "low",
                             tool_name=tool_name,
                             checkpoint_type=("tool.completed" if name == "tool.completed" else "tool.failed" if name == "tool.failed" else None),
                         )
                     if name in ("run.completed", "done"):
                         persist_assistant_once()
+                        new_artifact_items = load_new_persisted_artifacts()
+                        if new_artifact_items:
+                            yield trace_event(
+                                "artifact",
+                                "交付物入库",
+                                f"从最终回复登记 {len(new_artifact_items)} 个交付物",
+                                speaker,
+                                artifact_count=len(new_artifact_items),
+                            )
+                            yield (
+                                "event: openatlas.artifacts\n"
+                                f"data: {json.dumps({**speaker, 'items': new_artifact_items}, ensure_ascii=False)}\n\n"
+                            )
+                            _publish_session_event(
+                                sid,
+                                "session.updated",
+                                {
+                                    "reason": "assistant_artifacts.created",
+                                    "artifact_ids": [str(item.get("id")) for item in new_artifact_items if item.get("id")],
+                                    "openatlas_session_id": sess_marker,
+                                },
+                            )
                         done_status = "completed" if final_task_status == "completed" else (
                             "waiting_input" if final_task_status == "needs_input" else final_task_status
                         )
+                        waiting_approval_done = done_status == "waiting_approval"
                         mark_run_progress(
                             status=done_status,
                             node_status="done" if done_status == "completed" else done_status,
@@ -6440,13 +22477,13 @@ async def session_chat_stream(
                             output_summary="".join(assistant_text_parts)[:1000],
                         )
                         record_step_event(
-                            "node.completed" if done_status == "completed" else "node.waiting_input",
+                            "node.completed" if done_status == "completed" else "node.waiting_approval" if waiting_approval_done else "node.waiting_input",
                             {"runtime_event": name, "task_status": final_task_status, "reason": final_task_reason},
-                            title="节点完成" if done_status == "completed" else "节点等待补充",
-                            summary=final_task_reason or ("节点已完成" if done_status == "completed" else "节点需要补充信息"),
+                            title="节点完成" if done_status == "completed" else "节点等待授权" if waiting_approval_done else "节点等待补充",
+                            summary=final_task_reason or ("节点已完成" if done_status == "completed" else "节点等待用户确认授权" if waiting_approval_done else "节点需要补充信息"),
                             output_summary="".join(assistant_text_parts)[:1000],
                             artifact_ids=persisted_artifact_ids,
-                            checkpoint_type="node.completed" if done_status == "completed" else "node.waiting_input",
+                            checkpoint_type="node.completed" if done_status == "completed" else "node.waiting_approval" if waiting_approval_done else "node.waiting_input",
                         )
                     if isinstance(data, dict):
                         data = {**data, **speaker}
@@ -6454,7 +22491,8 @@ async def session_chat_stream(
                         data_str = json.dumps(data, ensure_ascii=False)
                     else:
                         data_str = str(data)
-                    yield f"event: {name}\ndata: {data_str}\n\n"
+                    outbound_name = "run.completed" if name == "done" else name
+                    yield f"event: {outbound_name}\ndata: {data_str}\n\n"
                     if name in ("run.completed", "done"):
                         break
 
@@ -6470,16 +22508,38 @@ async def session_chat_stream(
                         db_detached.close()
                     yield trace_event(
                         "runtime",
-                        "后台继续运行",
-                        "Hermes 长时间未推送新事件，前端已停止等待；稍后打开历史会话会自动补同步最终结果。",
+                        "后台继续处理",
+                        "Hermes 长时间未推送新事件，前端长连接已释放；Atlas 会继续后台监听并自动同步最终结果。",
                         speaker,
                         detached=True,
                     )
-                    yield task_state_event("running", "Hermes 后台仍在运行，等待补同步", speaker)
+                    yield task_state_event("running", "Hermes 后台仍在运行，Atlas 正在自动同步", speaker)
                     yield f"event: done\ndata: {json.dumps({'openatlas_session_id': sess_marker, 'detached': True}, ensure_ascii=False)}\n\n"
                     return
 
                 persist_assistant_once()
+                new_artifact_items = load_new_persisted_artifacts()
+                if new_artifact_items:
+                    yield trace_event(
+                        "artifact",
+                        "交付物入库",
+                        f"从最终回复登记 {len(new_artifact_items)} 个交付物",
+                        speaker,
+                        artifact_count=len(new_artifact_items),
+                    )
+                    yield (
+                        "event: openatlas.artifacts\n"
+                        f"data: {json.dumps({**speaker, 'items': new_artifact_items}, ensure_ascii=False)}\n\n"
+                    )
+                    _publish_session_event(
+                        sid,
+                        "session.updated",
+                        {
+                            "reason": "assistant_artifacts.created",
+                            "artifact_ids": [str(item.get("id")) for item in new_artifact_items if item.get("id")],
+                            "openatlas_session_id": sess_marker,
+                        },
+                    )
                 full = "".join(assistant_text_parts).strip()
                 if full:
                     relay_outputs.append(f"{emp.display_name}:\n{full}")
@@ -6513,9 +22573,29 @@ async def session_chat_stream(
                     node_rows = db_wf_done.query(WorkflowNodeRun).filter(
                         WorkflowNodeRun.workflow_run_id == wf.id,
                     ).all()
+                    node_run_ids = [n.run_id for n in node_rows if n.run_id]
+                    run_q = db_wf_done.query(SessionRun).filter(
+                        SessionRun.session_id == wf.session_id,
+                        SessionRun.tenant_id == wf.tenant_id,
+                    )
+                    if node_run_ids:
+                        run_rows = run_q.filter(SessionRun.id.in_(node_run_ids)).all()
+                    else:
+                        latest_run = run_q.order_by(SessionRun.created_at.desc()).first()
+                        run_rows = [latest_run] if latest_run else []
                     has_failed = any(n.status == "failed" for n in node_rows)
+                    has_stalled = any(n.status == "stalled" for n in node_rows) or any(r.status == "stalled" for r in run_rows)
+                    has_quota_waiting = any(n.status == "quota_waiting" for n in node_rows) or any(r.status == "quota_waiting" for r in run_rows)
                     has_waiting = any(n.status in {"waiting_approval", "waiting_input"} for n in node_rows)
-                    wf.status = "failed" if has_failed else "waiting_input" if has_waiting else "completed"
+                    has_running = any(n.status in {"running", "idle"} for n in node_rows) or any(r.status == "running" for r in run_rows)
+                    wf.status = (
+                        "failed" if has_failed
+                        else "quota_waiting" if has_quota_waiting
+                        else "stalled" if has_stalled
+                        else "waiting_input" if has_waiting
+                        else "running" if has_running
+                        else "completed"
+                    )
                     wf.completed_at = datetime.now(timezone.utc) if wf.status in {"completed", "failed"} else None
                     wf.summary = f"协作运行结束: {len(node_rows)} 个节点，状态 {wf.status}"
                     wf.updated_at = datetime.now(timezone.utc)
@@ -6524,24 +22604,147 @@ async def session_chat_stream(
                 db_wf_done.close()
             yield trace_event("done", "任务流结束", "本轮会话执行完成")
             yield f"event: done\ndata: {json.dumps({'openatlas_session_id': sess_marker}, ensure_ascii=False)}\n\n"
+        except asyncio.CancelledError:
+            # Browser navigation/session switching can close the SSE connection
+            # while Hermes is still working. Treat that as "background sync",
+            # not as task cancellation; only the explicit stop API should cancel.
+            run_id = str(locals().get("current_hermes_run_id") or "")
+            session_run_id_cancel = str(locals().get("session_run_id") or "")
+            node_run_id_cancel = str(locals().get("current_node_run_id") or "")
+            reason = "前端连接已断开，Atlas 已转入后台监听并自动同步结果。"
+            if run_id:
+                _schedule_detached_run_reconcile(run_id)
+            db_cancel = SessionLocal()
+            try:
+                session_row = db_cancel.get(SessionRecord, rec.id)
+                if session_row and session_row.task_status not in {"completed", "failed", "stopped", "cancelled"}:
+                    session_row.task_status = "running"
+                    session_row.task_summary = reason
+                    session_row.updated_at = datetime.now(timezone.utc)
+                run_row = db_cancel.get(SessionRun, session_run_id_cancel) if session_run_id_cancel else None
+                if not run_row:
+                    run_row = db_cancel.query(SessionRun).filter(
+                        SessionRun.session_id == rec.id,
+                        SessionRun.tenant_id == p.tenant.id,
+                        SessionRun.status.in_(RUNTIME_OPEN_RUN_STATUSES | {"quota_waiting"}),
+                    ).order_by(SessionRun.created_at.desc()).first()
+                if run_row:
+                    _update_session_run(
+                        db_cancel,
+                        run_row.id,
+                        status="stalled",
+                        stage="runtime",
+                        reason=reason,
+                        event_type="openatlas.client_disconnected",
+                        hermes_run_id=run_id or None,
+                    )
+                node_row = db_cancel.get(WorkflowNodeRun, node_run_id_cancel) if node_run_id_cancel else None
+                if not node_row:
+                    node_row = db_cancel.query(WorkflowNodeRun).filter(
+                        WorkflowNodeRun.session_id == rec.id,
+                        WorkflowNodeRun.tenant_id == p.tenant.id,
+                        WorkflowNodeRun.status.in_({"running", "idle", "waiting_approval", "waiting_input", "stalled", "quota_waiting"}),
+                    ).order_by(WorkflowNodeRun.updated_at.desc()).first()
+                if node_row:
+                    node_row.status = "stalled"
+                    node_row.output_summary = reason
+                    node_row.updated_at = datetime.now(timezone.utc)
+                    if run_id:
+                        node_row.hermes_run_id = run_id[:128]
+                wf = db_cancel.get(WorkflowRun, workflow_run_id)
+                if wf and wf.status not in {"completed", "failed", "stopped", "cancelled"}:
+                    wf.status = "stalled"
+                    wf.summary = reason
+                    wf.updated_at = datetime.now(timezone.utc)
+                db_cancel.commit()
+            except Exception:
+                db_cancel.rollback()
+            finally:
+                db_cancel.close()
+            _record_workflow_step_safely(
+                tenant_id=p.tenant.id,
+                user_id=p.user.id,
+                session_id=rec.id,
+                workflow_run_id=workflow_run_id,
+                workflow_node_run_id=node_run_id_cancel or None,
+                employee_id=(locals().get("emp").id if locals().get("emp") is not None else None),
+                event_type="openatlas.client_disconnected",
+                title="前端连接断开",
+                summary=reason,
+                input_summary=body.message[:1000],
+                payload={"hermes_run_id": run_id, "session_run_id": session_run_id_cancel},
+                risk_level="medium",
+                checkpoint_type="stalled",
+                hermes_session_id=rec.hermes_session_id,
+                hermes_run_id=run_id,
+            )
+            raise
         except Exception as e:
+            err_text = str(e)[:1000]
+            quota_limited = _is_quota_or_rate_limit_error(err_text)
+            runtime_transient = (not quota_limited) and _is_runtime_transient_error(err_text)
+            err_status = "quota_waiting" if quota_limited else "stalled" if runtime_transient else "failed"
+            err_reason = (
+                _quota_waiting_reason(err_text)
+                if quota_limited else
+                "Hermes Gateway 连接中断或运行时重启，本轮任务已保留检查点；Atlas 会继续允许同步/恢复，请稍后重试或从会话中继续。"
+                if runtime_transient else
+                err_text
+            )
             db_err = SessionLocal()
             try:
                 session_row = db_err.get(SessionRecord, rec.id)
                 if session_row:
-                    session_row.task_status = "failed"
+                    session_row.task_status = err_status
+                    session_row.task_summary = err_reason
                     session_row.updated_at = datetime.now(timezone.utc)
+                latest_run = db_err.query(SessionRun).filter(
+                    SessionRun.session_id == rec.id,
+                    SessionRun.tenant_id == p.tenant.id,
+                ).order_by(SessionRun.created_at.desc()).first()
+                if latest_run and latest_run.status in RUNTIME_OPEN_RUN_STATUSES | {"quota_waiting"}:
+                    latest_run.status = err_status
+                    latest_run.stage = "quota" if quota_limited else "runtime"
+                    latest_run.reason = err_reason
+                    latest_run.last_event_type = (
+                        "runtime.quota_waiting"
+                        if quota_limited else
+                        "openatlas.runtime_disconnected"
+                        if runtime_transient else
+                        "runtime.error"
+                    )
+                    latest_run.updated_at = datetime.now(timezone.utc)
+                    if err_status in {"failed", "cancelled", "completed"}:
+                        latest_run.completed_at = datetime.now(timezone.utc)
+                latest_node = db_err.query(WorkflowNodeRun).filter(
+                    WorkflowNodeRun.session_id == rec.id,
+                    WorkflowNodeRun.tenant_id == p.tenant.id,
+                ).order_by(WorkflowNodeRun.updated_at.desc()).first()
+                if latest_node and latest_node.status in {"running", "idle", "waiting_approval", "waiting_input", "stalled", "quota_waiting"}:
+                    latest_node.status = err_status
+                    latest_node.error = "" if err_status != "failed" else err_reason
+                    latest_node.output_summary = err_reason
+                    latest_node.updated_at = datetime.now(timezone.utc)
                 wf = db_err.get(WorkflowRun, workflow_run_id)
                 if wf:
-                    wf.status = "failed"
-                    wf.summary = str(e)[:1000]
-                    wf.completed_at = datetime.now(timezone.utc)
+                    wf.status = err_status
+                    wf.summary = err_reason
+                    wf.completed_at = datetime.now(timezone.utc) if err_status == "failed" else None
                     wf.updated_at = datetime.now(timezone.utc)
                 db_err.commit()
             finally:
                 db_err.close()
-            yield task_state_event("failed", str(e)[:500])
-            yield f"event: error\ndata: {json.dumps({'message': str(e), 'openatlas_session_id': sess_marker}, ensure_ascii=False)}\n\n"
+            yield task_state_event(err_status, err_reason[:500])
+            event_name = (
+                "openatlas.quota_waiting"
+                if quota_limited else
+                "openatlas.run_detached"
+                if runtime_transient else
+                "error"
+            )
+            yield f"event: {event_name}\ndata: {json.dumps({'message': err_reason, 'task_status': err_status, 'openatlas_session_id': sess_marker, 'retry_after_seconds': OPENATLAS_QUOTA_RETRY_AFTER_SECONDS if quota_limited else None}, ensure_ascii=False)}\n\n"
+            if runtime_transient:
+                yield f"event: done\ndata: {json.dumps({'openatlas_session_id': sess_marker, 'detached': True}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -6833,7 +23036,9 @@ def _parse_interval_seconds(expr: str) -> int:
 
 
 def _compute_next_job_run_at(kind: str, expr: str, *, after: datetime | None = None) -> datetime | None:
-    base = after or datetime.utcnow()
+    base = after or datetime.now(timezone.utc)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=timezone.utc)
     kind = (kind or "cron").strip().lower()
     expr = (expr or "").strip()
     if kind == "once":
@@ -6842,7 +23047,9 @@ def _compute_next_job_run_at(kind: str, expr: str, *, after: datetime | None = N
         try:
             dt = datetime.fromisoformat(expr.replace("Z", "+00:00"))
             if dt.tzinfo is not None:
-                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                dt = dt.astimezone(timezone.utc)
+            else:
+                dt = dt.replace(tzinfo=timezone.utc)
             return dt if dt > base else base
         except Exception as exc:
             raise HTTPException(400, "once schedule_expr must be ISO datetime or now") from exc
@@ -6881,7 +23088,7 @@ async def _execute_job_once(db: Session, j: Job, *, request: Request | None = No
     hermes_sid = sess.get("id") or sess.get("session_id")
     if not hermes_sid:
         raise HTTPException(502, "hermes did not return a session id")
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     j.last_run_at = now
     try:
         last_text: list[str] = []
@@ -6926,7 +23133,7 @@ async def _job_scheduler_loop() -> None:
         await asyncio.sleep(max(5.0, interval))
         if os.environ.get("OPENATLAS_DISABLE_JOB_SCHEDULER") == "1":
             continue
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         with SessionLocal() as db:
             due = db.query(Job).filter(
                 Job.status == JobStatus.active,
@@ -7017,6 +23224,7 @@ def list_jobs(
 ) -> dict:
     """Phase 3.5 — list this tenant's local Jobs. (Hermes-side jobs are
     ignored; OpenAtlas owns the schedule. See DELIVERY-PHASE-3.5 §4.)"""
+    _require_tenant_admin(p, "job management")
     rows = db.query(Job).filter(Job.tenant_id == p.tenant.id)\
         .order_by(Job.created_at.desc()).all()
     return {"items": [_job_to_dict(j) for j in rows]}
@@ -7027,6 +23235,7 @@ def create_job(
     body: JobIn, request: Request,
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
+    _require_tenant_admin(p, "job management")
     if body.employee_id:
         emp = db.get(DigitalEmployee, body.employee_id)
         if not emp or emp.tenant_id != p.tenant.id:
@@ -7054,6 +23263,7 @@ def create_job(
 def get_job(
     job_id: str, p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
+    _require_tenant_admin(p, "job management")
     j = db.get(Job, job_id)
     if not j or j.tenant_id != p.tenant.id:
         raise HTTPException(404, "job not found")
@@ -7065,6 +23275,7 @@ def patch_job(
     job_id: str, body: JobPatchIn, request: Request,
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
+    _require_tenant_admin(p, "job management")
     j = db.get(Job, job_id)
     if not j or j.tenant_id != p.tenant.id:
         raise HTTPException(404, "job not found")
@@ -7094,6 +23305,7 @@ def delete_job(
     job_id: str, request: Request,
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
+    _require_tenant_admin(p, "job management")
     j = db.get(Job, job_id)
     if not j or j.tenant_id != p.tenant.id:
         raise HTTPException(404, "job not found")
@@ -7109,6 +23321,7 @@ def pause_job(
     job_id: str, request: Request,
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
+    _require_tenant_admin(p, "job management")
     j = db.get(Job, job_id)
     if not j or j.tenant_id != p.tenant.id:
         raise HTTPException(404, "job not found")
@@ -7124,11 +23337,12 @@ def resume_job(
     job_id: str, request: Request,
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
+    _require_tenant_admin(p, "job management")
     j = db.get(Job, job_id)
     if not j or j.tenant_id != p.tenant.id:
         raise HTTPException(404, "job not found")
     j.status = JobStatus.active
-    if not j.next_run_at or j.next_run_at <= datetime.utcnow():
+    if not j.next_run_at or j.next_run_at <= datetime.now(timezone.utc):
         _refresh_job_next_run(j)
     audit(db, principal=p, action="job.resume", resource_type="job",
           resource_id=j.id, request=request)
@@ -7145,6 +23359,7 @@ async def run_job(
     Hermes, sends the job prompt, and records the outcome. Returns a
     summary; the actual stream is consumed and discarded (this is a
     background-style trigger, not a UI chat)."""
+    _require_tenant_admin(p, "job management")
     j = db.get(Job, job_id)
     if not j or j.tenant_id != p.tenant.id:
         raise HTTPException(404, "job not found")
@@ -7541,6 +23756,8 @@ def remove_hermes_skill_tap(
 @app.get("/api/skill-market")
 async def list_market(
     scope: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    query: str | None = Query(default=None, alias="q"),
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
     sync_error = ""
@@ -7556,6 +23773,18 @@ async def list_market(
     )
     if scope:
         q = q.where(SkillPackage.scope == Scope(scope))
+    keyword = (search or query or "").strip()
+    if keyword:
+        pattern = f"%{keyword}%"
+        q = q.where(or_(
+            SkillPackage.name.ilike(pattern),
+            SkillPackage.slug.ilike(pattern),
+            SkillPackage.description.ilike(pattern),
+            SkillPackage.category.ilike(pattern),
+            SkillPackage.version.ilike(pattern),
+            SkillPackage.source_ref.ilike(pattern),
+            SkillPackage.status.ilike(pattern),
+        ))
     rows = db.execute(q.order_by(SkillPackage.scope, SkillPackage.name)).scalars().all()
     rows = _dedupe_skill_rows(rows)
     rows.sort(key=lambda s: (
@@ -7682,6 +23911,8 @@ def create_skill(
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
     # Permission: global only by system_admin; tenant by tenant_admin; user by self
+    if p.user.role == UserRole.user:
+        raise HTTPException(403, "skill authoring requires tenant_admin")
     if body.scope == Scope.global_ and p.user.role != UserRole.system_admin:
         raise HTTPException(403, "only system_admin can publish global skills")
     if body.scope == Scope.tenant and p.user.role not in (UserRole.tenant_admin, UserRole.system_admin):
@@ -7693,6 +23924,10 @@ def create_skill(
         name=body.name, slug=body.slug, description=body.description,
         category=body.category, version=body.version,
         visibility=body.visibility, mutable=body.mutable,
+        system_prompt=body.system_prompt,
+        input_schema=body.input_schema,
+        output_schema=body.output_schema,
+        few_shot_examples=body.few_shot_examples,
         created_by=p.user.id,
     )
     db.add(s)
@@ -7765,6 +24000,7 @@ async def import_skill_zip(
     request: Request,
     file: UploadFile = File(...),
     scope: str = "user",
+    upsert: bool = False,
     p: Principal = Depends(get_principal),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -7778,9 +24014,13 @@ async def import_skill_zip(
     Behavior:
       - Extracts to OPENATLAS_HOME/tenant-skills/{tenant_slug}/{skill_slug}/
       - scope: 'user' (default, anyone) | 'tenant' (tenant_admin+ only)
-      - duplicate (name+version already in this tenant) → 409
+      - duplicate (slug/name+version already in this tenant) → 409 unless upsert=1
+      - upsert=1 migrates bindings from older duplicate metadata rows into the
+        selected SKILL.md package row, then disables those duplicate rows.
     """
     # ── Permission
+    if p.user.role == UserRole.user:
+        raise HTTPException(403, "skill import requires tenant_admin")
     if scope == "global":
         if p.user.role != UserRole.system_admin:
             raise HTTPException(403, "only system_admin can import global skills")
@@ -7824,15 +24064,16 @@ async def import_skill_zip(
         zf.close()
         raise HTTPException(400, "SKILL.md frontmatter missing required field: version")
 
-    skill_name = str(meta["name"]).strip()
+    skill_identifier = str(meta["name"]).strip()
+    skill_display_name = str(meta.get("display_name") or meta.get("title") or skill_identifier).strip()
     skill_version = str(meta["version"]).strip()
     skill_desc = str(meta.get("description", "")).strip()
     skill_category = str(meta.get("category", "general")).strip() or "general"
-    if not skill_name:
+    if not skill_identifier:
         zf.close()
         raise HTTPException(400, "skill name is empty")
 
-    skill_slug = _slugify_zip_skill(skill_name)
+    skill_slug = _slugify_zip_skill(skill_identifier)
 
     # ── Zip-slip check: every member path must resolve inside target dir
     base_extract = (
@@ -7847,46 +24088,116 @@ async def import_skill_zip(
             zf.close()
             raise HTTPException(400, f"zip-slip detected: '{member}' escapes target dir")
 
-    # ── Duplicate check (name+version, scoped to tenant)
-    existing = db.execute(
+    # ── Duplicate check (slug/name+version, scoped to tenant)
+    duplicate_rows = db.execute(
         select(SkillPackage).where(
-            SkillPackage.name == skill_name,
             SkillPackage.version == skill_version,
+            or_(
+                SkillPackage.slug == skill_slug,
+                SkillPackage.name == skill_identifier,
+                SkillPackage.name == skill_display_name,
+            ),
         )
-    ).scalar_one_or_none()
-    if existing:
-        # Also check that this tenant has access / owns the same name+version
-        if (existing.owner_tenant_id == p.tenant.id) or (existing.scope == Scope.global_):
+    ).scalars().all()
+    accessible_duplicates = [
+        row for row in duplicate_rows
+        if row.owner_tenant_id == p.tenant.id
+        or row.scope == Scope.global_
+        or (scope == "user" and row.owner_user_id == p.user.id)
+    ]
+    inaccessible_duplicates = [row for row in duplicate_rows if row not in accessible_duplicates]
+    if inaccessible_duplicates:
+        zf.close()
+        raise HTTPException(409, f"skill slug '{skill_slug}' v{skill_version} already exists outside this tenant")
+
+    existing: SkillPackage | None = None
+    if accessible_duplicates:
+        if not upsert:
             zf.close()
-            raise HTTPException(409, f"skill '{skill_name}' v{skill_version} already exists")
+            raise HTTPException(409, f"skill '{skill_display_name}' v{skill_version} already exists")
+
+        def _duplicate_score(row: SkillPackage) -> tuple[int, int, int, int]:
+            binding_count = db.query(SkillBinding).filter(SkillBinding.skill_id == row.id).count()
+            tenant_owned = 1 if row.owner_tenant_id == p.tenant.id else 0
+            openatlas_package = 1 if (row.source_ref or "").startswith(("zip:", "openatlas:")) else 0
+            active = 1 if row.status == "enabled" else 0
+            return (tenant_owned, openatlas_package, binding_count, active)
+
+        existing = sorted(accessible_duplicates, key=_duplicate_score, reverse=True)[0]
+        _skill_permission_check(existing, p, "import/update")
 
     # ── Extract
     base_extract.mkdir(parents=True, exist_ok=True)
     zf.extractall(base_extract)
     zf.close()
 
-    # ── Create SkillPackage
-    s = SkillPackage(
-        scope=(Scope.global_ if scope == "global" else (Scope.tenant if scope == "tenant" else Scope.user)),
-        owner_tenant_id=(p.tenant.id if scope in ("tenant", "user") else None),
-        owner_user_id=(p.user.id if scope == "user" else None),
-        name=skill_name,
-        slug=skill_slug,
-        description=skill_desc,
-        category=skill_category,
-        version=skill_version,
-        source_ref=f"zip:{str(base_extract)}",
-        visibility=("public" if scope == "global" else ("tenant" if scope == "tenant" else "private")),
-        mutable=(scope != "global"),
-        status="enabled",
-        created_by=p.user.id,
-    )
-    db.add(s)
+    source_ref = f"zip:{str(base_extract)}"
+    if existing and upsert:
+        s = existing
+        s.name = skill_display_name
+        s.slug = skill_slug
+        s.description = skill_desc
+        s.category = skill_category
+        s.version = skill_version
+        s.source_ref = source_ref
+        s.visibility = ("public" if scope == "global" else ("tenant" if scope == "tenant" else "private"))
+        s.mutable = (scope != "global")
+        s.status = "enabled"
+        audit_action = "skill.import_zip.upsert"
+        migrated_binding_count = 0
+        disabled_duplicate_ids: list[str] = []
+        for duplicate in accessible_duplicates:
+            if duplicate.id == s.id:
+                continue
+            bindings = db.query(SkillBinding).filter(SkillBinding.skill_id == duplicate.id).all()
+            for binding in bindings:
+                already_bound = db.query(SkillBinding).filter(
+                    SkillBinding.skill_id == s.id,
+                    SkillBinding.tenant_id == binding.tenant_id,
+                    SkillBinding.target_type == binding.target_type,
+                    SkillBinding.target_id == binding.target_id,
+                    SkillBinding.enabled == True,  # noqa: E712
+                ).first()
+                if already_bound:
+                    binding.enabled = False
+                    continue
+                binding.skill_id = s.id
+                migrated_binding_count += 1
+            duplicate.status = "disabled"
+            duplicate.mutable = True
+            disabled_duplicate_ids.append(duplicate.id)
+    else:
+        s = SkillPackage(
+            scope=(Scope.global_ if scope == "global" else (Scope.tenant if scope == "tenant" else Scope.user)),
+            owner_tenant_id=(p.tenant.id if scope in ("tenant", "user") else None),
+            owner_user_id=(p.user.id if scope == "user" else None),
+            name=skill_display_name,
+            slug=skill_slug,
+            description=skill_desc,
+            category=skill_category,
+            version=skill_version,
+            source_ref=source_ref,
+            visibility=("public" if scope == "global" else ("tenant" if scope == "tenant" else "private")),
+            mutable=(scope != "global"),
+            status="enabled",
+            created_by=p.user.id,
+        )
+        db.add(s)
+        audit_action = "skill.import_zip"
+        migrated_binding_count = 0
+        disabled_duplicate_ids = []
     audit(
-        db, principal=p, action="skill.import_zip", resource_type="skill",
+        db, principal=p, action=audit_action, resource_type="skill",
         resource_id=s.id, request=request,
-        extra={"scope": s.scope.value, "version": skill_version, "path": str(base_extract),
-               "size": len(raw), "files": sum(1 for _ in Path(base_extract).rglob("*") if _.is_file())},
+        extra={
+            "scope": s.scope.value,
+            "version": skill_version,
+            "path": str(base_extract),
+            "size": len(raw),
+            "files": sum(1 for _ in Path(base_extract).rglob("*") if _.is_file()),
+            "migrated_binding_count": migrated_binding_count,
+            "disabled_duplicate_ids": disabled_duplicate_ids,
+        },
     )
     db.commit()
     db.refresh(s)
@@ -7916,6 +24227,7 @@ def bind_skill(
         emp = db.get(DigitalEmployee, body.target_id)
         if not emp or emp.tenant_id != p.tenant.id:
             raise HTTPException(404, "employee not found")
+        _ensure_employee_mutable(emp, p)
     if body.target_type == "user":
         target_user = db.get(User, body.target_id)
         is_admin = p.user.role in (UserRole.tenant_admin, UserRole.system_admin)
@@ -7962,10 +24274,16 @@ class SkillUpdateIn(BaseModel):
     visibility: str | None = None
     mutable: bool | None = None
     status: str | None = None  # enabled | disabled | deprecated
+    system_prompt: str | None = None
+    input_schema: str | None = None
+    output_schema: str | None = None
+    few_shot_examples: str | None = None
 
 
 def _skill_permission_check(s: SkillPackage, p: Principal, action: str) -> None:
     """Raise 403 if principal cannot mutate the skill."""
+    if p.user.role == UserRole.user:
+        raise HTTPException(403, f"skill governance requires tenant_admin to {action}")
     if s.scope == Scope.global_ and p.user.role != UserRole.system_admin:
         raise HTTPException(403, f"only system_admin can {action} global skills")
     if s.scope == Scope.tenant and (
@@ -8004,9 +24322,17 @@ def update_market_skill(
         raise HTTPException(404, "skill not found")
     _skill_permission_check(s, p, "modify")
     changes = {}
-    for field in ("name", "description", "category", "version", "visibility", "mutable", "status"):
+    for field in (
+        "name", "description", "category", "version", "visibility", "mutable", "status",
+        "system_prompt", "input_schema", "output_schema", "few_shot_examples",
+    ):
         v = getattr(body, field)
         if v is not None:
+            if field in {"input_schema", "output_schema", "few_shot_examples"} and str(v).strip():
+                try:
+                    json.loads(str(v))
+                except Exception as exc:
+                    raise HTTPException(400, f"{field} must be valid JSON: {exc}") from exc
             setattr(s, field, v)
             changes[field] = v
     if not changes:
@@ -8080,6 +24406,8 @@ def fork_market_skill(
     src = db.get(SkillPackage, skill_id)
     if not src:
         raise HTTPException(404, "skill not found")
+    if p.user.role == UserRole.user:
+        raise HTTPException(403, "skill fork requires tenant_admin")
     # Permission: must be able to see the source
     if src.scope == Scope.tenant and src.owner_tenant_id != p.tenant.id:
         raise HTTPException(404, "skill not found")
@@ -8107,6 +24435,10 @@ def fork_market_skill(
         mutable=True,
         status="enabled",
         source_ref=src.id,
+        system_prompt=getattr(src, "system_prompt", "") or "",
+        input_schema=getattr(src, "input_schema", "") or "{}",
+        output_schema=getattr(src, "output_schema", "") or "{}",
+        few_shot_examples=getattr(src, "few_shot_examples", "") or "[]",
         created_by=p.user.id,
     )
     db.add(new)
@@ -8159,6 +24491,15 @@ def list_skill_bindings(
     rows = db.execute(q.order_by(SkillBinding.created_at.desc())).scalars().all()
     out = []
     for b in rows:
+        if not _is_admin_user(p.user):
+            if b.target_type == "user" and b.target_id != p.user.id:
+                continue
+            if b.target_type == "employee":
+                emp = db.get(DigitalEmployee, b.target_id)
+                if not _employee_visible_to_principal(db, emp, p):
+                    continue
+            if b.target_type == "tenant":
+                continue
         skill = db.get(SkillPackage, b.skill_id)
         out.append({
             "id": b.id,
@@ -8190,6 +24531,9 @@ def delete_skill_binding(
         raise HTTPException(404, "binding not found")
     if b.locked:
         raise HTTPException(400, "binding is locked (inherited from global skill)")
+    if b.target_type == "employee":
+        emp = db.get(DigitalEmployee, b.target_id)
+        _ensure_employee_mutable(emp, p)
     # permission: target owner or admin
     is_admin = p.user.role in (UserRole.tenant_admin, UserRole.system_admin)
     if not is_admin and b.created_by != p.user.id:
@@ -8207,16 +24551,12 @@ def list_memories(
     scope: str | None = Query(default=None),
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
-    # All memories the user can READ (global + tenant + own user + employees they own)
     rows = db.execute(
-        select(MemoryEntry).where(
-            MemoryEntry.tenant_id == p.tenant.id,
-            (MemoryEntry.scope == Scope.global_)
-            | (MemoryEntry.scope == Scope.tenant)
-            | ((MemoryEntry.scope == Scope.user) & (MemoryEntry.owner_user_id == p.user.id))
-            | (MemoryEntry.scope == Scope.employee)  # MVP: anyone in tenant sees employee memory metadata
-        ).order_by(MemoryEntry.priority.desc(), MemoryEntry.created_at.desc())
+        select(MemoryEntry)
+        .where(MemoryEntry.tenant_id == p.tenant.id)
+        .order_by(MemoryEntry.priority.desc(), MemoryEntry.created_at.desc())
     ).scalars().all()
+    rows = [m for m in rows if _memory_readable_by_principal(db, m, p)]
     if scope:
         rows = [m for m in rows if m.scope.value == scope]
     return {"items": [_memory_to_dict(m) for m in rows]}
@@ -8235,6 +24575,7 @@ def create_memory(
         emp = db.get(DigitalEmployee, body.employee_id) if body.employee_id else None
         if not emp or emp.tenant_id != p.tenant.id:
             raise HTTPException(400, "employee_id required and must be in this tenant")
+        _ensure_employee_mutable(emp, p)
     m = MemoryEntry(
         tenant_id=p.tenant.id,
         scope=body.scope,
@@ -8262,12 +24603,7 @@ def patch_memory(
     m = db.get(MemoryEntry, mid)
     if not m or m.tenant_id != p.tenant.id:
         raise HTTPException(404, "memory not found")
-    # Permission: only owner OR (admin for tenant/global)
-    is_owner = (m.scope == Scope.user and m.owner_user_id == p.user.id)
-    is_admin = (m.scope == Scope.tenant and p.user.role in (UserRole.tenant_admin, UserRole.system_admin))
-    is_sysadmin = (m.scope == Scope.global_ and p.user.role == UserRole.system_admin)
-    is_emp_owner = (m.scope == Scope.employee and m.created_by == p.user.id)
-    if not (is_owner or is_admin or is_sysadmin or is_emp_owner):
+    if not _memory_mutable_by_principal(m, p):
         raise HTTPException(403, "no permission to edit this memory")
     if not m.mutable:
         raise HTTPException(409, "memory is locked (immutable)")
@@ -8294,6 +24630,8 @@ def archive_memory(
     m = db.get(MemoryEntry, mid)
     if not m or m.tenant_id != p.tenant.id:
         raise HTTPException(404, "memory not found")
+    if not _memory_mutable_by_principal(m, p):
+        raise HTTPException(403, "no permission to archive this memory")
     m.status = "archived"
     audit(db, principal=p, action="memory.archive", resource_type="memory",
           resource_id=m.id, request=request)
@@ -8309,9 +24647,18 @@ def effective_memories(
     employee_id: str | None = Query(default=None),
     p: Principal = Depends(get_principal), db: Session = Depends(get_db),
 ) -> dict:
+    if employee_id:
+        _ensure_employee_visible(db, db.get(DigitalEmployee, employee_id), p)
     eff = resolve_effective_memories(db, tenant_id=p.tenant.id,
                                      user_id=p.user.id, employee_id=employee_id)
-    return {"items": eff}
+    filtered = []
+    for item in eff:
+        mid = item.get("id") if isinstance(item, dict) else getattr(item, "id", None)
+        if isinstance(mid, str) and mid.startswith("synthetic:"):
+            filtered.append(item)
+        elif mid and _memory_readable_by_principal(db, db.get(MemoryEntry, mid), p):
+            filtered.append(item)
+    return {"items": filtered}
 
 
 @app.get("/api/memories/{mid}")
@@ -8320,6 +24667,8 @@ def get_memory(
 ) -> dict:
     m = db.get(MemoryEntry, mid)
     if not m or m.tenant_id != p.tenant.id:
+        raise HTTPException(404, "memory not found")
+    if not _memory_readable_by_principal(db, m, p):
         raise HTTPException(404, "memory not found")
     return _memory_to_dict(m)
 
@@ -8339,12 +24688,15 @@ def fork_memory(
     src = db.get(MemoryEntry, mid)
     if not src or src.tenant_id != p.tenant.id:
         raise HTTPException(404, "memory not found")
+    if not _memory_readable_by_principal(db, src, p):
+        raise HTTPException(404, "memory not found")
     if body.target_scope not in (Scope.user, Scope.employee):
         raise HTTPException(400, "target_scope must be 'user' or 'employee'")
     if body.target_scope == Scope.employee:
         emp = db.get(DigitalEmployee, body.employee_id) if body.employee_id else None
         if not emp or emp.tenant_id != p.tenant.id:
             raise HTTPException(400, "employee_id required and must be in this tenant")
+        _ensure_employee_mutable(emp, p)
     new = MemoryEntry(
         tenant_id=p.tenant.id,
         scope=body.target_scope,
@@ -8388,14 +24740,23 @@ def bind_memory(
     m = db.get(MemoryEntry, mid)
     if not m or m.tenant_id != p.tenant.id:
         raise HTTPException(404, "memory not found")
+    if not _memory_readable_by_principal(db, m, p):
+        raise HTTPException(404, "memory not found")
     if body.target_type not in ("tenant", "user", "employee", "session"):
         raise HTTPException(400, "invalid target_type")
-    # permission: only memory owner OR admin
-    is_owner = (m.scope == Scope.user and m.owner_user_id == p.user.id)
-    is_admin = p.user.role in (UserRole.tenant_admin, UserRole.system_admin)
-    is_emp_owner = (m.scope == Scope.employee and m.created_by == p.user.id)
-    if not (is_owner or is_admin or is_emp_owner):
+    if not _memory_mutable_by_principal(m, p):
         raise HTTPException(403, "no permission to bind this memory")
+    if body.target_type == "tenant" and not _is_admin_user(p.user):
+        raise HTTPException(403, "tenant memory binding requires admin")
+    if body.target_type == "user" and body.target_id != p.user.id and not _is_admin_user(p.user):
+        raise HTTPException(403, "users can only bind memory to themselves")
+    if body.target_type == "employee":
+        emp = db.get(DigitalEmployee, body.target_id)
+        _ensure_employee_mutable(emp, p)
+    if body.target_type == "session":
+        rec = db.get(SessionRecord, body.target_id)
+        if not rec or rec.tenant_id != p.tenant.id or (not _is_admin_user(p.user) and rec.user_id != p.user.id):
+            raise HTTPException(404, "session not found")
     b = MemoryBinding(
         tenant_id=p.tenant.id, memory_id=mid,
         target_type=body.target_type, target_id=body.target_id,
@@ -8474,6 +24835,7 @@ def dashboard_tenant(
     """Phase 3.5 — tenant_admin sees their own tenant metrics.
     system_admin sees the tenant they're currently bound to.
     """
+    _require_tenant_admin(p, "tenant dashboard")
     tid = p.tenant.id
     users = db.query(User).filter(User.tenant_id == tid).count()
     emps = db.query(DigitalEmployee).filter(
@@ -8843,6 +25205,12 @@ def _role(v: Any) -> str:
 
 
 ROLE_CAPABILITIES = [
+    {"key": "workbench.use", "label": "工作台使用", "group": "基础"},
+    {"key": "employee.view", "label": "查看数智员工", "group": "基础"},
+    {"key": "employee.create", "label": "招聘新员工", "group": "基础"},
+    {"key": "skill.center.view", "label": "技能中心", "group": "基础"},
+    {"key": "skill.market.view", "label": "技能市场查看", "group": "基础"},
+    {"key": "history.view", "label": "对话历史", "group": "基础"},
     {"key": "tenant.manage", "label": "租户配置", "group": "治理"},
     {"key": "runtime.manage", "label": "Hermes Runtime", "group": "治理"},
     {"key": "org.manage", "label": "组织管理", "group": "身份"},
@@ -8868,7 +25236,15 @@ ROLE_PERMISSION_DEFAULTS: dict[str, set[str]] = {
         "session.view_all",
         "audit.view",
     },
-    "user": {"employee.manage", "memory.manage", "file.manage"},
+    "user": {
+        "workbench.use",
+        "employee.view",
+        "employee.create",
+        "skill.center.view",
+        "skill.market.view",
+        "history.view",
+        "file.manage",
+    },
 }
 
 
@@ -9597,34 +25973,33 @@ def admin_start_runtime(
     # Spawn via start_tenant.sh (8-layer isolation guard)
     tenant = db.get(Tenant, tid)
     script = _start_tenant_script()
+    if not script.exists():
+        raise HTTPException(500, f"runtime launcher not found: {script}")
     log_path = _tenant_log_path(runtime.hermes_home_path)
     # Spawn via start_tenant.sh (8-layer isolation guard).
-    # Use bash -c with KEY=VAL inline so the child shell sees the exports.
-    # We MUST avoid 'shell=True' on Popen (we use redirect for stdout/stderr).
-    # So we craft a single argv: env ... bash -c "<full command string>".
+    # Pass values through the child environment instead of shell string
+    # interpolation so API keys and tenant-controlled strings are not parsed by bash.
     # Phase 3.1 — decrypt the API key for env injection to the child shell.
     _api_key_plain = decrypt(runtime.api_key_encrypted)
-    cmd_str = (
-        f"HERMES_HOME={runtime.hermes_home_path} "
-        f"API_SERVER_HOST=127.0.0.1 "
-        f"API_SERVER_PORT={runtime.port} "
-        f"API_SERVER_KEY={_api_key_plain} "
-        f"OPENATLAS_HOME={str(OPENATLAS_HOME)} "
-        f"OPENATLAS_HERMES_AGENT_ROOT={str(OPENATLAS_HERMES_AGENT_ROOT)} "
-        f"OPENATLAS_TENANT={tenant.slug} "
-        f"bash {script} {runtime.hermes_home_path}"
-    )
-    env_args = [
-        "env", "-u", "ALL_PROXY", "-u", "all_proxy",
-        "-u", "HTTP_PROXY", "-u", "HTTPS_PROXY",
-        "-u", "http_proxy", "-u", "https_proxy",
-        "-u", "SOCKS_PROXY", "-u", "socks_proxy",
-        "bash", "-c", cmd_str,
-    ]
+    child_env = {k: v for k, v in os.environ.items() if k.lower() not in {
+        "all_proxy", "http_proxy", "https_proxy", "socks_proxy",
+    }}
+    child_env.update({
+        "HERMES_HOME": runtime.hermes_home_path,
+        "API_SERVER_HOST": "127.0.0.1",
+        "API_SERVER_PORT": str(runtime.port),
+        "API_SERVER_KEY": _api_key_plain,
+        "OPENATLAS_HOME": str(OPENATLAS_HOME),
+        "OPENATLAS_HERMES_AGENT_ROOT": str(OPENATLAS_HERMES_AGENT_ROOT),
+        "OPENATLAS_PROJECT_ROOT": str(OPENATLAS_PROJECT_ROOT),
+        "OPENATLAS_TENANT": tenant.slug,
+    })
     log_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(log_path, "ab")
     proc = subprocess.Popen(
-        env_args, stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
+        ["bash", str(script), runtime.hermes_home_path],
+        env=child_env,
+        stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
         start_new_session=True, close_fds=True,
     )
     runtime.status = RuntimeStatus.starting
@@ -9739,7 +26114,7 @@ def admin_update_tenant(
         changes["status"] = body.status
     if not changes:
         raise HTTPException(400, "no fields to update")
-    tenant.updated_at = datetime.utcnow()
+    tenant.updated_at = datetime.now(timezone.utc)
     audit(db, principal=p, action="tenant.update", resource_type="tenant",
           resource_id=tid, request=request, extra=changes)
     db.commit()
@@ -9873,7 +26248,7 @@ def _tenant_log_path(hermes_home: str) -> Path:
 
 
 def _start_tenant_script() -> Path:
-    return Path(OPENATLAS_HOME).parent / "Desktop" / "Atlasagent" / "openatlas" / "scripts" / "start_tenant.sh"
+    return OPENATLAS_PROJECT_ROOT / "scripts" / "start_tenant.sh"
 
 
 def _lsof_listen_pid(port: int) -> int | None:

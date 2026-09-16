@@ -17,13 +17,13 @@ if [[ -z "$HERMES_HOME" ]]; then
 fi
 
 # ── All env vars are injected by the backend caller; we just guard. ─────
-: "${OPENATLAS_HOME:=/Users/macbook/.openatlas}"
+: "${OPENATLAS_HOME:=${HOME:-/tmp}/.openatlas}"
 : "${OPENATLAS_HERMES_AGENT_ROOT:=$OPENATLAS_HOME/hermes-runtime}"
 : "${API_SERVER_HOST:=127.0.0.1}"
 : "${API_SERVER_PORT:?API_SERVER_PORT not set}"
 : "${API_SERVER_KEY:?API_SERVER_KEY not set}"
 
-LOCAL_HERMES_HOME="/Users/macbook/.hermes"
+LOCAL_HERMES_HOME="${HOME:-/tmp}/.hermes"
 HERMES_RUNTIME="$OPENATLAS_HERMES_AGENT_ROOT"
 HERMES_PY="$HERMES_RUNTIME/.venv/bin/python3"
 # Project root is the parent of the scripts/ dir, NOT of OPENATLAS_HOME.
@@ -114,7 +114,12 @@ echo "  HERMES_RUNTIME   = $HERMES_RUNTIME"
 echo "  API_SERVER_PORT  = $API_SERVER_PORT"
 
 # ── Spawn (setsid-detached on macOS via nohup + redirect, no setsid) ─────
-nohup env -u HOME \
+nohup env \
+  -u HOME \
+  -u ALL_PROXY -u all_proxy \
+  -u HTTP_PROXY -u http_proxy \
+  -u HTTPS_PROXY -u https_proxy \
+  -u SOCKS_PROXY -u socks_proxy \
   PYTHONPATH="$HERMES_RUNTIME" \
   OPENATLAS_HOME="$OPENATLAS_HOME" \
   OPENATLAS_HERMES_AGENT_ROOT="$HERMES_RUNTIME" \

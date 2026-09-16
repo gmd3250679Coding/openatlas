@@ -19,6 +19,9 @@ import ChatMessage from './ChatMessage';
 import Composer from './Composer';
 import MentionPopover from './MentionPopover';
 import type { Attachment, Employee } from '../services/api';
+import type { ProgressStage } from '../types/progress';
+
+const SHOW_AGENT_COMMAND_BAR = false;
 
 export interface Msg {
   role: 'user' | string;
@@ -33,6 +36,7 @@ export interface Msg {
   total_tokens?: number;
   token_count?: number;
   reasoning?: string[];
+  progressStages?: ProgressStage[];
 }
 
 interface ActiveEmployee {
@@ -42,8 +46,27 @@ interface ActiveEmployee {
   color: string;
 }
 
+interface TaskActivity {
+  status: string;
+  label: string;
+  detail: string;
+  headline: string;
+  nodeName?: string;
+  stepTitle?: string;
+  stepCount?: number;
+  checkpointCount?: number;
+  artifactCount?: number;
+  updatedText?: string;
+  capabilitySummary?: string;
+  capabilityLabels?: string[];
+  gapLabels?: string[];
+  routedTo?: string;
+  collaborationMode?: string;
+}
+
 interface Props {
   messages: Msg[];
+  artifacts?: any[];
   isProcessing: boolean;
   input: string;
   setInput: (v: string) => void;
@@ -52,6 +75,9 @@ interface Props {
   onSend: () => void;
   onAbort?: () => void;
   onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  onCompositionStart?: (e: React.CompositionEvent<HTMLTextAreaElement>) => void;
+  onCompositionEnd?: (e: React.CompositionEvent<HTMLTextAreaElement>) => void;
+  onPasteUpload?: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
   onFileSelect: (file: File) => void;
   reasoningEffort?: string;
   onReasoningEffortChange?: (value: string) => void;
@@ -64,6 +90,7 @@ interface Props {
   mentionSelectedIds?: number[];
   onMentionPick?: (emp: Employee) => void;
   onMentionClose?: () => void;
+  composerPlaceholder?: string;
   // Header
   orbState: 'idle' | 'thinking' | 'dispatch' | 'speaking';
   headerStyle: HeaderStyle;
@@ -75,30 +102,90 @@ interface Props {
   // Active employee chip
   activeEmployee: ActiveEmployee | null;
   onSwitchEmployee: () => void;
+  taskActivity?: TaskActivity | null;
   // Refs forwarded for parent use (chatEndRef for scroll)
   // 不需要 — 内部自己管
 }
 
+function collaborationModeLabel(mode?: string) {
+  if (!mode) return '';
+  if (mode.includes('synthesis')) return '协作合稿';
+  if (mode.includes('serial')) return '串行接力';
+  if (mode.includes('single')) return '单员工执行';
+  return mode;
+}
+
+function AgentCommandBar({ taskActivity }: { taskActivity: TaskActivity }) {
+  const modeLabel = collaborationModeLabel(taskActivity.collaborationMode);
+  return (
+    <section className={`atlas-agent-command-bar atlas-agent-command-bar--${taskActivity.status}`} aria-label="当前任务状态">
+      <div className="atlas-agent-command-bar__pulse" aria-hidden="true"><span /></div>
+      <div className="atlas-agent-command-bar__main">
+        <div className="atlas-agent-command-bar__eyebrow">
+          <strong>{taskActivity.label}</strong>
+          {taskActivity.updatedText && <span>{taskActivity.updatedText}</span>}
+        </div>
+        <div className="atlas-agent-command-bar__headline">{taskActivity.headline}</div>
+        <div className="atlas-agent-command-bar__detail">
+          {taskActivity.capabilitySummary || taskActivity.detail}
+        </div>
+        <div className="atlas-agent-command-bar__chips">
+          {taskActivity.nodeName && <span>当前员工 {taskActivity.nodeName}</span>}
+          {taskActivity.routedTo && <span>已路由 {taskActivity.routedTo}</span>}
+          {modeLabel && <span>{modeLabel}</span>}
+          {(taskActivity.capabilityLabels || []).map((label) => <span key={`cap-${label}`}>能力 {label}</span>)}
+          {(taskActivity.gapLabels || []).map((label) => <span key={`gap-${label}`} className="is-warning">缺口 {label}</span>)}
+          <span>步骤 {taskActivity.stepCount || 0}</span>
+          <span>交付物 {taskActivity.artifactCount || 0}</span>
+        </div>
+      </div>
+      <div className="atlas-agent-command-bar__meter" aria-hidden="true"><span /></div>
+    </section>
+  );
+}
+
 export default function CenterMain({
-  messages, isProcessing,
+  messages, artifacts = [], isProcessing,
   input, setInput, pendingAttachments, uploading,
-  onSend, onAbort, onKeyDown, onFileSelect, onRemoveAttachment,
+  onSend, onAbort, onKeyDown, onCompositionStart, onCompositionEnd, onPasteUpload, onFileSelect, onRemoveAttachment,
   reasoningEffort, onReasoningEffortChange,
   relayChips, onRemoveRelay,
-  mentionEmployees, mentionSelectedIds, onMentionPick, onMentionClose,
+  mentionEmployees, mentionSelectedIds, onMentionPick, onMentionClose, composerPlaceholder,
   orbState, headerStyle, onStyleChange, pet, onPetChange, petAwakeSignal, profile = 'normal',
-  activeEmployee, onSwitchEmployee,
+  activeEmployee, onSwitchEmployee, taskActivity,
 }: Props) {
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const lastMessage = messages[messages.length - 1];
+  const artifactSignature = (artifacts || [])
+    .map((item: any) => `${item?.__id || item?.id || ''}:${item?.name || item?.title || ''}:${item?.status || ''}:${item?.managed_status || ''}`)
+    .join('|');
+  const latestMessageSignature = [
+    messages.length,
+    lastMessage?.role || '',
+    lastMessage?.text?.length || 0,
+    lastMessage?.tools?.length || 0,
+    lastMessage?.tools?.map((t) => `${t.name}:${t.status || ''}`).join('|') || '',
+    lastMessage?.reasoning?.join('\n').length || 0,
+    lastMessage?.progressStages?.length || 0,
+    artifactSignature,
+  ].join(':');
+  const latestAssistantIndex = (() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role !== 'user') return i;
+    }
+    return -1;
+  })();
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages.length, isProcessing]);
+  }, [latestMessageSignature, isProcessing, taskActivity?.status, taskActivity?.stepCount]);
 
   return (
     <main style={{
       display: 'flex', flexDirection: 'column',
       background: 'var(--bg-primary)', overflow: 'hidden',
+      flex: 1,
+      minHeight: 0,
     }}>
       {activeEmployee && (
         <div style={{
@@ -144,6 +231,7 @@ export default function CenterMain({
         petAwakeSignal={petAwakeSignal}
         profile={profile}
       />
+      {SHOW_AGENT_COMMAND_BAR && taskActivity && <AgentCommandBar taskActivity={taskActivity} />}
 
       <div style={{ flex: 1, overflowY: 'auto', padding: '20px' }}>
         {messages.map((msg, i) => {
@@ -162,10 +250,22 @@ export default function CenterMain({
               tools={msg.tools}
               attachments={msg.attachments}
               reasoning={msg.reasoning}
+              progressStages={msg.progressStages}
+              artifacts={i === latestAssistantIndex ? artifacts : undefined}
               isStreaming={streaming}
             />
           );
         })}
+        {latestAssistantIndex < 0 && artifacts.length > 0 && (
+          <ChatMessage
+            role="assistant"
+            sender="Atlas"
+            avatar="A"
+            color="var(--accent)"
+            text=""
+            artifacts={artifacts}
+          />
+        )}
         {isProcessing && !messages.some(m => m.role !== 'user') && (
           <div style={{ display: 'flex', gap: 10, marginBottom: 20 }}>
             <div style={{
@@ -199,15 +299,19 @@ export default function CenterMain({
         )}
         <Composer
           input={input} setInput={setInput}
-          disabled={isProcessing} uploading={uploading}
+          disabled={false} running={isProcessing} uploading={uploading}
           pendingAttachments={pendingAttachments}
-          onSend={onSend} onKeyDown={onKeyDown} onFileSelect={onFileSelect}
+          onSend={onSend} onKeyDown={onKeyDown}
+          onCompositionStart={onCompositionStart}
+          onCompositionEnd={onCompositionEnd}
+          onPasteUpload={onPasteUpload} onFileSelect={onFileSelect}
           onAbort={onAbort}
           onRemoveAttachment={onRemoveAttachment}
           reasoningEffort={reasoningEffort}
           onReasoningEffortChange={onReasoningEffortChange}
           relayChips={relayChips}
           onRemoveRelay={onRemoveRelay}
+          placeholder={composerPlaceholder}
         />
       </div>
     </main>

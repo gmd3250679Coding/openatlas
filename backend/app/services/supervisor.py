@@ -22,7 +22,7 @@ import logging
 import os
 import time
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger("openatlas.supervisor")
@@ -45,22 +45,39 @@ def _is_pid_alive(pid: int | None) -> bool:
     return is_pid_alive(pid)
 
 
-def _is_health_ok(base_url: str, api_key: str) -> bool:
-    """Probe an authenticated endpoint so stale gateways with old keys fail."""
+def _probe_gateway(base_url: str, api_key: str) -> str:
+    """Return ok/auth_failed/unreachable for a tenant gateway.
+
+    A busy Hermes gateway can temporarily delay non-chat endpoints while a
+    model/tool call is running. Treat timeouts as "unreachable" and avoid
+    killing the process on that signal alone. Only an explicit 401/403 proves
+    the listener is a stale process with the wrong key.
+    """
     import urllib.error
     import urllib.request
 
-    req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/v1/models",
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return 200 <= resp.status < 500
-    except urllib.error.HTTPError:
-        return False
-    except Exception:
-        return False
+    for path in ("/v1/models", "/health"):
+        req = urllib.request.Request(
+            f"{base_url.rstrip('/')}{path}",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if 200 <= resp.status < 500:
+                    return "ok"
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return "auth_failed"
+            if exc.code < 500:
+                return "ok"
+        except Exception:
+            continue
+    return "unreachable"
+
+
+def _is_health_ok(base_url: str, api_key: str) -> bool:
+    """Backward-compatible boolean probe for callers that only need liveness."""
+    return _probe_gateway(base_url, api_key) == "ok"
 
 
 def _pid_file_for(hermes_home: str) -> Path:
@@ -109,13 +126,19 @@ async def _maybe_respawn(runtime) -> bool:
         return False
     api_key_plain = decrypt(runtime.api_key_encrypted)
     # Case 1: DB pid is alive AND health responds — happy path.
-    if _is_pid_alive(runtime.pid) and _is_health_ok(runtime.gateway_base_url, api_key_plain):
+    db_pid_alive = _is_pid_alive(runtime.pid)
+    db_probe = _probe_gateway(runtime.gateway_base_url, api_key_plain) if db_pid_alive else "unreachable"
+    if db_pid_alive and db_probe == "ok":
         if status != "running":
             with SessionLocal() as db:
                 row = db.get(type(runtime), runtime.id)
                 if row:
                     row.status = "running"
                     db.commit()
+        return False
+    if db_pid_alive and db_probe == "unreachable":
+        log.info("[supervisor] runtime %s pid=%s alive but health probe is busy/unreachable; will retry",
+                 runtime.id, runtime.pid)
         return False
     # Case 2: DB pid is wrong/dead, but something is listening on the port
     # AND health responds — someone (start.sh, sibling supervisor) is running
@@ -125,7 +148,8 @@ async def _maybe_respawn(runtime) -> bool:
     p = urlparse(runtime.gateway_base_url)
     try:
         with socket.create_connection((p.hostname, p.port), timeout=2):
-            if _is_health_ok(runtime.gateway_base_url, api_key_plain):
+            port_probe = _probe_gateway(runtime.gateway_base_url, api_key_plain)
+            if port_probe == "ok":
                 # port is open and healthy — figure out who owns it via lsof
                 actual_pid = _lsof_pid(p.port)
                 if actual_pid and actual_pid != runtime.pid:
@@ -139,12 +163,16 @@ async def _maybe_respawn(runtime) -> bool:
                             db.commit()
                 return False
             actual_pid = _lsof_pid(p.port)
-            if actual_pid:
+            if actual_pid and port_probe == "auth_failed":
                 from app.services.process_utils import terminate_pid
                 log.warning("[supervisor] terminating stale runtime %s pid=%s on port=%s (auth check failed)",
                             runtime.id, actual_pid, p.port)
                 terminate_pid(actual_pid, grace=5.0)
                 _pid_file_for(runtime.hermes_home_path).unlink(missing_ok=True)
+            elif actual_pid:
+                log.info("[supervisor] runtime %s port=%s has pid=%s but health probe is busy/unreachable; will retry",
+                         runtime.id, p.port, actual_pid)
+                return False
     except Exception:
         pass
     # Case 3: pid is dead AND nothing on the port. Respawn.
@@ -186,7 +214,7 @@ async def _maybe_respawn(runtime) -> bool:
                 row = db.get(type(runtime), runtime.id)
                 if row:
                     row.status = "running"
-                    row.health_checked_at = datetime.utcnow()
+                    row.health_checked_at = datetime.now(timezone.utc)
                     db.commit()
             return True
         else:
@@ -204,9 +232,8 @@ async def _spawn_gateway(runtime) -> None:
     """Shell out to start_tenant.sh just like the HTTP /start endpoint does."""
     from app.db.models import Tenant
     from app.db.session import SessionLocal
-    from app.core.config import OPENATLAS_HOME, OPENATLAS_HERMES_AGENT_ROOT
+    from app.core.config import OPENATLAS_HOME, OPENATLAS_HERMES_AGENT_ROOT, OPENATLAS_PROJECT_ROOT
     from app.core.encryption import decrypt
-    from pathlib import Path as _P
     import subprocess
 
     with SessionLocal() as db:
@@ -215,29 +242,30 @@ async def _spawn_gateway(runtime) -> None:
             return
         slug = tenant.slug
         api_key_plain = decrypt(runtime.api_key_encrypted)
-        script = _P(OPENATLAS_HOME).parent / "Desktop" / "Atlasagent" / "openatlas" / "scripts" / "start_tenant.sh"
+        script = OPENATLAS_PROJECT_ROOT / "scripts" / "start_tenant.sh"
+        if not script.exists():
+            log.error("[supervisor] start_tenant.sh missing at %s", script)
+            return
         log_path = OPENATLAS_HOME / "logs" / f"hermes-tenant-{slug}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd_str = (
-            f"HERMES_HOME={runtime.hermes_home_path} "
-            f"API_SERVER_HOST=127.0.0.1 "
-            f"API_SERVER_PORT={runtime.port} "
-            f"API_SERVER_KEY={api_key_plain} "
-            f"OPENATLAS_HOME={str(OPENATLAS_HOME)} "
-            f"OPENATLAS_HERMES_AGENT_ROOT={str(OPENATLAS_HERMES_AGENT_ROOT)} "
-            f"OPENATLAS_TENANT={slug} "
-            f"bash {script} {runtime.hermes_home_path}"
-        )
-        env_args = [
-            "env", "-u", "ALL_PROXY", "-u", "all_proxy",
-            "-u", "HTTP_PROXY", "-u", "HTTPS_PROXY",
-            "-u", "http_proxy", "-u", "https_proxy",
-            "-u", "SOCKS_PROXY", "-u", "socks_proxy",
-            "bash", "-c", cmd_str,
-        ]
+        env = {k: v for k, v in os.environ.items() if k.lower() not in {
+            "all_proxy", "http_proxy", "https_proxy", "socks_proxy",
+        }}
+        env.update({
+            "HERMES_HOME": runtime.hermes_home_path,
+            "API_SERVER_HOST": "127.0.0.1",
+            "API_SERVER_PORT": str(runtime.port),
+            "API_SERVER_KEY": api_key_plain,
+            "OPENATLAS_HOME": str(OPENATLAS_HOME),
+            "OPENATLAS_HERMES_AGENT_ROOT": str(OPENATLAS_HERMES_AGENT_ROOT),
+            "OPENATLAS_PROJECT_ROOT": str(OPENATLAS_PROJECT_ROOT),
+            "OPENATLAS_TENANT": slug,
+        })
         fh = open(log_path, "ab")
         proc = subprocess.Popen(
-            env_args, stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
+            ["bash", str(script), runtime.hermes_home_path],
+            env=env,
+            stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
             start_new_session=True, close_fds=True,
         )
         # update DB with new pid + status
